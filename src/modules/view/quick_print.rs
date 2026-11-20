@@ -2,18 +2,26 @@
 // selection's bounding box to a PDF (handled by the host). No dialog. (#325)
 
 use crate::command::{CadCommand, CmdResult};
-use codec::Handle;
-use glam::DVec3;
 use crate::t;
+use document::Handle;
+use glam::DVec3;
 
 pub struct QuickPrintCommand {
     /// Latest selection set, refreshed on every selection action.
     handles: Vec<Handle>,
 }
 
+impl Default for QuickPrintCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl QuickPrintCommand {
     pub fn new() -> Self {
-        Self { handles: Vec::new() }
+        Self {
+            handles: Vec::new(),
+        }
     }
 }
 

@@ -2,22 +2,37 @@
 
 use crate::modules::IconKind;
 
-/// Shared icon for the Paste button and its dropdown entries.
+/// The Paste button, its dropdown face and plain Paste (PASTECLIP).
 pub const ICON: IconKind = IconKind::Svg(include_bytes!("../../../../assets/icons/paste.svg"));
+/// Paste to Original Coordinates: the clipboard with X / Y axes.
+pub const ICON_ORIG: IconKind =
+    IconKind::Svg(include_bytes!("../../../../assets/icons/paste_orig.svg"));
+/// Paste as Block: the clipboard with a block.
+pub const ICON_BLOCK: IconKind =
+    IconKind::Svg(include_bytes!("../../../../assets/icons/paste_block.svg"));
+/// Paste as Hyperlink: the clipboard with a globe.
+pub const ICON_HYPERLINK: IconKind = IconKind::Svg(include_bytes!(
+    "../../../../assets/icons/paste_hyperlink.svg"
+));
+/// Paste Special: the clipboard with a pencil.
+pub const ICON_SPECIAL: IconKind =
+    IconKind::Svg(include_bytes!("../../../../assets/icons/paste_special.svg"));
 
 /// Paste-menu entries: (command id, label, icon). The first is the default
 /// fired by clicking the button body; the rest open from the ▾.
 pub const MENU_ITEMS: &[(&str, &str, IconKind)] = &[
     ("PASTECLIP", "Paste", ICON),
-    ("PASTEORIG", "Paste to Original Coordinates", ICON),
-    ("PASTEBLOCK", "Paste as Block", ICON),
+    ("PASTEORIG", "Paste to Original Coordinates", ICON_ORIG),
+    ("PASTEBLOCK", "Paste as Block", ICON_BLOCK),
+    ("PASTEASHYPERLINK", "Paste as Hyperlink", ICON_HYPERLINK),
+    ("PASTESPEC", "Paste Special", ICON_SPECIAL),
 ];
 
 // ── CadCommand implementation ─────────────────────────────────────────────
 
-use codec::Handle;
-use glam::{DVec3, Vec3};
 use crate::t;
+use document::Handle;
+use glam::{DVec3, Vec3};
 
 use crate::command::{CadCommand, CmdResult};
 use crate::scene::model::wire_model::WireModel;
@@ -53,10 +68,18 @@ impl PasteCommand {
         if too_heavy {
             if let Some(bbox_wire) = Self::bbox_outline(&wires) {
                 // Drop the full wires — the box is all the ghost needs now.
-                return Self { wires: Vec::new(), bbox_wire: Some(bbox_wire), base };
+                return Self {
+                    wires: Vec::new(),
+                    bbox_wire: Some(bbox_wire),
+                    base,
+                };
             }
         }
-        Self { wires, bbox_wire: None, base }
+        Self {
+            wires,
+            bbox_wire: None,
+            base,
+        }
     }
 
     /// Build a closed rectangle outline around the XY extent of `wires`, in the
@@ -130,8 +153,13 @@ impl CadCommand for PasteCommand {
     }
 }
 
-
 // ── Autocomplete registry ─────────────────────────────────
-inventory::submit!(crate::command::CommandRegistration { names: &["PASTE", "PASTECLIP"] });  // PasteCommand
-inventory::submit!(crate::command::CommandRegistration { names: &["PASTEORIG"] });
-inventory::submit!(crate::command::CommandRegistration { names: &["PASTEBLOCK"] });
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["PASTE", "PASTECLIP"]
+}); // PasteCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["PASTEORIG"]
+});
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["PASTEBLOCK"]
+});

@@ -1,34 +1,23 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use codec::io::dwg::DwgReader;
-use codec::{DwgReadOptions, DxfReader, DxfReaderConfiguration};
+use document::DwgReader;
+use document::{DwgReadOptions, DxfReader, DxfReaderConfiguration};
 use js_sys::{Function, Uint8Array};
 use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 
 const HASH_MARKER: &str = "\nreport-source-sha256:";
-const PROTOCOL_VERSION: u16 = 4;
 
-#[derive(serde::Serialize)]
-struct EntityRuntimeFields {
-    handle: u64,
-    linetype_handle: Option<u64>,
-    color_book_handle: Option<u64>,
-    face_visual_style_handle: Option<u64>,
-    edge_visual_style_handle: Option<u64>,
-    material_flags: u8,
-    material_handle: Option<u64>,
-    shadow_flags: u8,
-    plotstyle_flags: u8,
-    plotstyle_handle: Option<u64>,
-    entity_mode: Option<u8>,
-    has_ds_data: bool,
-}
+/// Version of the shared worker wire format (see `ocs_save`). Both sides of
+/// the boundary — this crate and the app's `io::web_worker` — check payloads
+/// against it.
+const PROTOCOL_VERSION: u16 = ocs_save::PROTOCOL_VERSION;
 
-/// Parse DWG/DXF on a dedicated browser worker and return a compact serialized
-/// document. The main wasm instance only deserializes and installs it, so the
-/// expensive bit/handle/object decode never occupies the browser UI thread.
+/// Parse DWG/DXF (or a listed converter's format) on a dedicated browser
+/// worker and return a compact serialized document. The main wasm instance
+/// only deserializes and installs it, so the expensive bit/handle/object
+/// decode never occupies the browser UI thread.
 #[wasm_bindgen]
 pub fn parse_document(
     name: String,
@@ -42,7 +31,8 @@ pub fn parse_document(
     let bytes: Arc<[u8]> = Arc::from(bytes.to_vec());
     report_stage.call1(&JsValue::NULL, &JsValue::from_str("parse document"))?;
     let ext = name.rsplit('.').next().unwrap_or_default().to_lowercase();
-    if !matches!(ext.as_str(), "dwg" | "dxf") {
+    let external = ocs_save::external_format(&ext);
+    if !matches!(ext.as_str(), "dwg" | "dxf") && external.is_none() {
         return encode_result(
             Err((format!("Unsupported file format: .{ext}"), None)),
             None,
@@ -54,32 +44,35 @@ pub fn parse_document(
         "dwg" => {
             if recovery_mode {
                 DwgReader::from_stream_with_options(
-                        Cursor::new(Arc::clone(&bytes)),
-                        DwgReadOptions::failsafe(),
-                    )
-                    .read_with_stats()
+                    Cursor::new(Arc::clone(&bytes)),
+                    DwgReadOptions::failsafe(),
+                )
+                .read_with_stats()
             } else {
-                DwgReader::from_stream(Cursor::new(Arc::clone(&bytes)))
-                    .read_with_stats()
+                DwgReader::from_stream(Cursor::new(Arc::clone(&bytes))).read_with_stats()
             }
         }
         "dxf" => {
             if recovery_mode {
-                DxfReader::from_reader(Cursor::new(Arc::clone(&bytes)))
-                    .and_then(|reader| {
-                        reader
-                            .with_configuration(DxfReaderConfiguration {
-                                failsafe: true,
-                                ..DxfReaderConfiguration::default()
-                            })
-                            .read_with_stats()
-                    })
+                DxfReader::from_reader(Cursor::new(Arc::clone(&bytes))).and_then(|reader| {
+                    reader
+                        .with_configuration(DxfReaderConfiguration {
+                            failsafe: true,
+                            ..DxfReaderConfiguration::default()
+                        })
+                        .read_with_stats()
+                })
             } else {
                 DxfReader::from_reader(Cursor::new(Arc::clone(&bytes)))
                     .and_then(|reader| reader.read_with_stats())
             }
         }
-        _ => unreachable!(),
+        _ => match external {
+            Some(format) => {
+                ocs_save::read_external(format, &bytes).map_err(document::DxfError::Custom)
+            }
+            None => unreachable!(),
+        },
     };
     let mut outcome = match outcome_result {
         Ok(outcome) => outcome,
@@ -96,9 +89,7 @@ pub fn parse_document(
     };
     if !outcome.stats.has_usable_drawing_data() {
         let error = if recovery_mode {
-            format!(
-                "initial read failed: {initial_error}; recovery found no usable drawing data"
-            )
+            format!("initial read failed: {initial_error}; recovery found no usable drawing data")
         } else {
             "initial read returned no source drawing records".to_string()
         };
@@ -121,21 +112,21 @@ pub fn parse_document(
     }
     if recovery_mode {
         outcome.document.notifications.notify(
-            codec::notification::NotificationType::Error,
+            document::notification::NotificationType::Error,
             format!("Initial read failed; recovery mode continued: {initial_error}"),
         );
-        codec::push_read_diagnostic(
+        document::push_read_diagnostic(
             &mut outcome.stats.diagnostics,
-            codec::ReadDiagnostic::new(
+            document::ReadDiagnostic::new(
                 "strict-read-failed",
-                codec::ReadStage::RecordStream,
+                document::ReadStage::RecordStream,
                 initial_error,
             ),
         );
         outcome.stats.recovered_errors = outcome.stats.recovered_errors.saturating_add(1);
     }
-    let source_sha256 = report_fingerprint_needed(&outcome.stats)
-        .then(|| sha256_document_bytes(&bytes));
+    let source_sha256 =
+        report_fingerprint_needed(&outcome.stats).then(|| sha256_document_bytes(&bytes));
     report_stage.call1(&JsValue::NULL, &JsValue::from_str("serialize document"))?;
     let encoded = encode_result(Ok(outcome), source_sha256, false, &bytes)?;
     report_stage.call1(&JsValue::NULL, &JsValue::from_str("copy output"))?;
@@ -147,30 +138,52 @@ pub fn sha256_document(bytes: Uint8Array) -> String {
     sha256_document_bytes(&bytes.to_vec())
 }
 
-fn report_fingerprint_needed(stats: &codec::ReadStats) -> bool {
+/// Serialize an already-prepared document to DWG/DXF bytes on the dedicated
+/// browser worker, so the expensive writer pass (bit-level DWG encoding /
+/// ASCII DXF formatting) never occupies the UI thread. `encoded_document` is
+/// the shared `ocs_save` request payload (document + runtime-field sidecar +
+/// target extension); the reply is the shared response payload (protocol
+/// version + `Result<bytes, error text>`). The main wasm instance only decodes
+/// the result — the save-side counterpart of [`parse_document`].
+#[wasm_bindgen]
+pub fn serialize_document(
+    encoded_document: Uint8Array,
+    report_stage: &Function,
+) -> Result<Uint8Array, JsValue> {
+    console_error_panic_hook::set_once();
+    report_stage.call1(&JsValue::NULL, &JsValue::from_str("decode document"))?;
+    let (document, ext) = ocs_save::decode_request(&encoded_document.to_vec())?;
+    report_stage.call1(&JsValue::NULL, &JsValue::from_str("serialize drawing"))?;
+    let result = ocs_save::serialize_document(&document, &ext);
+    report_stage.call1(&JsValue::NULL, &JsValue::from_str("copy output"))?;
+    let encoded = ocs_save::encode_response(result)?;
+    Ok(Uint8Array::from(encoded.as_slice()))
+}
+
+fn report_fingerprint_needed(stats: &document::ReadStats) -> bool {
     stats.recovered() || stats.skipped_source_records > 0 || !stats.stream_completed
 }
 
-fn recoverable_reader_error(error: &codec::DxfError) -> bool {
+fn recoverable_reader_error(error: &document::DxfError) -> bool {
     matches!(
         error,
-        codec::DxfError::Compression(_)
-            | codec::DxfError::Parse(_)
-            | codec::DxfError::InvalidDxfCode(_)
-            | codec::DxfError::InvalidHandle(_)
-            | codec::DxfError::ObjectNotFound(_)
-            | codec::DxfError::InvalidEntityType(_)
-            | codec::DxfError::ChecksumMismatch { .. }
-            | codec::DxfError::InvalidHeader(_)
-            | codec::DxfError::InvalidFormat(_)
-            | codec::DxfError::InvalidSentinel(_)
-            | codec::DxfError::Decompression(_)
-            | codec::DxfError::Encoding(_)
+        document::DxfError::Compression(_)
+            | document::DxfError::Parse(_)
+            | document::DxfError::InvalidDxfCode(_)
+            | document::DxfError::InvalidHandle(_)
+            | document::DxfError::ObjectNotFound(_)
+            | document::DxfError::InvalidEntityType(_)
+            | document::DxfError::ChecksumMismatch { .. }
+            | document::DxfError::InvalidHeader(_)
+            | document::DxfError::InvalidFormat(_)
+            | document::DxfError::InvalidSentinel(_)
+            | document::DxfError::Decompression(_)
+            | document::DxfError::Encoding(_)
     )
 }
 
 fn encode_result(
-    result: Result<codec::ReadOutcome, (String, Option<codec::ReadStats>)>,
+    result: Result<document::ReadOutcome, (String, Option<document::ReadStats>)>,
     source_sha256: Option<String>,
     recoverable_parse_error: bool,
     bytes: &[u8],
@@ -178,33 +191,7 @@ fn encode_result(
     let runtime_fields = result
         .as_ref()
         .ok()
-        .map(|outcome| {
-            outcome
-                .document
-                .entities()
-                .map(|entity| {
-                    let common = entity.common();
-                    EntityRuntimeFields {
-                        handle: common.handle.value(),
-                        linetype_handle: common.linetype_handle.map(|handle| handle.value()),
-                        color_book_handle: common.color_book_handle.map(|handle| handle.value()),
-                        face_visual_style_handle: common
-                            .face_visual_style_handle
-                            .map(|handle| handle.value()),
-                        edge_visual_style_handle: common
-                            .edge_visual_style_handle
-                            .map(|handle| handle.value()),
-                        material_flags: common.material_flags,
-                        material_handle: common.material_handle.map(|handle| handle.value()),
-                        shadow_flags: common.shadow_flags,
-                        plotstyle_flags: common.plotstyle_flags,
-                        plotstyle_handle: common.plotstyle_handle.map(|handle| handle.value()),
-                        entity_mode: common.entity_mode,
-                        has_ds_data: common.has_ds_data,
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
+        .map(|outcome| ocs_save::extract_entity_runtime_fields(&outcome.document))
         .unwrap_or_default();
     let encoded = bincode::serialize(&(
         PROTOCOL_VERSION,
@@ -213,7 +200,7 @@ fn encode_result(
         recoverable_parse_error,
         runtime_fields,
     ))
-        .map_err(|error| worker_error(error.to_string(), bytes, true))?;
+    .map_err(|error| worker_error(error.to_string(), bytes, true))?;
     Ok(Uint8Array::from(encoded.as_slice()))
 }
 

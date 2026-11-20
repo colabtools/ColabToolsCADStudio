@@ -1,9 +1,11 @@
 use super::*;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::io::plot_style::PlotStyleTableExt as _;
 use crate::scene::model::object::PropValue;
 
-fn control_color(value: &Value) -> Result<codec::types::Color, Value> {
+pub(crate) fn control_color(value: &Value) -> Result<document::types::Color, Value> {
     if let Some(index) = value.as_i64().and_then(|v| i16::try_from(v).ok()) {
-        return Ok(codec::types::Color::from_index(index));
+        return Ok(document::types::Color::from_index(index));
     }
     if let Some(rgb) = value
         .get("rgb")
@@ -12,7 +14,7 @@ fn control_color(value: &Value) -> Result<codec::types::Color, Value> {
     {
         let component = |i: usize| rgb[i].as_u64().and_then(|v| u8::try_from(v).ok());
         return match (component(0), component(1), component(2)) {
-            (Some(r), Some(g), Some(b)) => Ok(codec::types::Color::from_rgb(r, g, b)),
+            (Some(r), Some(g), Some(b)) => Ok(document::types::Color::from_rgb(r, g, b)),
             _ => Err(failure(
                 "invalid_color",
                 "RGB components must be 0 through 255",
@@ -25,12 +27,12 @@ fn control_color(value: &Value) -> Result<codec::types::Color, Value> {
     ))
 }
 
-fn control_lineweight(value: &Value) -> Result<codec::types::LineWeight, Value> {
+fn control_lineweight(value: &Value) -> Result<document::types::LineWeight, Value> {
     let raw = value
         .as_i64()
         .and_then(|v| i16::try_from(v).ok())
         .ok_or_else(|| failure("invalid_lineweight", "Use the raw lineweight value"))?;
-    let candidate = codec::types::LineWeight::from_value(raw);
+    let candidate = document::types::LineWeight::from_value(raw);
     crate::ui::properties::lw_options()
         .iter()
         .any(|v| v.0 == candidate)
@@ -38,54 +40,201 @@ fn control_lineweight(value: &Value) -> Result<codec::types::LineWeight, Value> 
         .ok_or_else(|| failure("invalid_lineweight", "Value is not a standard lineweight"))
 }
 
-fn color_value(color: codec::types::Color) -> Value {
-    if let Some((r, g, b)) = color.rgb() {
+pub(crate) fn color_value(color: document::types::Color) -> Value {
+    if let Some((r, g, b)) = color.true_color_rgb() {
         json!({"rgb":[r,g,b]})
     } else {
         json!(color.index())
+    }
+}
+/// The id a row answers to: its parameter and component for a dynamic row,
+/// the palette's static field name otherwise.
+pub(crate) fn row_id(p: &crate::scene::model::object::Property) -> String {
+    match &p.value {
+        PropValue::BlockNumber { key, .. } | PropValue::BlockChoice { key, .. } => {
+            crate::scene::block_parameter_properties::field_id(key)
+        }
+        _ => p.field.to_owned(),
     }
 }
 /// One Properties-panel row as the control protocol's JSON (`id`, `label`,
 /// `kind`, `value`, `options`). The node graph moves values in this form too,
 /// so a port's value round-trips through [`OpenCADStudio::set_property_value`].
 pub(crate) fn property_json(p: &crate::scene::model::object::Property) -> Value {
-    let (kind,value,options)=match &p.value{
-                PropValue::ReadOnly(v)|PropValue::ReadOnlyWithTooltip{value:v,..}=>("readonly",json!(v),Value::Null),
-                PropValue::EditText(v)=>("number",json!(v),Value::Null),
-                PropValue::PlainText(v)=>("text",json!(v),Value::Null),
-                PropValue::Hyperlink(v)=>("hyperlink",json!(v),Value::Null),
-                PropValue::Choice{selected,options}=>("choice",json!(selected),json!(options)),
-                PropValue::EditChoice{value,options}=>("editable_choice",json!(value),json!(options)),
-                PropValue::LayerChoice(v)=>("layer",json!(v),Value::Null),
-                PropValue::LinetypeChoice(v)=>("linetype",json!(v),Value::Null),
-                PropValue::BoolToggle{value,..}=>("bool",json!(value),Value::Null),
-                PropValue::ColorChoice(value)|PropValue::NamedColorChoice{color:value,..}=>("color",color_value(*value),Value::Null),
-                PropValue::ColorVaries=>("color",Value::Null,Value::Null),
-                PropValue::LwChoice(value)|PropValue::FieldLwChoice{value,..}=>("lineweight",json!(value.value()),json!(crate::ui::properties::lw_options().iter().map(|v|v.0.value()).collect::<Vec<_>>())),
-                PropValue::LwVaries|PropValue::FieldLwVaries{..}=>("lineweight",Value::Null,json!(crate::ui::properties::lw_options().iter().map(|v|v.0.value()).collect::<Vec<_>>())),
-                PropValue::AttrText{tag,value}=>("attribute",json!({"tag":tag,"value":value}),Value::Null),
-                other=>("specialized",json!(format!("{other:?}")),Value::Null),
-    };json!({"id":p.field,"label":p.label,"kind":kind,"value":value,"options":options})
+    let (kind, value, options) = match &p.value {
+        PropValue::ReadOnly(v) | PropValue::ReadOnlyWithTooltip { value: v, .. } => {
+            ("readonly", json!(v), Value::Null)
+        }
+        PropValue::EditText(v) => ("number", json!(v), Value::Null),
+        PropValue::PlainText(v) => ("text", json!(v), Value::Null),
+        PropValue::Hyperlink(v) => ("hyperlink", json!(v), Value::Null),
+        PropValue::Choice { selected, options }
+        | PropValue::ChoiceWithTooltip {
+            selected, options, ..
+        } => ("choice", json!(selected), json!(options)),
+        PropValue::EditChoice { value, options } => {
+            ("editable_choice", json!(value), json!(options))
+        }
+        PropValue::LayerChoice(v) => ("layer", json!(v), Value::Null),
+        PropValue::LinetypeChoice(v) => ("linetype", json!(v), Value::Null),
+        PropValue::BoolToggle { value, .. } => ("bool", json!(value), Value::Null),
+        PropValue::ColorChoice(value) | PropValue::NamedColorChoice { color: value, .. } => {
+            ("color", color_value(*value), Value::Null)
+        }
+        PropValue::ColorVaries => ("color", Value::Null, Value::Null),
+        PropValue::LwChoice(value) | PropValue::FieldLwChoice { value, .. } => (
+            "lineweight",
+            json!(value.value()),
+            json!(crate::ui::properties::lw_options()
+                .iter()
+                .map(|v| v.0.value())
+                .collect::<Vec<_>>()),
+        ),
+        PropValue::LwVaries | PropValue::FieldLwVaries { .. } => (
+            "lineweight",
+            Value::Null,
+            json!(crate::ui::properties::lw_options()
+                .iter()
+                .map(|v| v.0.value())
+                .collect::<Vec<_>>()),
+        ),
+        PropValue::AttrText { tag, value } => {
+            ("attribute", json!({"tag":tag,"value":value}), Value::Null)
+        }
+        PropValue::BlockNumber { value, .. } => ("number", json!(value), Value::Null),
+        PropValue::BlockChoice {
+            selected, options, ..
+        } => (
+            "choice",
+            options
+                .get(*selected)
+                .map(|label| json!(label))
+                .unwrap_or(Value::Null),
+            json!(options),
+        ),
+        other => ("specialized", json!(format!("{other:?}")), Value::Null),
+    };
+    let mut row =
+        json!({"id":row_id(p),"label":p.label,"kind":kind,"value":value,"options":options});
+    if let PropValue::BlockNumber {
+        key, description, ..
+    }
+    | PropValue::BlockChoice {
+        key, description, ..
+    } = &p.value
+    {
+        row["description"] = json!(description);
+        row["component"] = json!(crate::scene::block_parameter_properties::component_id(
+            &key.component
+        ));
+        row["parameter"] = json!(format!("{:X}", key.parameter.value()));
+    }
+    row
 }
 pub(super) const NAMES: &[&str] = &[
     "close_modal",
+    "recovery_accept",
+    "conversion_loss_save_anyway",
+    "conversion_loss_back",
+    // Native-only: the "changed outside" dialog does not exist in the web
+    // build, so neither does its action set.
+    #[cfg(not(target_arch = "wasm32"))]
+    "external_change_reload",
+    #[cfg(not(target_arch = "wasm32"))]
+    "external_change_overwrite",
+    #[cfg(not(target_arch = "wasm32"))]
+    "external_change_save_as",
+    #[cfg(not(target_arch = "wasm32"))]
+    "external_change_cancel",
     "pdf_dialog_ok",
+    "txt2mtxt_settings",
+    "matchprop_settings",
+    "view_background",
+    "image_adjust",
+    "import_file_dialog",
+    "pdf_import_pick",
+    "pdf_import_dialog",
+    "dgn_import_dialog",
+    "tds_import_dialog",
+    "tds_material_dialog",
+    "tds_map_dialog",
+    "hatch_panel",
+    "hatch_boundary_warning",
+    "extraction_outdated",
+    "print_all",
+    "data_link_manager",
+    "data_extraction",
+    "refedit_dialog",
+    "pdf_password_dialog",
+    "dim_inspect_dialog",
+    "table_cell_dialog",
+    "table_cell_warning",
+    "table_cell_entry",
+    "hyperlink_dialog",
+    "object_scale_dialog",
+    "mleader_style_dialog",
+    "dimstyle_dialog",
+    "anno_scale_prompt",
+    "mtext_dialog",
+    "text_style_dialog",
+    "scale_list_dialog",
+    "spell_dialog",
+    "find_replace_dialog",
+    "table_cell_tab",
+    "command_submit",
+    "command_type",
+    "pdf_shx_settings",
     "pdf_layer_toggle",
+    "pc_manager_toggle",
+    "pc_manager",
+    "count_palette",
+    "blocks_palette",
     "pdf_page_select",
+    "pc_colormap",
+    "pc_section",
     "ribbon_tab",
     "ribbon_dropdown",
+    "plugin_install",
+    "plugin_search",
+    "keytips",
     "dialog_ok",
+    "dialog_answer",
+    // The attribute form's page steppers: `page=next|previous`.
+    "dialog_page",
+    "dialog_discard",
+    "dialog_cancel",
+    "block_def_dialog",
+    // The Write Block dialog's fields: `source=block|entire|objects`,
+    // `block=<name>`, `object_mode=retain|convert|delete`,
+    // `base_point=x,y[,z]`, `file=<path>` and `unit=<code|meters|mm|feet>`.
+    "wblock_dialog",
+    "table_insert_dialog",
+    "table_style_dialog",
+    "attdef_dialog",
+    // The enhanced attribute editor: `tab=attribute|text|properties`,
+    // `row=<n>`, `value=`, `style=`, `justify=`, `height=`, `rotation=`,
+    // `width=`, `oblique=`, `boundary=`, `backwards=0|1`, `upside_down=0|1`,
+    // `annotative=0|1`,
+    // `layer=`, `linetype=`, `color=`, `apply`, `ok`, `cancel`, `help`,
+    // `select_block`, `answer=save|discard|stay`, `dismiss`, `edit_value`,
+    // `insert_field`.
+    "attr_editor",
+    "field_dialog",
+    "attman_dialog",
+    "sheet_set",
     "close_document",
     "toggle_properties",
     "toggle_layers",
     "toggle_grid",
     "toggle_snap",
     "toggle_ortho",
+    "grip_menu_pick",
     "mtext_insert",
     "mtext_commit",
     "mtext_cancel",
     "text_input",
     "text_commit",
+    "command_escape",
     "layer_visible",
     "layer_locked",
     "layer_frozen",
@@ -97,7 +246,7 @@ pub(super) const NAMES: &[&str] = &[
 ];
 
 /// Parse the `at` placement point for `embed_image`: `[x,y]` or `[x,y,z]`.
-fn embed_point(req: &Value) -> Result<codec::types::Vector3, Value> {
+fn embed_point(req: &Value) -> Result<document::types::Vector3, Value> {
     let values = req["at"]
         .as_array()
         .filter(|v| (2..=3).contains(&v.len()))
@@ -109,82 +258,326 @@ fn embed_point(req: &Value) -> Result<codec::types::Vector3, Value> {
             .filter(|v| v.is_finite())
             .ok_or_else(|| failure("invalid_point", "Expected finite coordinates"))?;
     }
-    Ok(codec::types::Vector3::new(p[0], p[1], p[2]))
+    Ok(document::types::Vector3::new(p[0], p[1], p[2]))
 }
+fn parse_point_2d(val: &Value) -> Result<[f64; 2], Value> {
+    let arr = val
+        .as_array()
+        .filter(|v| v.len() >= 2)
+        .ok_or_else(|| failure("invalid_point", "Expected [x, y]"))?;
+    let x = arr[0]
+        .as_f64()
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| failure("invalid_point", "Expected finite coordinates"))?;
+    let y = arr[1]
+        .as_f64()
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| failure("invalid_point", "Expected finite coordinates"))?;
+    Ok([x, y])
+}
+
+fn parse_calibrate(
+    cal: &Value,
+    pixel_width: u32,
+    pixel_height: u32,
+) -> Result<(document::types::Vector3, f64, f64), Value> {
+    let pt_a = cal
+        .get("point_a")
+        .or_else(|| cal.get("pixel_a"))
+        .or_else(|| cal.get("p1"))
+        .or_else(|| cal.get("source_a"));
+    let pt_b = cal
+        .get("point_b")
+        .or_else(|| cal.get("pixel_b"))
+        .or_else(|| cal.get("p2"))
+        .or_else(|| cal.get("source_b"));
+    let dist = cal
+        .get("distance")
+        .or_else(|| cal.get("real_distance"))
+        .or_else(|| cal.get("length"))
+        .and_then(Value::as_f64);
+
+    if let (Some(pa), Some(pb), Some(d_real)) = (pt_a, pt_b, dist) {
+        if !d_real.is_finite() || d_real <= 0.0 {
+            return Err(failure(
+                "invalid_distance",
+                "Calibration distance must be positive",
+            ));
+        }
+        let p1 = parse_point_2d(pa)?;
+        let p2 = parse_point_2d(pb)?;
+        let d_px = ((p2[0] - p1[0]).powi(2) + (p2[1] - p1[1]).powi(2)).sqrt();
+        if d_px <= 1e-6 {
+            return Err(failure(
+                "invalid_points",
+                "Calibration reference points must be distinct",
+            ));
+        }
+        let scale = d_real / d_px;
+        let width = pixel_width as f64 * scale;
+
+        let align_to = cal
+            .get("align_to")
+            .or_else(|| cal.get("origin"))
+            .or_else(|| cal.get("target_a"))
+            .map(parse_point_2d)
+            .transpose()?
+            .unwrap_or([0.0, 0.0]);
+
+        let x_ll = align_to[0] - p1[0] * scale;
+        let y_ll = align_to[1] - (pixel_height as f64 - p1[1]) * scale;
+        return Ok((document::types::Vector3::new(x_ll, y_ll, 0.0), width, scale));
+    }
+
+    if let (Some(src_pts), Some(tgt_pts)) = (
+        cal.get("source_points").and_then(Value::as_array),
+        cal.get("target_points").and_then(Value::as_array),
+    ) {
+        if src_pts.len() >= 2 && tgt_pts.len() >= 2 {
+            let p_s1 = parse_point_2d(&src_pts[0])?;
+            let p_s2 = parse_point_2d(&src_pts[1])?;
+            let p_t1 = parse_point_2d(&tgt_pts[0])?;
+            let p_t2 = parse_point_2d(&tgt_pts[1])?;
+            let d_px = ((p_s2[0] - p_s1[0]).powi(2) + (p_s2[1] - p_s1[1]).powi(2)).sqrt();
+            let d_cad = ((p_t2[0] - p_t1[0]).powi(2) + (p_t2[1] - p_t1[1]).powi(2)).sqrt();
+            if d_px <= 1e-6 {
+                return Err(failure(
+                    "invalid_points",
+                    "Source calibration points must be distinct",
+                ));
+            }
+            let scale = d_cad / d_px;
+            let width = pixel_width as f64 * scale;
+            let x_ll = p_t1[0] - p_s1[0] * scale;
+            let y_ll = p_t1[1] - (pixel_height as f64 - p_s1[1]) * scale;
+            return Ok((document::types::Vector3::new(x_ll, y_ll, 0.0), width, scale));
+        }
+    }
+
+    Err(failure(
+        "invalid_calibrate",
+        "calibrate requires point_a:[x,y], point_b:[x,y], distance:number, and optional align_to:[x,y]",
+    ))
+}
+
+/// Reads and decodes an `embed_image` picture.
+#[cfg(not(target_arch = "wasm32"))]
+type EmbedImageReader = fn(&str) -> Result<crate::io::ole_embed::EmbeddedImage, String>;
+
+/// What an `embed_image` read gives back: the request, the picture's path
+/// and the picture (or why it cannot be read).
+#[cfg(not(target_arch = "wasm32"))]
+pub(in crate::app) type EmbedImageRead = (
+    Value,
+    String,
+    Result<crate::io::ole_embed::EmbeddedImage, String>,
+);
+
+/// Read and decode an `embed_image` picture (run on a worker thread).
+#[cfg(not(target_arch = "wasm32"))]
+fn read_embed_image(path: &str) -> Result<crate::io::ole_embed::EmbeddedImage, String> {
+    crate::io::ole_embed::EmbeddedImage::from_file(std::path::Path::new(path))
+}
+
 impl OpenCADStudio {
-    /// `embed_image` — pack the picture at `path` into an OLE2FRAME placed
-    /// with its lower-left corner at `at` (default width ≈ pixel_width/100,
-    /// like the interactive command's Enter answer) and commit it as one
-    /// undo step. The drawing stays self-contained: no external file to lose.
+    /// `embed_image` — pack the picture at `path` into an OLE2FRAME or linked RasterImage
+    /// placed with its lower-left corner at `at` (default width ≈ pixel_width/100).
+    /// Supports automatic reference scaling and calibration via `calibrate`:
+    /// `{"point_a": [px1, py1], "point_b": [px2, py2], "distance": 6500.0, "align_to": [0, 0]}`.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn control_embed_image(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        let path = string(req, "path")?.to_string();
+        Ok(self.control_embed_image_with(req.clone(), path, read_embed_image))
+    }
+
+    /// The picture is read and decoded off the UI thread; it is placed when
+    /// the worker ends ([`Self::finish_control_embed_image`]), and the
+    /// operation settles then: with its result, or with the failure it
+    /// answered at once before (the same `code` and `error`). The reader is
+    /// given, so a test can give one that panics.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(in crate::app) fn control_embed_image_with(
+        &mut self,
+        req: Value,
+        path: String,
+        reader: EmbedImageReader,
+    ) -> Task<Message> {
         let i = self.active_tab;
-        let path = string(req, "path")?;
-        let image = crate::io::ole_embed::EmbeddedImage::from_file(std::path::Path::new(&path))
-            .map_err(|e| failure("embed_failed", e))?;
-        let at = embed_point(req)?;
-        let default_width = (image.pixel_width as f64 / 100.0).max(1.0);
-        let width = req["width"].as_f64().filter(|w| *w > 0.0).unwrap_or(default_width);
+        let (tab_id, generation) = (self.tabs[i].id, self.tabs[i].document_generation);
+        crate::app::update::background_task(
+            "embed_image",
+            {
+                let path = path.clone();
+                move || reader(&path)
+            },
+            move |read| Message::EmbedImageRead(tab_id, generation, Box::new((req, path, read))),
+        )
+    }
+
+    /// The end of the operation's read: the picture is placed in the drawing
+    /// the operation started in, as it was placed at once before, and the
+    /// operation's result or failure is set.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(in crate::app) fn finish_control_embed_image(
+        &mut self,
+        tab_id: u64,
+        generation: u64,
+        read: EmbedImageRead,
+    ) {
+        let (req, path, read) = read;
+        let image = match read {
+            Ok(image) => image,
+            Err(error) => {
+                self.set_control_failure(failure("embed_failed", error));
+                return;
+            }
+        };
+        let Some(i) = self.import_target(tab_id, generation) else {
+            self.set_control_failure(failure(
+                "document_closed",
+                "The drawing to place the picture in was closed or replaced during the read",
+            ));
+            return;
+        };
+        if let Err(error) = self.place_embedded_image(i, &req, &path, &image) {
+            self.set_control_failure(error);
+        }
+    }
+
+    /// Place the picture read for `embed_image` request `req` in drawing `i`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn place_embedded_image(
+        &mut self,
+        i: usize,
+        req: &Value,
+        path: &str,
+        image: &crate::io::ole_embed::EmbeddedImage,
+    ) -> Result<(), Value> {
+        let (at, width, scale) = if let Some(cal) = req.get("calibrate") {
+            parse_calibrate(cal, image.pixel_width, image.pixel_height)?
+        } else if let (Some(src_pts), Some(tgt_pts)) = (
+            req.get("source_points").and_then(Value::as_array),
+            req.get("target_points").and_then(Value::as_array),
+        ) {
+            let dummy = json!({"source_points": src_pts, "target_points": tgt_pts});
+            parse_calibrate(&dummy, image.pixel_width, image.pixel_height)?
+        } else {
+            let default_width = (image.pixel_width as f64 / 100.0).max(1.0);
+            let width = req["width"]
+                .as_f64()
+                .filter(|w| *w > 0.0)
+                .unwrap_or(default_width);
+            let scale = width / image.pixel_width as f64;
+            (embed_point(req)?, width, scale)
+        };
+
+        let final_at = if req.get("calibrate").is_none() && req.get("source_points").is_none() {
+            at
+        } else {
+            embed_point(req).unwrap_or(at)
+        };
+        let final_width = req["width"].as_f64().filter(|w| *w > 0.0).unwrap_or(width);
+        let height = final_width * image.pixel_height as f64 / image.pixel_width as f64;
+
+        let layer_name = req["layer"].as_str().filter(|l| !l.is_empty());
+        let lock_layer = req["lock_layer"].as_bool().unwrap_or(false);
+
         if req["linked"].as_bool().unwrap_or(false) {
-            // Path-linked RasterImage + ImageDefinition: the drawing stores
-            // only the file path, so the picture file must travel with the
-            // drawing (unlike the embedded OLE2FRAME default below).
             self.push_undo_snapshot(i, "IMAGEATTACH");
-            let height = width * image.pixel_height as f64 / image.pixel_width as f64;
             let handle = {
                 let document = &mut self.tabs[i].scene.document;
-                let definition_handle = document.allocate_handle();
-                let mut definition = codec::objects::ImageDefinition::with_dimensions(
+                let mut entity = document::entities::RasterImage::with_size(
                     path,
-                    image.pixel_width,
-                    image.pixel_height,
-                );
-                definition.handle = definition_handle;
-                document.objects.insert(
-                    definition_handle,
-                    codec::objects::ObjectType::ImageDefinition(definition),
-                );
-                let mut entity = codec::entities::RasterImage::with_size(
-                    path,
-                    at,
+                    final_at,
                     image.pixel_width as f64,
                     image.pixel_height as f64,
-                    width,
+                    final_width,
                     height,
                 );
-                entity.definition_handle = Some(definition_handle);
-                document
-                    .add_entity(codec::EntityType::RasterImage(entity))
-                    .map_err(|e| failure("embed_failed", e))?
+                if let Some(l_name) = layer_name {
+                    entity.common.layer = l_name.to_string();
+                    if !document.layers.contains(l_name) {
+                        let mut layer_record = document::tables::Layer::new(l_name.to_string());
+                        layer_record.handle = document.allocate_handle();
+                        if lock_layer {
+                            layer_record.flags.locked = true;
+                        }
+                        let _ = document.layers.add(layer_record);
+                    } else if lock_layer {
+                        if let Some(l) = document.layers.get_mut(l_name) {
+                            l.flags.locked = true;
+                        }
+                    }
+                }
+                let handle = self.tabs[i]
+                    .scene
+                    .add_entity(document::EntityType::RasterImage(entity));
+                if handle.is_null() {
+                    return Err(failure("embed_failed", "Could not add image"));
+                }
+                handle
             };
             self.tabs[i].scene.populate_images_from_document();
+            if layer_name.is_some() {
+                self.refresh_layer_panel();
+            }
             self.post_ref_op(i);
             self.set_control_result(json!({
                 "handle": format!("{:X}", handle.value()),
                 "kind": "RasterImage",
                 "path": path,
-                "width": width,
+                "at": [final_at.x, final_at.y, final_at.z],
+                "width": final_width,
                 "height": height,
+                "scale": scale,
                 "linked": true,
+                "layer": layer_name.unwrap_or("0"),
             }));
-            return Ok(Task::none());
+            return Ok(());
         }
+
         self.push_undo_snapshot(i, "IMAGEEMBED");
         let handle = crate::io::ole_embed::add_embedded_image(
             &mut self.tabs[i].scene.document,
-            &image,
-            at,
-            width,
+            image,
+            final_at,
+            final_width,
         )
         .map_err(|e| failure("embed_failed", e))?;
+
+        if let Some(l_name) = layer_name {
+            let document = &mut self.tabs[i].scene.document;
+            if !document.layers.contains(l_name) {
+                let mut layer_record = document::tables::Layer::new(l_name.to_string());
+                layer_record.handle = document.allocate_handle();
+                if lock_layer {
+                    layer_record.flags.locked = true;
+                }
+                let _ = document.layers.add(layer_record);
+            } else if lock_layer {
+                if let Some(l) = document.layers.get_mut(l_name) {
+                    l.flags.locked = true;
+                }
+            }
+            if let Some(ent) = document.get_entity_mut(handle) {
+                ent.common_mut().layer = l_name.to_string();
+            }
+            self.refresh_layer_panel();
+        }
+
         self.post_ref_op(i);
         self.set_control_result(json!({
             "handle": format!("{:X}", handle.value()),
             "kind": "Ole2Frame",
             "path": path,
-            "width": width,
+            "at": [final_at.x, final_at.y, final_at.z],
+            "width": final_width,
+            "height": height,
+            "scale": scale,
+            "linked": false,
+            "layer": layer_name.unwrap_or("0"),
         }));
-        Ok(Task::none())
+        Ok(())
     }
 
     /// `wblock` — write the named block's entities or the listed entity handles
@@ -192,8 +585,16 @@ impl OpenCADStudio {
     /// this needs no undo snapshot. Format follows the path extension.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn control_wblock(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        if self.tabs[self.active_tab].block_test.is_some() {
+            return Err(failure(
+                "temporary_document",
+                "Test Block is temporary and cannot be saved",
+            ));
+        }
         let path = string(req, "path")?;
-        let document = &self.tabs[self.active_tab].scene.document;
+        // The export is built from the document as a save writes it: the
+        // header's save stamps and the current display form of the geometry.
+        let document = self.tabs[self.active_tab].document_for_save();
         // A template base keeps its tables/styles in the exported file
         // (Catalog §2.1: clone from a .dwt/.dwg template).
         let template_base = match req["template"].as_str().filter(|t| !t.is_empty()) {
@@ -207,13 +608,15 @@ impl OpenCADStudio {
             match &template_base {
                 Some(base) => {
                     let mut base = base.clone();
-                    crate::modules::insert::wblock::extract_block_into(document, block, &mut base)?;
+                    crate::modules::insert::wblock::extract_block_into(
+                        &document, block, &mut base,
+                    )?;
                     Ok(base)
                 }
-                None => crate::modules::insert::wblock::extract_block_to_doc(document, block),
+                None => crate::modules::insert::wblock::extract_block_to_doc(&document, block),
             }
         } else if let Some(listed) = req["handles"].as_array() {
-            let handles: Result<Vec<codec::Handle>, Value> = listed
+            let handles: Result<Vec<document::Handle>, Value> = listed
                 .iter()
                 .map(|v| {
                     u64::from_str_radix(
@@ -223,7 +626,7 @@ impl OpenCADStudio {
                             .trim_start_matches("0X"),
                         16,
                     )
-                    .map(codec::Handle::new)
+                    .map(document::Handle::new)
                     .map_err(|_| {
                         failure(
                             "invalid_handle",
@@ -236,13 +639,13 @@ impl OpenCADStudio {
                 Some(base) => {
                     let mut base = base.clone();
                     crate::modules::insert::wblock::extract_entities_into(
-                        document,
-                        &handles?,
-                        &mut base,
+                        &document, &handles?, &mut base,
                     )?;
                     Ok(base)
                 }
-                None => crate::modules::insert::wblock::extract_entities_to_doc(document, &handles?),
+                None => {
+                    crate::modules::insert::wblock::extract_entities_to_doc(&document, &handles?)
+                }
             }
         } else {
             return Err(failure(
@@ -293,13 +696,17 @@ impl OpenCADStudio {
     /// fields win over a layout's stored page setup; unspecified fields keep
     /// the stored setup (layouts) or the app's plot defaults (Model).
     #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn control_plot(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+    pub(in crate::app) fn control_plot(&mut self, req: &Value) -> Result<Task<Message>, Value> {
         use crate::io::pdf_export::PdfPageInput;
 
         let path = string(req, "path")?;
-        if !path.to_ascii_lowercase().ends_with(".pdf") {
-            return Err(failure("invalid_path", "plot writes .pdf files"));
+        let lower = path.to_ascii_lowercase();
+        // SVG shares the plot page with PDF: the writer follows the extension.
+        let is_svg = lower.ends_with(".svg");
+        if !is_svg && !lower.ends_with(".pdf") {
+            return Err(failure("invalid_path", "plot writes .pdf or .svg files"));
         }
+        self.stamp_plot_fields();
         let i = self.active_tab;
         let names = self.tabs[i].scene.layout_names();
         let requested = req["layout"].as_str().unwrap_or("Model").to_owned();
@@ -311,16 +718,50 @@ impl OpenCADStudio {
                 .find(|name| name.eq_ignore_ascii_case(&requested))
                 .cloned()
                 .ok_or_else(|| {
-                    failure("layout_missing", format!("Layout '{requested}' does not exist"))
+                    failure(
+                        "layout_missing",
+                        format!("Layout '{requested}' does not exist"),
+                    )
                 })?]
         };
 
         // Optional plot style table: a CTB path or a folder-discovered name.
         let style = req["plot_style"].as_str().filter(|s| !s.is_empty());
+        let external_tables = req
+            .get("plot_style_files")
+            .map(|value| {
+                value
+                    .as_array()
+                    .and_then(|files| {
+                        files
+                            .iter()
+                            .map(|file| file.as_str().map(std::path::PathBuf::from))
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .ok_or_else(|| {
+                        failure(
+                            "invalid_value",
+                            "plot_style_files must be an array of file paths",
+                        )
+                    })
+            })
+            .transpose()?;
+        if style.is_some() && external_tables.is_some() {
+            return Err(failure(
+                "invalid_value",
+                "Choose either plot_style or plot_style_files",
+            ));
+        }
+        let drawing_base = crate::io::drawing_dir(&self.tabs[i].scene.document);
         let loaded_style = match style {
-            Some(name) => Some(
+            // An existing file reports its own load error; anything else is
+            // looked up by name in the plot styles folder.
+            Some(name) if std::path::Path::new(name).is_file() => Some(
                 crate::io::plot_style::PlotStyleTable::load(std::path::Path::new(name))
-                    .or_else(|_| crate::io::plot_style::PlotStyleTable::load_named(name))
+                    .map_err(|e| failure("plot_style_invalid", e))?,
+            ),
+            Some(name) => Some(
+                crate::io::plot_style::PlotStyleTable::load_named_at(name, drawing_base)
                     .map_err(|e| failure("plot_style_missing", e))?,
             ),
             None => None,
@@ -345,6 +786,7 @@ impl OpenCADStudio {
             };
         }
         let explicit_scale = req.get("scale").is_some();
+        let explicit_fit = req.get("fit").is_some();
         if let Some(scale) = req["scale"].as_str().filter(|s| !s.is_empty()) {
             request.scale = scale.to_owned();
             request.fit_to_paper = false;
@@ -359,28 +801,51 @@ impl OpenCADStudio {
         if let Some(offset) = req["offset_y"].as_f64() {
             request.offset_y = offset.to_string();
         }
+        if let Some(outlines) = req["text_as_outlines"].as_bool() {
+            request.text_as_outlines = outlines;
+        }
+        if let Some(layer_attrs) = req["layer_attributes"].as_bool() {
+            request.layer_attributes = layer_attrs;
+        }
         if req.get("upside_down").is_some() {
             request.upside_down = req["upside_down"].as_bool().unwrap_or(false);
+        }
+        if let Some(shade) = req["shade"].as_str() {
+            request.shade = crate::io::plot::SHADE_PLOT_MODES
+                .iter()
+                .find(|mode| mode.eq_ignore_ascii_case(shade))
+                .ok_or_else(|| failure("invalid_value", format!("Unknown shade mode '{shade}'")))?
+                .to_string();
         }
         for (key, field) in [
             ("transparency", 0),
             ("lineweights", 1),
             ("merge_lines", 2),
             ("stamp", 3),
+            ("non_scaling_stroke", 4),
+            ("scale_lineweights", 5),
+            ("paperspace_last", 6),
+            ("apply_plot_styles", 7),
         ] {
             if let Some(flag) = req[key].as_bool() {
                 match field {
                     0 => request.transparency = flag,
                     1 => request.lineweights = flag,
                     2 => request.merge_lines = flag,
-                    _ => request.stamp = flag,
+                    3 => request.stamp = flag,
+                    4 => request.non_scaling_stroke = flag,
+                    5 => request.scale_lw = flag,
+                    6 => request.paperspace_last = flag,
+                    _ => request.apply_plot_styles = flag,
                 }
             }
         }
         if let Some(table) = &loaded_style {
             self.active_plot_style = Some(table.clone());
             request.style_name = table.name.clone();
-            request.apply_plot_styles = true;
+            // Selecting a table enables it by default, but an explicit false
+            // still wins so callers can keep the table selected without using it.
+            request.apply_plot_styles = req["apply_plot_styles"].as_bool().unwrap_or(true);
             request.style_missing = false;
         }
         let area_explicit = req.get("area").is_some();
@@ -392,9 +857,15 @@ impl OpenCADStudio {
             "limits" => request.area = "Limits".into(),
             "layout" => request.area = "Layout".into(),
             "window" => {
-                let values = req["window"].as_array().filter(|v| v.len() == 4).ok_or_else(|| {
-                    failure("window_required", "area \"window\" needs window:[x0,y0,x1,y1]")
-                })?;
+                let values = req["window"]
+                    .as_array()
+                    .filter(|v| v.len() == 4)
+                    .ok_or_else(|| {
+                        failure(
+                            "window_required",
+                            "area \"window\" needs window:[x0,y0,x1,y1]",
+                        )
+                    })?;
                 let coord = |k: usize| {
                     values[k].as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
                         failure("invalid_window", "window must be four finite numbers")
@@ -409,13 +880,20 @@ impl OpenCADStudio {
         // Snapshot everything the pipeline reads or mutates, like print-all.
         let original_layout = self.tabs[i].scene.current_layout.clone();
         let original_viewport = self.tabs[i].scene.active_viewport;
-        let original_psltscale = self.tabs[i].scene.document.header.paper_space_linetype_scaling;
+        let original_psltscale = self.tabs[i]
+            .scene
+            .document
+            .header
+            .paper_space_linetype_scaling;
         let original_plimcheck = self.tabs[i].scene.document.header.paper_space_limit_check;
         let original_dialog = self.plot_dialog.clone();
         let original_window = self.plot_window;
         let original_style = self.active_plot_style.clone();
         let original_camera = self.tabs[i].scene.camera.borrow().clone();
         let original_camera_generation = self.tabs[i].scene.camera_generation;
+        // A requested table is only a fallback when the request enables it.
+        // Otherwise `page.plot_style = None` would be undone at export time.
+        let export_style = loaded_style.as_ref().filter(|_| request.apply_plot_styles);
 
         let build = |app: &mut Self| -> Result<Vec<PdfPageInput>, String> {
             let mut pages = Vec::with_capacity(targets.len());
@@ -433,6 +911,13 @@ impl OpenCADStudio {
                     if page_dialog.area == "Layout" {
                         page_dialog.area = "Extents".into();
                     }
+                    // Model has no stored page-setup load below. Honor the
+                    // API's documented default rather than a persisted non-fit
+                    // dialog preference when neither scale nor fit was
+                    // requested.
+                    if !explicit_scale && !explicit_fit {
+                        page_dialog.fit_to_paper = true;
+                    }
                 } else if let Some(page_setup) = app.tabs[i].scene.plot_settings_for(name) {
                     // Stored page setup first, then the explicit request
                     // fields on top (a layout plot's behaviour).
@@ -441,8 +926,13 @@ impl OpenCADStudio {
                     app.load_plotsettings_into_dialog(&page_setup);
                     page_dialog = app.plot_dialog.clone();
                     page_dialog.paper_space = true;
+                    // An explicit area brings its window rect (the "Window"
+                    // plot branch reads `page_dialog.window`): a named
+                    // layout's stored setup must not swallow it. Without
+                    // `area` the request's rect is the dialog's leftover.
                     if area_explicit {
                         page_dialog.area = request.area.clone();
+                        page_dialog.window = request.window;
                     }
                     if request.paper_width_mm == 0.0 && !request.paper.is_empty() {
                         page_dialog.paper = request.paper.clone();
@@ -468,6 +958,76 @@ impl OpenCADStudio {
                     if req.get("upside_down").is_some() {
                         page_dialog.upside_down = request.upside_down;
                     }
+                    // Explicit output flags win over the stored page setup too,
+                    // like paper, scale and area above.
+                    if req["transparency"].is_boolean() {
+                        page_dialog.transparency = request.transparency;
+                    }
+                    if req["lineweights"].is_boolean() {
+                        page_dialog.lineweights = request.lineweights;
+                    }
+                    if req["merge_lines"].is_boolean() {
+                        page_dialog.merge_lines = request.merge_lines;
+                    }
+                    if req["text_as_outlines"].is_boolean() {
+                        page_dialog.text_as_outlines = request.text_as_outlines;
+                    }
+                    if req["stamp"].is_boolean() {
+                        page_dialog.stamp = request.stamp;
+                    }
+                    if req["non_scaling_stroke"].is_boolean() {
+                        page_dialog.non_scaling_stroke = request.non_scaling_stroke;
+                    }
+                    if req["layer_attributes"].is_boolean() {
+                        page_dialog.layer_attributes = request.layer_attributes;
+                    }
+                    if req["scale_lineweights"].is_boolean() {
+                        page_dialog.scale_lw = request.scale_lw;
+                    }
+                    if req["paperspace_last"].is_boolean() {
+                        page_dialog.paperspace_last = request.paperspace_last;
+                    }
+                    if req["apply_plot_styles"].is_boolean() {
+                        page_dialog.apply_plot_styles = request.apply_plot_styles;
+                    }
+                    if req["shade"].is_string() {
+                        page_dialog.shade = request.shade.clone();
+                    }
+                    // The requested table wins over the layout's own, which
+                    // the stored page setup just loaded (or failed to find).
+                    if let Some(table) = &loaded_style {
+                        app.active_plot_style = Some(table.clone());
+                        page_dialog.style_name = table.name.clone();
+                        page_dialog.apply_plot_styles =
+                            req["apply_plot_styles"].as_bool().unwrap_or(true);
+                        page_dialog.style_missing = false;
+                        page_dialog.style_error = None;
+                    }
+                }
+                if let Some(files) = &external_tables {
+                    app.active_plot_style = None;
+                    if page_dialog.apply_plot_styles && !page_dialog.style_name.is_empty() {
+                        let tab = &app.tabs[i];
+                        let document = &tab.scene.document;
+                        let named = !document.header.plotstyle_mode;
+                        let sha256 = tab
+                            .ifccad_session
+                            .as_ref()
+                            .and_then(|session| {
+                                session.plot_style_source(document, name, &page_dialog.style_name)
+                            })
+                            .and_then(|source| source.sha256.as_deref());
+                        let table = crate::io::plot_style::resolve_external_table(
+                            &page_dialog.style_name,
+                            named,
+                            sha256,
+                            files,
+                        )
+                        .map_err(|error| format!("Layout {name:?}: {error}"))?;
+                        page_dialog.style_missing = false;
+                        page_dialog.style_error = None;
+                        app.active_plot_style = Some(table);
+                    }
                 }
                 app.plot_dialog = page_dialog;
                 if app.plot_dialog.area == "Display" {
@@ -492,8 +1052,12 @@ impl OpenCADStudio {
                     }
                     _ => None,
                 };
-                let page =
-                    page.ok_or_else(|| format!("Layout '{name}' plot area is empty."))?;
+                let page = page.ok_or_else(|| format!("Layout '{name}' plot area is empty."))?;
+                if !is_svg {
+                    app.validate_geopdf_page(&page)?;
+                }
+                page.validate_plot_styles(export_style)
+                    .map_err(|error| format!("Layout {name:?}: {error}"))?;
                 pages.push(page);
             }
             Ok(pages)
@@ -501,7 +1065,11 @@ impl OpenCADStudio {
         let built = build(self);
         self.tabs[i].scene.current_layout = original_layout;
         self.tabs[i].scene.active_viewport = original_viewport;
-        self.tabs[i].scene.document.header.paper_space_linetype_scaling = original_psltscale;
+        self.tabs[i]
+            .scene
+            .document
+            .header
+            .paper_space_linetype_scaling = original_psltscale;
         self.tabs[i].scene.document.header.paper_space_limit_check = original_plimcheck;
         self.plot_dialog = original_dialog;
         self.plot_window = original_window;
@@ -510,22 +1078,43 @@ impl OpenCADStudio {
         self.tabs[i].scene.camera_generation = original_camera_generation;
         let pages = built.map_err(|e| failure("plot_failed", e))?;
         if req["per_page"].as_bool().unwrap_or(false) {
-            // One PDF per layout: <stem>-<Layout>.pdf beside the requested
+            // One file per layout: <stem>-<Layout>.pdf/.svg beside the requested
             // path (sheet-by-sheet delivery).
-            let stem = path.strip_suffix(".pdf").unwrap_or(path).to_owned();
+            let stem = path
+                .strip_suffix(".pdf")
+                .or_else(|| path.strip_suffix(".PDF"))
+                .or_else(|| path.strip_suffix(".svg"))
+                .or_else(|| path.strip_suffix(".SVG"))
+                .unwrap_or(path)
+                .to_owned();
+            let ext = if is_svg { "svg" } else { "pdf" };
             let mut files = Vec::with_capacity(pages.len());
             for (name, page) in targets.iter().zip(&pages) {
                 let safe: String = name
                     .chars()
-                    .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                    .map(|c| {
+                        if c.is_alphanumeric() || c == '-' || c == '_' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
                     .collect();
-                let file = format!("{stem}-{safe}.pdf");
-                crate::io::pdf_export::export_pdf_pages(
-                    std::slice::from_ref(page),
-                    std::path::Path::new(&file),
-                    loaded_style.as_ref(),
-                )
-                .map_err(|e| failure("plot_failed", e))?;
+                let file = format!("{stem}-{safe}.{ext}");
+                let result = if is_svg {
+                    crate::io::svg_export::export_svg_pages(
+                        std::slice::from_ref(page),
+                        std::path::Path::new(&file),
+                        export_style,
+                    )
+                } else {
+                    crate::io::pdf_export::export_plot_pdf_pages(
+                        std::slice::from_ref(page),
+                        std::path::Path::new(&file),
+                        export_style,
+                    )
+                };
+                result.map_err(|e| failure("plot_failed", e))?;
                 files.push(json!({"layout": name, "path": file}));
             }
             self.set_control_result(json!({ "files": files, "pages": pages.len() }));
@@ -534,12 +1123,20 @@ impl OpenCADStudio {
         // Pages may drop the style when a stored page setup overwrites the
         // dialog's style fields, so the explicit request style rides along as
         // the export-level fallback.
-        crate::io::pdf_export::export_pdf_pages(
-            &pages,
-            std::path::Path::new(path),
-            loaded_style.as_ref(),
-        )
-        .map_err(|e| failure("plot_failed", e))?;
+        let result = if is_svg {
+            crate::io::svg_export::export_svg_pages(
+                &pages,
+                std::path::Path::new(path),
+                export_style,
+            )
+        } else {
+            crate::io::pdf_export::export_plot_pdf_pages(
+                &pages,
+                std::path::Path::new(path),
+                export_style,
+            )
+        };
+        result.map_err(|e| failure("plot_failed", e))?;
         self.set_control_result(json!({
             "path": path,
             "pages": pages.len(),
@@ -555,6 +1152,582 @@ impl OpenCADStudio {
         self.refresh_properties();
         json!({"ok":true,"sections":self.tabs[self.active_tab].properties.sections.iter().map(|s|json!({"title":s.title,"properties":s.props.iter().map(property_json).collect::<Vec<_>>()})).collect::<Vec<_>>()})
     }
+    /// The grips of the current selection, as the viewport shows them.
+    pub(super) fn control_grips(&self) -> Value {
+        let tab = &self.tabs[self.active_tab];
+        let grips = tab
+            .selected_grip_handles
+            .iter()
+            .zip(&tab.selected_grips)
+            .map(|(owner, grip)| {
+                json!({
+                    "handle": format!("{:X}", owner.value()),
+                    "grip_id": grip.id,
+                    "point": [grip.world.x, grip.world.y, grip.world.z],
+                    "shape": format!("{:?}", grip.shape),
+                    "moves_entity": grip.is_midpoint,
+                    "axis": grip.axis.map(|a| [a.x, a.y, a.z]),
+                })
+            })
+            .collect::<Vec<_>>();
+        // API v11: plugin-declared custom grips of the active tab, each marked
+        // with its owning plugin. `moves_entity` is false by construction —
+        // the host never moves anything for a custom grip; any edit is the
+        // plugin's own, at settle.
+        #[cfg(target_arch = "wasm32")]
+        let plugin_grips: Vec<Value> = Vec::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        let visible = crate::plugin::grip_points::visibility(&self.disabled_plugins);
+        #[cfg(not(target_arch = "wasm32"))]
+        let plugin_grips = tab
+            .plugin_grips
+            .query_all(&visible)
+            .iter()
+            .map(|grip| {
+                json!({
+                    "plugin": grip.plugin,
+                    "grip_id": grip.grip_id,
+                    "handle": grip.anchor.map(|handle| format!("{:X}", handle.value())),
+                    "point": [grip.point.x, grip.point.y, grip.point.z],
+                    "shape": format!("{:?}", grip.shape),
+                    "moves_entity": false,
+                    "axis": grip.axis.map(|a| [a.x, a.y, a.z]),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({"ok": true, "grips": grips, "plugin_grips": plugin_grips})
+    }
+
+    /// Drag one grip of an entity to a world point through the viewport's
+    /// own grip gesture: select the entity, engage the grip, move, place.
+    /// Object snaps, grid, ortho, polar and tracking are off for the move so
+    /// the grip lands on `point`.
+    pub(super) fn control_grip_drag(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        let i = self.active_tab;
+        // API v11: a `plugin` names the owner of a custom grip — the drag
+        // routes to the plugin through the same live machinery the viewport
+        // uses (begin → move → settle; preview frames flow; the settle is
+        // the plugin's own one-undo-step write).
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(plugin) = req["plugin"].as_str() {
+            let grip_id = req["grip_id"]
+                .as_u64()
+                .ok_or_else(|| failure("invalid_request", "Missing grip_id"))?;
+            let to = point(req)?;
+            return self.control_plugin_grip_drag(i, plugin, grip_id, to.to_array());
+        }
+        let target = handle(req)?;
+        let grip_id = req["grip_id"]
+            .as_u64()
+            .ok_or_else(|| failure("invalid_request", "Missing grip_id"))?
+            as usize;
+        let to = point(req)?;
+        self.perform_grip_drag(i, target, grip_id, to.to_array())
+            .map_err(|(code, message)| failure(code, message))
+    }
+
+    /// The MCP/automation entry for a custom-grip drag (API v11/v12): drive
+    /// begin → move → settle through the same lifecycle the viewport runs,
+    /// so end-to-end tests exercise exactly one pipeline — including the
+    /// v11.1 hardening (deliveries never inline command frames; the settle
+    /// is issued without waiting; the watchdog bounds a plugin that never
+    /// answers). The op waits, bounded by the settle floor, for the final
+    /// result: the settle is the plugin's own one-undo-step write window,
+    /// and cancel paths are identical to interactive drags.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn control_plugin_grip_drag(
+        &mut self,
+        i: usize,
+        plugin: &str,
+        grip_id: u64,
+        to: [f64; 3],
+    ) -> Result<Task<Message>, Value> {
+        let candidate = {
+            let visible = crate::plugin::grip_points::visibility(&self.disabled_plugins);
+            self.tabs[i]
+                .plugin_grips
+                .find(plugin, grip_id, &visible)
+                .ok_or_else(|| {
+                    failure(
+                        "unknown_grip",
+                        "Read plugin_grips for the declaring plugin's grip ids",
+                    )
+                })?
+        };
+        // begin → move → settle(issued) → drive pump ticks until the settle
+        // finalizes (or the watchdog abandons it). Bounded — the UI route
+        // never waits, this automation route may.
+        let _ = self.begin_plugin_grip_drag(i, &candidate);
+        let _ = self.move_plugin_grip_drag(i, glam::DVec3::new(to[0], to[1], to[2]));
+        let _ = self.settle_plugin_grip_drag();
+        let completed =
+            self.drive_plugin_grip_settle_to_completion(std::time::Duration::from_secs(12));
+        if !completed {
+            return Err(failure(
+                "plugin_settle_timeout",
+                "The plugin did not settle its grip drag in time; the delivery was abandoned",
+            ));
+        }
+        Ok(iced::Task::none())
+    }
+
+    /// The shared programmatic grip-drag core — one pipeline, three
+    /// consumers: the interactive viewport itself (the same
+    /// `grip_edit_for_hit` / `on_viewport_move` / `commit_active_grip_edit`
+    /// machinery), the MCP `grip_drag` op, and the HostApi `grip_drag`
+    /// (API v11). Selects `handle`, engages its grip `grip_id`, moves to
+    /// `to` with snaps / ortho / polar / tracking off, and commits: exactly
+    /// one undo step labeled like the interactive grip step, byte-exact
+    /// restore on undo. Refusal parity with the interactive path: unknown
+    /// entity, reference-only designation (gripless), locked layer, unknown
+    /// grip id, point out of view.
+    pub(in crate::app) fn perform_grip_drag(
+        &mut self,
+        i: usize,
+        target: document::Handle,
+        grip_id: usize,
+        to: [f64; 3],
+    ) -> Result<Task<Message>, (&'static str, &'static str)> {
+        if self.tabs.len() <= i {
+            return Err(("invalid_request", "Tab does not exist"));
+        }
+        if self.tabs[i].scene.document.get_entity(target).is_none() {
+            return Err(("entity_absent", "No entity with that handle"));
+        }
+        // Picked cells of the target table stay picked: their grips are the
+        // cell grips.
+        let cells = self.tabs[i]
+            .scene
+            .table_cells
+            .filter(|cells| cells.table == target);
+        self.tabs[i].scene.deselect_all();
+        self.tabs[i].scene.select_entity(target, false);
+        if let Some(cells) = cells {
+            self.tabs[i].scene.select_table_cells(cells);
+        }
+        self.refresh_properties();
+        let (world, moves_entity) = self.tabs[i]
+            .selected_grip_handles
+            .iter()
+            .zip(&self.tabs[i].selected_grips)
+            .find(|(owner, grip)| **owner == target && grip.id == grip_id)
+            .map(|(_, grip)| (grip.world, grip.is_midpoint))
+            .ok_or_else(|| {
+                if self.tabs[i].scene.is_reference_only(target) {
+                    ("reference_only", "The entity is reference-only")
+                } else if self.tabs[i].scene.is_layer_locked(target) {
+                    ("layer_locked", "The entity's layer is locked")
+                } else {
+                    ("unknown_grip", "Read grips for the entity's grip ids")
+                }
+            })?;
+        let edit = self.grip_edit_for_hit(i, target, grip_id, moves_entity, world);
+        self.tabs[i].active_grip = Some(edit);
+
+        let (vw, vh) = self.tabs[i].scene.selection.borrow().view.vp_size;
+        let tile = self.tabs[i].scene.active_model_tile_bounds(vw, vh);
+        let local = iced::Rectangle {
+            width: tile.width,
+            height: tile.height,
+            ..iced::Rectangle::default()
+        };
+        let Some(screen) = self.tabs[i]
+            .scene
+            .camera
+            .borrow()
+            .project(glam::DVec3::new(to[0], to[1], to[2]), local)
+        else {
+            self.cancel_active_grip_edit();
+            return Err(("invalid_point", "The point is not in view"));
+        };
+        let saved = (
+            self.snapper.snap_enabled,
+            self.snapper.snap3d_enabled,
+            self.snapper.grid_snap_on,
+            self.snapper.otrack_enabled,
+            self.ortho_mode,
+            self.polar_mode,
+        );
+        self.snapper.snap_enabled = false;
+        self.snapper.snap3d_enabled = false;
+        self.snapper.grid_snap_on = false;
+        self.snapper.otrack_enabled = false;
+        self.ortho_mode = false;
+        self.polar_mode = false;
+        let _ = self.on_viewport_move(iced::Point::new(screen.x + tile.x, screen.y + tile.y));
+        (
+            self.snapper.snap_enabled,
+            self.snapper.snap3d_enabled,
+            self.snapper.grid_snap_on,
+            self.snapper.otrack_enabled,
+            self.ortho_mode,
+            self.polar_mode,
+        ) = saved;
+        Ok(self.commit_active_grip_edit())
+    }
+
+    /// Click the viewport where `point` (world) shows, as the left button
+    /// would, holding Ctrl and/or Shift when `modifiers` names them.
+    /// Where a world point shows on the drawing canvas, through the camera
+    /// the cursor edits with: an entered viewport's, else the active tile's.
+    fn control_world_to_canvas(&self, at: glam::DVec3) -> Result<iced::Point, Value> {
+        let scene = &self.tabs[self.active_tab].scene;
+        let (vw, vh) = scene.selection.borrow().view.vp_size;
+        let (camera, bounds) = scene.viewport_edit_frame((vw, vh)).unwrap_or_else(|| {
+            (
+                scene.camera.borrow().clone(),
+                scene.active_model_tile_bounds(vw, vh),
+            )
+        });
+        let local = iced::Rectangle {
+            width: bounds.width,
+            height: bounds.height,
+            ..iced::Rectangle::default()
+        };
+        camera
+            .project(at, local)
+            .filter(|p| p.x.is_finite() && p.y.is_finite())
+            .map(|p| iced::Point::new(p.x + bounds.x, p.y + bounds.y))
+            .ok_or_else(|| failure("invalid_point", "The point is not in view"))
+    }
+
+    pub(super) fn control_click(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        let at = point(req)?;
+        let modifiers = req["modifiers"].as_str().unwrap_or("").to_ascii_lowercase();
+        let cursor = self.control_world_to_canvas(at)?;
+        let saved = (self.ctrl_down, self.shift_down);
+        self.ctrl_down = modifiers.contains("ctrl");
+        self.shift_down = modifiers.contains("shift");
+        let tasks = [
+            self.update(Message::ViewportMove(cursor)),
+            self.update(Message::ViewportLeftPress),
+            self.update(Message::ViewportLeftRelease),
+        ];
+        (self.ctrl_down, self.shift_down) = saved;
+        Ok(Task::batch(tasks))
+    }
+
+    pub(super) fn panel_button_action(
+        controls: &[ocs_plugin_api::dialog::DialogControl],
+        control_id: &str,
+    ) -> Option<String> {
+        Self::panel_control(controls, control_id).and_then(|control| match control {
+            ocs_plugin_api::dialog::DialogControl::Button { action, .. } => action.clone(),
+            _ => None,
+        })
+    }
+
+    /// Find one registered panel control by id, descending Row / Column /
+    /// Fields containers exactly like the button-action lookup.
+    pub(super) fn panel_control<'a>(
+        controls: &'a [ocs_plugin_api::dialog::DialogControl],
+        control_id: &str,
+    ) -> Option<&'a ocs_plugin_api::dialog::DialogControl> {
+        for control in controls {
+            match control {
+                ocs_plugin_api::dialog::DialogControl::Row { controls, .. }
+                | ocs_plugin_api::dialog::DialogControl::Column { controls, .. }
+                | ocs_plugin_api::dialog::DialogControl::Fields { controls, .. } => {
+                    if let Some(found) = Self::panel_control(controls, control_id) {
+                        return Some(found);
+                    }
+                }
+                other => {
+                    let id = match other {
+                        ocs_plugin_api::dialog::DialogControl::Button { id, .. }
+                        | ocs_plugin_api::dialog::DialogControl::Text { id, .. }
+                        | ocs_plugin_api::dialog::DialogControl::Number { id, .. }
+                        | ocs_plugin_api::dialog::DialogControl::Checkbox { id, .. }
+                        | ocs_plugin_api::dialog::DialogControl::Choice { id, .. }
+                        | ocs_plugin_api::dialog::DialogControl::Color { id, .. }
+                        | ocs_plugin_api::dialog::DialogControl::FilePicker { id, .. }
+                        | ocs_plugin_api::dialog::DialogControl::Fields { id, .. }
+                        | ocs_plugin_api::dialog::DialogControl::Table { id, .. }
+                        | ocs_plugin_api::dialog::DialogControl::Label { id, .. }
+                        | ocs_plugin_api::dialog::DialogControl::Svg { id, .. } => id,
+                        _ => continue,
+                    };
+                    if id == control_id {
+                        return Some(other);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Automation: fire ONE panel control's real GUI interaction — the exact
+    /// message the rendered widget would send — so plugin behavior that has
+    /// no declared command (a plain `click` button) and typed control edits
+    /// (checkbox/choice/color drafts) stay driveable non-interactively.
+    /// No document records, edit_revision or undo state is touched here; the
+    /// resulting `PanelAction` remains the plugin's notification.
+    pub(super) fn control_panel_action(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        let panel_id = req["panel_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| failure("invalid_request", "panel_id is required"))?;
+        let control_id = req["control_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| failure("invalid_request", "control_id is required"))?;
+        let action = req["action"].as_str().unwrap_or("click");
+        let bad_kind = |expected: &str| {
+            failure(
+                "invalid_request",
+                &format!("control {control_id} needs action '{expected}'"),
+            )
+        };
+        let panel = self
+            .plugin_panels
+            .get(panel_id)
+            .ok_or_else(|| failure("panel_not_found", "The requested panel is not registered"))?;
+        let control = Self::panel_control(&panel.def.controls, control_id).ok_or_else(|| {
+            failure(
+                "panel_not_found",
+                "The requested panel control does not exist",
+            )
+        })?;
+        use ocs_plugin_api::dialog::DialogControl;
+        match (control, action) {
+            // A plain (action-less) button: its click is the plugin event
+            // itself — the host's bulk keywords and declared commands run
+            // through panel_button / dispatch instead.
+            (DialogControl::Button { action: None, .. }, "click") => Ok(
+                self.update(Message::PluginPanelButtonClick(
+                    panel_id.to_string(),
+                    control_id.to_string(),
+                    None,
+                )),
+            ),
+            (DialogControl::Button { .. }, "click") => Err(bad_kind(
+                "panel_button (this button declares a command)",
+            )),
+            (DialogControl::Button { .. }, _) => Err(bad_kind("click")),
+            (DialogControl::Checkbox { .. }, "change") => {
+                // The schema contract is the RAW shape (a plain boolean);
+                // the tagged `{"Bool": …}` DialogValue JSON is tolerated.
+                let pick = req["value"].get("Bool").unwrap_or(&req["value"]);
+                let Some(checked) = pick.as_bool() else {
+                    return Err(failure(
+                        "invalid_request",
+                        "checkbox change needs boolean `value`",
+                    ));
+                };
+                Ok(self.update(Message::PluginPanelBoolToggle(
+                    panel_id.to_string(),
+                    control_id.to_string(),
+                    checked,
+                )))
+            }
+            (DialogControl::Choice { options, .. }, "change") => {
+                // RAW: `{index, text?}`; text defaults to options[index],
+                // exactly like the rendered widget's selection. Tagged
+                // `{"Choice": …}` DialogValue JSON is tolerated.
+                let pick = req["value"].get("Choice").unwrap_or(&req["value"]);
+                let Some(index) = pick["index"].as_u64() else {
+                    return Err(failure(
+                        "invalid_request",
+                        "choice change needs {\"index\": <n> (optional \"text\")",
+                    ));
+                };
+                let Ok(index) = usize::try_from(index) else {
+                    return Err(failure("invalid_request", "index out of range"));
+                };
+                let text = match pick["text"].as_str() {
+                    Some(text) => text.to_string(),
+                    None => options.get(index).cloned().unwrap_or_default(),
+                };
+                Ok(self.update(Message::PluginPanelChoiceSelect(
+                    panel_id.to_string(),
+                    control_id.to_string(),
+                    index,
+                    text,
+                )))
+            }
+            (DialogControl::Text { .. } | DialogControl::Number { .. }, "change") => {
+                // RAW: a plain string or finite number (the widget sends
+                // the draft text); tagged `{"Text": …}` / `{"Number": …}`
+                // DialogValue JSON is tolerated.
+                let pick = req["value"]
+                    .get("Text")
+                    .or_else(|| req["value"].get("Number"))
+                    .unwrap_or(&req["value"]);
+                let text = if let Some(text) = pick.as_str() {
+                    text.to_string()
+                } else if let Some(number) = pick.as_f64().filter(|n| n.is_finite()) {
+                    format!("{number}")
+                } else {
+                    return Err(failure(
+                        "invalid_request",
+                        "text/number change needs string or finite number `value`",
+                    ));
+                };
+                Ok(self.update(Message::PluginPanelTextChange(
+                    panel_id.to_string(),
+                    control_id.to_string(),
+                    text,
+                )))
+            }
+            (DialogControl::Color { .. }, "change") => Err(bad_kind(
+                "change (colors flow through the interactive picker; use the plugin's own draft default)",
+            )),
+            _ => Err(bad_kind(action)),
+        }
+    }
+
+    /// Edit a native panel widget only. This does not touch document records,
+    /// entities, edit_revision or undo state; the normal PanelAction remains
+    /// a notification and never acquires HostApi.
+    pub(super) fn control_panel_input(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        let panel_id = req["panel_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| failure("invalid_request", "panel_id is required"))?;
+        let control_id = req["control_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| failure("invalid_request", "control_id is required"))?;
+        if !self.plugin_panels.contains_key(panel_id) {
+            return Err(failure(
+                "panel_not_found",
+                "The requested panel is not registered",
+            ));
+        }
+        let text = if let Some(text) = req["text"].as_str() {
+            text.to_string()
+        } else if let Some(value) = req["value"].as_f64().filter(|value| value.is_finite()) {
+            value.to_string()
+        } else {
+            return Err(failure(
+                "invalid_request",
+                "Supply exact text or a finite numeric value",
+            ));
+        };
+        Ok(self.update(Message::PluginPanelTextChange(
+            panel_id.to_string(),
+            control_id.to_string(),
+            text,
+        )))
+    }
+
+    /// Activate the declared action of a native panel button through the same
+    /// Message used by the actual widget. Only that declared command runs.
+    pub(super) fn control_panel_button(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        let panel_id = req["panel_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| failure("invalid_request", "panel_id is required"))?;
+        let control_id = req["control_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| failure("invalid_request", "control_id is required"))?;
+        let panel = self
+            .plugin_panels
+            .get(panel_id)
+            .ok_or_else(|| failure("panel_not_found", "The requested panel is not registered"))?;
+        let action = if control_id == "reset" {
+            "reset".to_string()
+        } else {
+            Self::panel_button_action(&panel.def.controls, control_id).ok_or_else(|| {
+                failure(
+                    "panel_action_not_found",
+                    "The requested panel button has no declared action",
+                )
+            })?
+        };
+        Ok(self.update(Message::PluginPanelButtonClick(
+            panel_id.to_string(),
+            control_id.to_string(),
+            Some(action),
+        )))
+    }
+
+    /// Replay pointer events on the drawing canvas in order, as the mouse
+    /// sends them: moves (canvas pixels, or a world point projected through
+    /// the editing camera), button presses and releases, and wheel steps.
+    /// Each step reports where the cursor landed in the world, so a drag
+    /// shows the points the interaction actually received.
+    pub(super) fn control_pointer(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        let i = self.active_tab;
+        let events = req["events"]
+            .as_array()
+            .filter(|events| !events.is_empty())
+            .ok_or_else(|| failure("invalid_request", "Supply a non-empty events array"))?;
+        let modifiers = req["modifiers"].as_str().unwrap_or("").to_ascii_lowercase();
+        let coords = |value: &Value, n: usize| -> Option<Vec<f64>> {
+            let values: Vec<f64> = value.as_array()?.iter().filter_map(Value::as_f64).collect();
+            (values.len() == n && values.iter().all(|v| v.is_finite())).then_some(values)
+        };
+        let saved = (self.ctrl_down, self.shift_down);
+        self.ctrl_down = modifiers.contains("ctrl");
+        self.shift_down = modifiers.contains("shift");
+        let mut tasks = Vec::new();
+        let mut steps = Vec::new();
+        let mut outcome = Ok(());
+        for event in events {
+            let message = if let Some(xy) = event.get("move").and_then(|v| coords(v, 2)) {
+                Message::ViewportMove(iced::Point::new(xy[0] as f32, xy[1] as f32))
+            } else if let Some(at) = event.get("move_world").and_then(|v| coords(v, 3)) {
+                match self.control_world_to_canvas(glam::DVec3::new(at[0], at[1], at[2])) {
+                    Ok(cursor) => Message::ViewportMove(cursor),
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
+                }
+            } else if let Some(button) = event.get("press").and_then(Value::as_str) {
+                match button {
+                    "left" => Message::ViewportLeftPress,
+                    "right" => Message::ViewportRightPress,
+                    "middle" => Message::ViewportMiddlePress,
+                    _ => {
+                        outcome = Err(failure("invalid_request", "press is left, right or middle"));
+                        break;
+                    }
+                }
+            } else if let Some(button) = event.get("release").and_then(Value::as_str) {
+                match button {
+                    "left" => Message::ViewportLeftRelease,
+                    "right" => Message::ViewportRightRelease,
+                    "middle" => Message::ViewportMiddleRelease,
+                    _ => {
+                        outcome = Err(failure(
+                            "invalid_request",
+                            "release is left, right or middle",
+                        ));
+                        break;
+                    }
+                }
+            } else if let Some(lines) = event.get("wheel").and_then(Value::as_f64) {
+                Message::ViewportScroll(iced::mouse::ScrollDelta::Lines {
+                    x: 0.0,
+                    y: lines as f32,
+                })
+            } else if event.get("leave").and_then(Value::as_bool) == Some(true) {
+                Message::ViewportExit
+            } else {
+                outcome = Err(failure(
+                    "invalid_request",
+                    "Each event is move, move_world, press, release, wheel or leave",
+                ));
+                break;
+            };
+            tasks.push(self.update(message));
+            let tab = &self.tabs[i];
+            let world = tab.last_cursor_world;
+            steps.push(json!({
+                "screen":[tab.last_cursor_screen.x, tab.last_cursor_screen.y],
+                "world":[world.x, world.y, world.z],
+                "dragging_grip":tab.active_grip.is_some(),
+            }));
+        }
+        (self.ctrl_down, self.shift_down) = saved;
+        outcome?;
+        self.set_control_result(json!({"steps":steps}));
+        Ok(Task::batch(tasks))
+    }
+
     pub(super) fn control_set_property(&mut self, req: &Value) -> Result<Task<Message>, Value> {
         self.refresh_properties();
         let field = string(req, "field")?;
@@ -563,7 +1736,7 @@ impl OpenCADStudio {
             .sections
             .iter()
             .flat_map(|s| &s.props)
-            .find(|p| p.field == field)
+            .find(|p| row_id(p) == field)
             .cloned()
             .ok_or_else(|| {
                 failure(
@@ -585,6 +1758,15 @@ impl OpenCADStudio {
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| raw.to_string());
+        let i = self.active_tab;
+        if crate::app::properties::property_edits_geometry(&p)
+            && self.any_entity_is_fixed(i, &self.property_target_handles(i))
+        {
+            return Err(failure(
+                "fixed_constraint",
+                crate::app::properties::HELD_BY_FIXED,
+            ));
+        }
         Ok(match p.value {
             PropValue::EditText(_)
             | PropValue::PlainText(_)
@@ -597,7 +1779,7 @@ impl OpenCADStudio {
                 let commit = self.update(Message::PropGeomCommit(p.field));
                 Task::batch([input, commit])
             }
-            PropValue::Choice { options, .. } => {
+            PropValue::Choice { options, .. } | PropValue::ChoiceWithTooltip { options, .. } => {
                 if !options.contains(&value) {
                     return Err(failure(
                         "invalid_choice",
@@ -668,6 +1850,22 @@ impl OpenCADStudio {
                     field,
                     value: control_lineweight(raw)?,
                 }),
+            PropValue::BlockNumber { key, .. } => {
+                let input = self.update(Message::PropBlockInput { key, value });
+                let commit = self.update(Message::PropBlockCommit(key));
+                Task::batch([input, commit])
+            }
+            PropValue::BlockChoice { key, options, .. } => {
+                let index = options
+                    .iter()
+                    .position(|option| option == &value)
+                    .or_else(|| {
+                        let index = value.trim().parse::<usize>().ok()?;
+                        (index < options.len()).then_some(index)
+                    })
+                    .ok_or_else(|| failure("invalid_choice", "Value is not an available option"))?;
+                self.update(Message::PropBlockChoice { key, index })
+            }
             PropValue::ReadOnly(_) | PropValue::ReadOnlyWithTooltip { .. } => {
                 return Err(failure("readonly_property", "Property cannot be edited"))
             }
@@ -681,13 +1879,398 @@ impl OpenCADStudio {
     }
     pub(super) fn control_ui_action(&mut self, req: &Value) -> Result<Task<Message>, Value> {
         let name = string(req, "name")?;
+        // The scale windows set Ctrl/Shift for one click only.
+        let modifiers = (self.ctrl_down, self.shift_down);
+        // Without a prompt there is no failed open to retry.
+        if name == "recovery_accept" && !self.focus_dialog(crate::app::ModalKind::RecoveryPrompt) {
+            return Ok(Task::none());
+        }
+        // The buttons of "the open dialog" press the front-most one when no
+        // dialog is swapped in.
+        if matches!(
+            name,
+            "dialog_ok"
+                | "dialog_answer"
+                | "dialog_page"
+                | "dialog_discard"
+                | "dialog_cancel"
+                | "pdf_dialog_ok"
+                | "pdf_layer_toggle"
+                | "table_cell_dialog"
+        ) && self.active_modal.is_none()
+        {
+            if let Some(kind) = self.tool_windows.last().map(|tool| tool.kind) {
+                self.enter_tool(kind);
+            }
+        }
+        match name {
+            "conversion_loss_save_anyway" | "conversion_loss_back" => {
+                self.focus_dialog(crate::app::ModalKind::ConversionLoss);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            "external_change_reload"
+            | "external_change_overwrite"
+            | "external_change_save_as"
+            | "external_change_cancel" => {
+                self.focus_dialog(crate::app::ModalKind::ExternalChange);
+            }
+            _ => {}
+        }
         let msg = match name {
-            "close_modal" => Message::CloseModal,
+            // With no modal dialog up, the front-most open tool dialog.
+            "close_modal" => match (self.active_modal, self.tool_windows.last()) {
+                (None, Some(tool)) => Message::ToolWindow(tool.kind, Box::new(Message::CloseModal)),
+                _ => Message::CloseModal,
+            },
+            // Type `value` into the command line and press Enter.
+            "command_submit" => {
+                self.command_line.input = req["value"].as_str().unwrap_or("").to_string();
+                Message::CommandSubmit
+            }
+            // Types into the command line without submitting, as the
+            // keyboard does, so the suggestion list follows the text.
+            "command_type" => Message::CommandInput(req["value"].as_str().unwrap_or("").into()),
+            // Tab / Shift+Tab in a table cell editor: value "next" or "prev".
+            "table_cell_tab" => match req["value"].as_str() {
+                Some("prev") => Message::DynTabPrev,
+                _ => Message::DynTabNext,
+            },
+            // The recovery prompt's Recover button; `close_modal` declines.
+            "recovery_accept" => Message::RecoveryAttempt,
+            // The conversion-loss warning's choices: save with the losses it
+            // lists, or drop the held-back save.
+            "conversion_loss_save_anyway" => Message::ConversionLossProceed,
+            "conversion_loss_back" => Message::ConversionLossBack,
+            // Show a layout (or "Model"), as clicking its tab does.
+            "layout_switch" => Message::LayoutSwitch(string(req, "value")?.into()),
+            // Pick the Plot dialog's output device: a printer name, "pdf" or "svg".
+            "plot_printer" => {
+                use crate::ui::window::plot::{PlotDlgMsg, OUT_PDF, OUT_SVG};
+                let device = match string(req, "value")? {
+                    "pdf" => OUT_PDF.to_string(),
+                    "svg" => OUT_SVG.to_string(),
+                    other => other.to_string(),
+                };
+                Message::PlotDlg(PlotDlgMsg::Printer(device))
+            }
+            // The open right-click menu turns into its editor.
+            "context_menu_customize" => {
+                Message::ContextMenuPick(crate::ui::popup::context_menu::MenuAction::Customize)
+            }
+            // The Plot dialog's Plot / Export button.
+            "plot_commit" => Message::PlotDlg(crate::ui::window::plot::PlotDlgMsg::Commit),
+            // The Plugin Manager's Install button for `owner/repo`.
+            "plugin_install" => Message::PluginInstall(string(req, "value")?.to_string()),
+            // The Plugin Manager's search box.
+            "plugin_search" => Message::PluginSearchInput(string(req, "value")?.to_string()),
+            // The "changed outside" modal's suggested actions (D6): reload
+            // the disk copy, keep the in-memory one and overwrite, save as,
+            // or dismiss. Native only — the web build has no such dialog.
+            #[cfg(not(target_arch = "wasm32"))]
+            "external_change_reload" => Message::ExternalChangeReload,
+            #[cfg(not(target_arch = "wasm32"))]
+            "external_change_overwrite" => Message::ExternalChangeOverwrite,
+            #[cfg(not(target_arch = "wasm32"))]
+            "external_change_save_as" => Message::ExternalChangeSaveAs,
+            #[cfg(not(target_arch = "wasm32"))]
+            "external_change_cancel" => Message::ExternalChangeCancel,
             // The open PDF dialog's OK button.
             // Underlay Layers: switch a layer of the shown underlay.
-            "pdf_layer_toggle" => Message::PdfDialog(
-                crate::ui::window::pdf_dialogs::PdfDialogMsg::LayersToggle(string(req, "value")?.into()),
-            ),
+            "pdf_layer_toggle" => {
+                Message::PdfDialog(crate::ui::window::pdf_dialogs::PdfDialogMsg::LayersToggle(
+                    string(req, "value")?.into(),
+                ))
+            }
+            // Point Cloud Color Map: one edit, "tab=elevation", "count=3",
+            // "even", "reverse", "scheme=Earth", "gradient=0", "max=90",
+            // "min=10", "interval=0.1", "extents=0", "range=2", "current=0".
+            "pc_colormap" => {
+                use crate::ui::window::pdf_dialogs::{OutOfRange, PdfDialogMsg as M};
+                let value = string(req, "value")?;
+                let (key, arg) = value.split_once('=').unwrap_or((value, ""));
+                let on = arg != "0";
+                Message::PdfDialog(match key {
+                    "tab" => M::MapTab(arg == "elevation"),
+                    "scheme" => M::MapScheme(arg.into()),
+                    "count" => {
+                        M::MapCount(arg.parse().map_err(|_| failure("invalid_value", "count"))?)
+                    }
+                    "even" => M::MapEven,
+                    "reverse" => M::MapReverse,
+                    "gradient" => M::MapGradient(on),
+                    "max" => M::MapMax(arg.into()),
+                    "min" => M::MapMin(arg.into()),
+                    "interval" => M::MapInterval(arg.into()),
+                    "extents" => M::MapExtents(on),
+                    "range" => M::MapOutOfRange(OutOfRange(arg.parse().unwrap_or(1))),
+                    "current" => M::MapCurrent(on),
+                    "new" => M::MapNew,
+                    "rename" => M::MapRename,
+                    "name" => M::MapNameInput(arg.into()),
+                    "name_ok" => M::MapNameOk,
+                    "delete" => M::MapDelete,
+                    "apply" => M::MapApply,
+                    _ => return Err(failure("invalid_value", "Unknown color map edit")),
+                })
+            }
+            // Section extraction dialog: "min=0.01", "connect=0.02", "angle=5",
+            // "points=18000", "lines=1", "perimeter=1", "preview=0", "width=0".
+            "pc_section" => {
+                use crate::ui::window::pdf_dialogs::PdfDialogMsg as M;
+                let value = string(req, "value")?;
+                let (key, arg) = value.split_once('=').unwrap_or((value, ""));
+                Message::PdfDialog(match key {
+                    "min" => M::SecMinLength(arg.into()),
+                    "connect" => M::SecConnect(arg.into()),
+                    "angle" => M::SecAngle(arg.into()),
+                    "points" => M::SecMaxPoints(arg.into()),
+                    "width" => M::SecWidth(arg.into()),
+                    "lines" => M::SecPolylines(arg == "0"),
+                    "perimeter" => M::SecPerimeter(arg != "0"),
+                    "preview" => M::SecPreview(arg != "0"),
+                    _ => return Err(failure("invalid_value", "Unknown section setting")),
+                })
+            }
+            // Point Cloud Manager: flip a row's switch, "<handle>:<row>" with
+            // row cloud, unassigned, scans or scan:<name>.
+            "pc_manager_toggle" => {
+                use crate::ui::window::pc_manager::{PcManagerMsg, Row};
+                let value = string(req, "value")?;
+                let parsed = value.split_once(':').and_then(|(handle, row)| {
+                    Some((
+                        document::Handle::new(u64::from_str_radix(handle, 16).ok()?),
+                        Row::parse(row)?,
+                    ))
+                });
+                let Some((handle, row)) = parsed else {
+                    return Err(failure("bad_value", "Expected <handle>:<row>"));
+                };
+                Message::PcManager(PcManagerMsg::Toggle(handle, row))
+            }
+            // Count palette and count mode: "search=<text>", "sort=name|count",
+            // "open=NAME", "child=NAME:<n>" (an expanded row), "menu=<review|field|
+            // layer|scale|mirror>:NAME", "create_table", "check=NAME:1",
+            // "all=1", "table_cancel", "table_insert", "back", "match=<0|1|2>:1",
+            // "details", "errors", "error=<n>", "area", "prev", "next", "select",
+            // "field", "close", "invalid_undo", "invalid_continue", "invalid_always=1".
+            "count_palette" => {
+                use crate::ui::window::count_palette::{CountMsg as M, RowAction};
+                let value = string(req, "value")?;
+                let (key, arg) = value.split_once('=').unwrap_or((value, ""));
+                let flag = |s: &str| s == "1" || s.eq_ignore_ascii_case("true");
+                let bad = || failure("invalid_value", "Unknown count palette edit");
+                Message::Count(match key {
+                    "search" => M::Search(arg.into()),
+                    "sort" => M::Sort(arg == "count"),
+                    "open" => M::Open(arg.into(), document::count::CountKey::default()),
+                    "child" => {
+                        let (name, n) = arg.rsplit_once(':').ok_or_else(bad)?;
+                        let n: usize = n.parse().map_err(|_| bad())?;
+                        let [l, s, m] = self.count_palette.expansion(name).ok_or_else(bad)?;
+                        let i = self.active_tab;
+                        let area = self.tabs[i].count.as_ref().and_then(|c| c.area.clone());
+                        let instances = document::count::block_instances(
+                            &self.tabs[i].scene.document,
+                            area.as_deref(),
+                        );
+                        let (k, _) = document::count::expanded_counts(&instances, name, l, s, m)
+                            .into_iter()
+                            .nth(n)
+                            .ok_or_else(bad)?;
+                        M::Open(name.into(), k)
+                    }
+                    "menu" => {
+                        let (action, name) = arg.split_once(':').ok_or_else(bad)?;
+                        let action = match action {
+                            "review" => RowAction::Review,
+                            "field" => RowAction::Field,
+                            "layer" => RowAction::Expand(0),
+                            "scale" => RowAction::Expand(1),
+                            "mirror" => RowAction::Expand(2),
+                            _ => return Err(bad()),
+                        };
+                        M::Menu(name.into(), document::count::CountKey::default(), action)
+                    }
+                    "create_table" => M::CreateTable,
+                    "check" => {
+                        let (name, on) = arg.rsplit_once(':').unwrap_or((arg, "1"));
+                        M::TableCheck(name.into(), flag(on))
+                    }
+                    "all" => M::TableAll(flag(arg)),
+                    "table_cancel" => M::TableCancel,
+                    "table_insert" => M::TableInsert,
+                    "back" => M::Back,
+                    "match" => {
+                        let (k, on) = arg.split_once(':').unwrap_or((arg, "1"));
+                        M::Match(
+                            k.parse::<usize>().ok().filter(|k| *k < 3).ok_or_else(bad)?,
+                            flag(on),
+                        )
+                    }
+                    "details" => M::ToggleDetails,
+                    "errors" => M::ToggleErrors,
+                    "error" => {
+                        let i = self.active_tab;
+                        let n: usize = arg.parse().map_err(|_| bad())?;
+                        let mode = self.tabs[i].count.as_ref().ok_or_else(bad)?;
+                        M::ShowError(
+                            *mode
+                                .result(&self.tabs[i].scene.document)
+                                .errors
+                                .get(n)
+                                .ok_or_else(bad)?,
+                        )
+                    }
+                    "area" => M::Area,
+                    "prev" => M::Prev,
+                    "next" => M::Next,
+                    "select" => M::Select,
+                    "field" => M::Field,
+                    "close" => M::Close,
+                    // The Invalid Area dialog.
+                    "invalid_undo" => M::InvalidUndo,
+                    "invalid_continue" => M::InvalidContinue,
+                    "invalid_always" => M::InvalidAlways(arg == "1"),
+                    _ => return Err(bad()),
+                })
+            }
+            // Point Cloud Manager tree: "search=<text>", "collapse", "expand",
+            // "toggle_node=<key>" or "select=<key>".
+            "pc_manager" => {
+                use crate::ui::window::pc_manager::PcManagerMsg as M;
+                let value = string(req, "value")?;
+                let (key, arg) = value.split_once('=').unwrap_or((value, ""));
+                Message::PcManager(match key {
+                    "search" => M::Search(arg.into()),
+                    "collapse" => M::CollapseAll,
+                    "expand" => M::ExpandAll,
+                    "toggle_node" => M::Expand(arg.into()),
+                    "select" => M::Select(arg.into()),
+                    _ => return Err(failure("invalid_value", "Unknown point cloud manager edit")),
+                })
+            }
+            // Blocks palette: "tab=recent", "search=D*", "view=2",
+            // "option=x:2", "options", "library=<dir>", "insert=<item>",
+            // "drop=<item>@x,y", "menu=<action>:<item>". An item is
+            // "current:NAME", "recent:N", "fav:N", "lib:N" or "file:<path>".
+            "blocks_palette" => {
+                use crate::ui::window::block_palette::{
+                    BlockPaletteMsg as M, Item, MenuAction, OptionMsg, Tab, ViewMode,
+                };
+                let value = string(req, "value")?;
+                let (key, arg) = value.split_once('=').unwrap_or((value, ""));
+                let item = |app: &Self, spec: &str| -> Result<Item, Value> {
+                    let (kind, rest) = spec.split_once(':').unwrap_or((spec, ""));
+                    let index = || {
+                        rest.parse::<usize>()
+                            .map_err(|_| failure("invalid_value", "Bad item index"))
+                    };
+                    let missing = || failure("invalid_value", "No such palette item");
+                    Ok(match kind {
+                        "current" => Item::Current(rest.to_string()),
+                        "recent" => Item::Ref(
+                            app.block_palette
+                                .recent
+                                .get(index()?)
+                                .cloned()
+                                .ok_or_else(missing)?,
+                        ),
+                        "fav" => Item::Ref(
+                            app.block_palette
+                                .favorites
+                                .get(index()?)
+                                .cloned()
+                                .ok_or_else(missing)?,
+                        ),
+                        "lib" => {
+                            let e = app
+                                .block_palette
+                                .library_entries
+                                .get(index()?)
+                                .ok_or_else(missing)?;
+                            if e.folder {
+                                Item::Folder(e.path.clone())
+                            } else {
+                                Item::File(e.path.clone())
+                            }
+                        }
+                        "file" => Item::File(std::path::PathBuf::from(rest)),
+                        _ => return Err(missing()),
+                    })
+                };
+                match key {
+                    "tab" => Message::BlockPalette(M::Tab(match arg {
+                        "recent" => Tab::Recent,
+                        "favorites" => Tab::Favorites,
+                        "libraries" => Tab::Libraries,
+                        _ => Tab::Current,
+                    })),
+                    "search" => Message::BlockPalette(M::Search(arg.into())),
+                    "view" => {
+                        Message::BlockPalette(M::View(ViewMode::from_u8(arg.parse().unwrap_or(1))))
+                    }
+                    "options" => Message::BlockPalette(M::ToggleOptions),
+                    "library" => Message::BlockPalette(M::LibraryPicked(Ok(arg.into()))),
+                    "up" => Message::BlockPalette(M::LibraryUp),
+                    "option" => {
+                        let (name, v) = arg.split_once(':').unwrap_or((arg, "1"));
+                        let on = v == "1";
+                        Message::BlockPalette(M::Option(match name {
+                            "insertion_point" => OptionMsg::InsertionPoint(on),
+                            "scale" => OptionMsg::Scale(on),
+                            "uniform" => OptionMsg::Uniform(on),
+                            "rotation" => OptionMsg::Rotation(on),
+                            "auto" => OptionMsg::AutoPlacement(on),
+                            "repeat" => OptionMsg::Repeat(on),
+                            "explode" => OptionMsg::Explode(on),
+                            "x" => OptionMsg::X(v.into()),
+                            "y" => OptionMsg::Y(v.into()),
+                            "z" => OptionMsg::Z(v.into()),
+                            "angle" => OptionMsg::Angle(v.into()),
+                            _ => return Err(failure("invalid_value", "Unknown palette option")),
+                        }))
+                    }
+                    "insert" => {
+                        let it = item(self, arg)?;
+                        self.block_palette.pressed = Some(it.clone());
+                        Message::BlockPalette(M::Release(it))
+                    }
+                    "drop" => {
+                        let (spec, at) = arg
+                            .rsplit_once('@')
+                            .ok_or_else(|| failure("invalid_value", "drop needs @x,y"))?;
+                        let xy: Vec<f64> = at
+                            .split(',')
+                            .filter_map(|v| v.trim().parse().ok())
+                            .collect();
+                        if xy.len() < 2 {
+                            return Err(failure("invalid_value", "drop needs @x,y"));
+                        }
+                        let it = item(self, spec)?;
+                        let i = self.active_tab;
+                        self.tabs[i].last_cursor_world =
+                            glam::DVec3::new(xy[0], xy[1], xy.get(2).copied().unwrap_or(0.0));
+                        self.block_palette.pressed = Some(it);
+                        Message::ViewportLeftRelease
+                    }
+                    "menu" => {
+                        let (action, spec) = arg
+                            .split_once(':')
+                            .ok_or_else(|| failure("invalid_value", "menu needs action:item"))?;
+                        let action = match action {
+                            "insert" => MenuAction::Insert,
+                            "redefine" => MenuAction::Redefine,
+                            "favorite" => MenuAction::Favorite,
+                            "unfavorite" => MenuAction::Unfavorite,
+                            "edit" => MenuAction::Edit,
+                            "remove" => MenuAction::Remove,
+                            _ => return Err(failure("invalid_value", "Unknown menu action")),
+                        };
+                        Message::BlockPalette(M::Menu(item(self, spec)?, action))
+                    }
+                    _ => return Err(failure("invalid_value", "Unknown blocks palette edit")),
+                }
+            }
             // Attach dialog: choose pages by index ("0,2").
             "pdf_page_select" => {
                 let pages: Vec<usize> = string(req, "value")?
@@ -708,11 +2291,2761 @@ impl OpenCADStudio {
                 }
                 return Ok(Task::none());
             }
+            // The open Insert Table dialog: `style=…`, `columns=…`, `rows=…`,
+            // `width=…`, `lines=…`, `window=0|1`, `columns_fixed=0|1`,
+            // `rows_fixed=0|1`, `preview=0|1`, `styles` (the Table Style
+            // button), `ok`.
+            "table_style_dialog" => {
+                // value: "open", "select=<style>", "tab=<0-3>", "cell=<name>",
+                // "<field>=<value>" (cell fields), "flow=<Down|Up>",
+                // "description=<text>", "template_pick", "template_remove",
+                // "apply", "close"; New Cell Style: "cell_new",
+                // "cell_new_name=<n>", "cell_new_start=<cell>", "cell_new_ok",
+                // "cell_new_cancel", "notice_close"; Manage Cell Styles:
+                // "manage", "manage_select=<cell>", "manage_new",
+                // "manage_rename=<n>", "manage_delete", "manage_delete_yes",
+                // "manage_delete_no", "manage_ok", "manage_cancel"; "format"
+                // and "text_styles" ("…"); Borders: "border_lw=<-2|-1|n>",
+                // "border_linetype=<handle hex|0|other>",
+                // "border_color=<aci|r,g,b>", "border_double=0|1",
+                // "border_spacing=<n>", "border_apply=<0-7>" (All, Outside,
+                // Inside, Bottom, Left, Top, Right, None); Select Linetype:
+                // "linetype_pick=<name>", "linetype_ok", "linetype_cancel",
+                // "linetype_load", "load_toggle=<name>", "load_ok",
+                // "load_cancel", "reload=this|all|skip|skip_rest|cancel".
+                use crate::ui::style::tablestyle::TsCellMsg as C;
+                let value = string(req, "value")?;
+                let (key, v) = value.split_once('=').unwrap_or((value, ""));
+                if key != "open" && !self.focus_dialog(crate::app::ModalKind::TableStyle) {
+                    return Err(failure("no_dialog", "The Table Style dialog is not open"));
+                }
+                let cell = |field: &'static str| Message::TableStyleCellEdit {
+                    field,
+                    value: v.to_string(),
+                };
+                let cells = Message::TableStyleCells;
+                match key {
+                    "open" => Message::TableStyleDialogOpen,
+                    "select" => Message::TableStyleDialogSelect(v.to_string()),
+                    "tab" => Message::TableStyleDialogTab(v.parse().unwrap_or(0)),
+                    "cell" => Message::TableStyleCellSelect(v.to_string()),
+                    "flow" => Message::TableStyleSetFlow(v.to_string()),
+                    "description" => Message::TableStyleEdit {
+                        field: "description",
+                        value: v.to_string(),
+                    },
+                    "template_pick" => Message::TableStyleTemplatePick,
+                    "template_remove" => Message::TableStyleTemplateRemove,
+                    "apply" => Message::TableStyleApply,
+                    "close" => Message::TableStyleDialogClose,
+                    "height" => cell("height"),
+                    "angle" => cell("angle"),
+                    "hmargin" => cell("hmargin"),
+                    "vmargin" => cell("vmargin"),
+                    "align" => cell("align"),
+                    "class" => cell("class"),
+                    "datatype" => cell("datatype"),
+                    "textstyle" => cell("textstyle"),
+                    "textcolor" => cell("textcolor"),
+                    "fillcolor" => cell("fillcolor"),
+                    "merge" => cell("merge"),
+                    "cell_new" => cells(C::CreateOpen),
+                    "cell_new_name" => cells(C::CreateName(v.to_string())),
+                    "cell_new_start" => cells(C::CreateStart(v.to_string())),
+                    "cell_new_ok" => cells(C::CreateOk),
+                    "cell_new_cancel" => cells(C::CreateCancel),
+                    "notice_close" => cells(C::NoticeClose),
+                    "manage" => cells(C::ManageOpen),
+                    "manage_select" => cells(C::ManageSelect(v.to_string())),
+                    "manage_new" => cells(C::ManageNew),
+                    "manage_rename" => {
+                        let _ = self.update(cells(C::RenameStart));
+                        let _ = self.update(cells(C::RenameText(v.to_string())));
+                        cells(C::RenameCommit)
+                    }
+                    "manage_delete" => cells(C::DeleteAsk),
+                    "manage_delete_yes" => cells(C::DeleteAnswer(true)),
+                    "manage_delete_no" => cells(C::DeleteAnswer(false)),
+                    "manage_ok" => cells(C::ManageOk),
+                    "manage_cancel" => cells(C::ManageCancel),
+                    "format" => cells(C::FormatOpen),
+                    "text_styles" => cells(C::TextStyles),
+                    "border_lw" => cells(C::BorderLineweight(v.to_string())),
+                    "border_linetype" => cells(C::BorderLinetype(v.to_string())),
+                    "border_color" => match crate::ui::style::tablestyle::parse_color_code(v) {
+                        Some(color) => cells(C::BorderColor(color)),
+                        None => return Err(failure("invalid_value", "Unknown color")),
+                    },
+                    "border_double" => cells(C::BorderDouble(v == "1")),
+                    "border_spacing" => cells(C::BorderSpacing(v.to_string())),
+                    "border_apply" => cells(C::BorderApply(v.parse().unwrap_or(0))),
+                    "linetype_pick" => cells(C::LinetypePick(v.to_string())),
+                    "linetype_ok" => cells(C::LinetypeOk),
+                    "linetype_cancel" => cells(C::LinetypeCancel),
+                    "linetype_load" => cells(C::LinetypeLoad),
+                    "load_toggle" => cells(C::LoadToggle(v.to_string())),
+                    "load_ok" => cells(C::LoadOk),
+                    "load_cancel" => cells(C::LoadCancel),
+                    "reload" => {
+                        use crate::ui::style::mleaderstyle::Reload;
+                        cells(C::ReloadAnswer(match v {
+                            "this" => Reload::This,
+                            "all" => Reload::All,
+                            "skip" => Reload::Skip,
+                            "skip_rest" => Reload::SkipRest,
+                            _ => Reload::Cancel,
+                        }))
+                    }
+                    _ => return Err(failure("invalid_value", "Unknown Table Style field")),
+                }
+            }
+            "table_insert_dialog" => {
+                use crate::ui::window::annotation_data::{TableInsertField as F, TableInsertion};
+                if !self.focus_dialog(crate::app::ModalKind::InsertTable) {
+                    return Err(failure("no_dialog", "The Insert Table dialog is not open"));
+                }
+                let value = string(req, "value")?;
+                let (key, v) = value.split_once('=').unwrap_or((value, ""));
+                let on = v == "1";
+                match key {
+                    "style" => Message::TableInsertStyle(v.to_string()),
+                    "columns" => Message::TableInsertField(F::Columns(v.to_string())),
+                    "rows" => Message::TableInsertField(F::DataRows(v.to_string())),
+                    "width" => Message::TableInsertField(F::ColumnWidth(v.to_string())),
+                    "lines" => Message::TableInsertField(F::RowHeight(v.to_string())),
+                    "window" => Message::TableInsertField(F::Insertion(if on {
+                        TableInsertion::Window
+                    } else {
+                        TableInsertion::Point
+                    })),
+                    "columns_fixed" => Message::TableInsertField(F::ColumnsFixed(on)),
+                    "rows_fixed" => Message::TableInsertField(F::RowsFixed(on)),
+                    "preview" => Message::TableInsertField(F::Preview(on)),
+                    "first_row" => Message::TableInsertField(F::FirstRowStyle(v.to_string())),
+                    "second_row" => Message::TableInsertField(F::SecondRowStyle(v.to_string())),
+                    "other_rows" => Message::TableInsertField(F::OtherRowStyle(v.to_string())),
+                    "extra_rows" => Message::TableInsertField(F::ExtraRows(v.to_string())),
+                    "extra_columns" => Message::TableInsertField(F::ExtraColumns(v.to_string())),
+                    // "keep=<option index>:<0|1>", the -TABLE Options order.
+                    "keep" => {
+                        let (index, state) = v.split_once(':').unwrap_or((v, "1"));
+                        Message::TableInsertField(F::TemplateOption(
+                            index.parse().unwrap_or(0),
+                            state == "1",
+                        ))
+                    }
+                    "styles" => Message::TableInsertManageStyles,
+                    "ok" => Message::TableInsertApply,
+                    _ => return Err(failure("invalid_value", "Unknown Insert Table field")),
+                }
+            }
+            // The open Block Definition dialog: `name=…`, `open_in_editor=0|1`,
+            // `base_on_screen=0|1`, `objects_on_screen=0|1`, `create_empty`,
+            // `select_objects`.
+            "block_def_dialog" => {
+                if self.block_definition.is_none() {
+                    return Err(failure(
+                        "no_dialog",
+                        "The Block Definition dialog is not open",
+                    ));
+                }
+                let value = string(req, "value")?;
+                let (key, v) = value.split_once('=').unwrap_or((value, ""));
+                let on = v == "1";
+                match key {
+                    "name" => Message::BlockDefNameSelect(v.to_string()),
+                    "open_in_editor" => Message::BlockDefOpenInEditor(on),
+                    "base_on_screen" => Message::BlockDefBaseOnScreen(on),
+                    "objects_on_screen" => Message::BlockDefObjectsOnScreen(on),
+                    "create_empty" => Message::BlockDefCreateEmpty,
+                    "select_objects" => Message::BlockDefSelectObjects,
+                    "mode" => {
+                        use crate::ui::window::block_definition::BlockObjectMode;
+                        let mode = match v.to_ascii_lowercase().as_str() {
+                            "retain" => BlockObjectMode::Retain,
+                            "convert" => BlockObjectMode::Convert,
+                            "delete" => BlockObjectMode::Delete,
+                            _ => {
+                                return Err(failure(
+                                    "invalid_value",
+                                    "mode is retain, convert or delete",
+                                ))
+                            }
+                        };
+                        Message::BlockDefObjectMode(mode)
+                    }
+                    "annotative" => Message::BlockDefAnnotative(on),
+                    "match_orientation" => Message::BlockDefMatchOrientation(on),
+                    "scale_uniformly" => Message::BlockDefScaleUniformly(on),
+                    "allow_exploding" => Message::BlockDefAllowExploding(on),
+                    "unit" => {
+                        let unit = v
+                            .trim()
+                            .parse::<i16>()
+                            .or_else(|_| match v.to_ascii_lowercase().as_str() {
+                                "inch" | "inches" => Ok(1),
+                                "foot" | "feet" => Ok(2),
+                                "mm" => Ok(4),
+                                "cm" => Ok(5),
+                                "m" | "meter" | "meters" => Ok(6),
+                                _ => Err(()),
+                            })
+                            .map_err(|_| {
+                                failure("invalid_value", "unit is an insertion unit code or name")
+                            })?;
+                        Message::BlockDefUnit(unit)
+                    }
+                    "description" => Message::BlockDefDescription(v.to_string()),
+                    "hyperlink" => Message::BlockDefHyperlink,
+                    _ => return Err(failure("invalid_value", "Unknown block definition field")),
+                }
+            }
+            "wblock_dialog" => {
+                if self.wblock.is_none() {
+                    return Err(failure("no_dialog", "The Write Block dialog is not open"));
+                }
+                let value = string(req, "value")?;
+                let (key, v) = value.split_once('=').unwrap_or((value, ""));
+                use crate::ui::window::wblock::{WblockObjectMode, WblockSourceMode};
+                match key {
+                    "source" => {
+                        let mode = match v.to_ascii_lowercase().as_str() {
+                            "block" => WblockSourceMode::Block,
+                            "entire" | "drawing" => WblockSourceMode::EntireDrawing,
+                            "objects" | "object" => WblockSourceMode::Objects,
+                            _ => {
+                                return Err(failure(
+                                    "invalid_value",
+                                    "source is block, entire or objects",
+                                ))
+                            }
+                        };
+                        Message::WblockSourceMode(mode)
+                    }
+                    "block" => Message::WblockBlockSelect(v.to_string()),
+                    "base_x" => Message::WblockBaseX(v.to_string()),
+                    "base_y" => Message::WblockBaseY(v.to_string()),
+                    "base_z" => Message::WblockBaseZ(v.to_string()),
+                    "object_mode" => {
+                        let mode = match v.to_ascii_lowercase().as_str() {
+                            "retain" => WblockObjectMode::Retain,
+                            "convert" => WblockObjectMode::Convert,
+                            "delete" => WblockObjectMode::Delete,
+                            _ => {
+                                return Err(failure(
+                                    "invalid_value",
+                                    "object_mode is retain, convert or delete",
+                                ))
+                            }
+                        };
+                        Message::WblockObjectMode(mode)
+                    }
+                    "file" => Message::WblockFilePath(v.to_string()),
+                    "unit" => {
+                        let unit = v
+                            .trim()
+                            .parse::<i16>()
+                            .or_else(|_| match v.to_ascii_lowercase().as_str() {
+                                "inch" | "inches" => Ok(1),
+                                "foot" | "feet" => Ok(2),
+                                "mm" => Ok(4),
+                                "cm" => Ok(5),
+                                "m" | "meter" | "meters" => Ok(6),
+                                _ => Err(()),
+                            })
+                            .map_err(|_| {
+                                failure("invalid_value", "unit is an insertion unit code or name")
+                            })?;
+                        Message::WblockUnit(unit)
+                    }
+                    _ => return Err(failure("invalid_value", "Unknown write block dialog field")),
+                }
+            }
+            // One field of the open attribute definition dialog: `tag=…`,
+            // `prompt=…`, `default=…`, `justify=MC`, `style=…`, `height=…`,
+            // `rotation=…`, `width=…`, `on_screen=0|1`, `x=…` / `y=…` / `z=…`,
+            // `mode=<bit>:0|1`, `annotative=0|1`, `align_below=0|1`, `edit_value`, `dismiss`.
+            "attr_editor" if self.attr_editor_session.is_some() => {
+                use crate::ui::window::attribute_editor::{AttrAnswer, AttrTab};
+                let value = string(req, "value")?;
+                let (key, v) = value.split_once('=').unwrap_or((value, ""));
+                let idx = self.attr_editor_selected;
+                match key {
+                    "tab" => Message::AttrEditorTab(match v {
+                        "text" => AttrTab::TextOptions,
+                        "properties" => AttrTab::Properties,
+                        _ => AttrTab::Attribute,
+                    }),
+                    "row" => Message::AttrEditorSelect(
+                        v.parse::<usize>()
+                            .map_err(|_| failure("invalid_value", "row=<n>"))?,
+                    ),
+                    "value" => Message::AttrEditorInput {
+                        idx,
+                        value: v.into(),
+                    },
+                    "style" => Message::AttrEditorTextStyle(v.into()),
+                    "justify" => Message::AttrEditorJustify(v.into()),
+                    "height" => Message::AttrEditorHeight(v.into()),
+                    "rotation" => Message::AttrEditorRotation(v.into()),
+                    "width" => Message::AttrEditorWidth(v.into()),
+                    "oblique" => Message::AttrEditorOblique(v.into()),
+                    "boundary" => Message::AttrEditorBoundary(v.into()),
+                    "backwards" => Message::AttrEditorBackwards(v == "1"),
+                    "upside_down" => Message::AttrEditorUpsideDown(v == "1"),
+                    "annotative" => Message::AttrEditorAnnotative(v == "1"),
+                    "layer" => Message::AttrEditorLayer(v.into()),
+                    "linetype" => Message::AttrEditorLinetype(v.into()),
+                    "color" => Message::AttrEditorColor(v.into()),
+                    "apply" => Message::AttrEditorApply,
+                    "ok" => Message::AttrEditorOk,
+                    "cancel" => Message::AttrEditorCancel,
+                    "help" => Message::AttrEditorHelp,
+                    "select_block" => Message::AttrEditorSelectBlock,
+                    "answer" => Message::AttrEditorAnswer(match v {
+                        "save" => AttrAnswer::Save,
+                        "discard" => AttrAnswer::Discard,
+                        _ => AttrAnswer::Stay,
+                    }),
+                    "dismiss" => Message::AttrEditorDismissError,
+                    "edit_value" => Message::AttrEditorEditValue,
+                    "insert_field" => Message::AttrEditorInsertField,
+                    _ => return Err(failure("invalid_value", "Unknown attribute editor field")),
+                }
+            }
+            "attr_editor" => {
+                return Err(failure("no_dialog", "The attribute editor is not open"));
+            }
+            "attdef_dialog" => {
+                use crate::ui::window::attdef_dialog::{AttdefDialogMsg as M, JustifyChoice};
+                let value = string(req, "value")?;
+                let (key, v) = value.split_once('=').unwrap_or((value, ""));
+                let on = v == "1";
+                let editing = self.focus_dialog(crate::app::ModalKind::AttDefEdit);
+                Message::AttdefDialog(match key {
+                    "tag" if editing => M::EditTag(v.into()),
+                    "prompt" if editing => M::EditPrompt(v.into()),
+                    "default" if editing => M::EditDefault(v.into()),
+                    "tag" => M::Tag(v.into()),
+                    "prompt" => M::Prompt(v.into()),
+                    "default" => M::Default(v.into()),
+                    "style" => M::Style(v.into()),
+                    "height" => M::Height(v.into()),
+                    "rotation" => M::Rotation(v.into()),
+                    "width" => M::Width(v.into()),
+                    "on_screen" => M::OnScreen(on),
+                    "annotative" => M::Annotative(on),
+                    "align_below" => M::AlignBelow(on),
+                    "edit_value" => M::EditValue,
+                    "dismiss" => M::DismissError,
+                    "insert_field" if editing => M::EditInsertField,
+                    "insert_field" => M::InsertField,
+                    "x" => M::Coord(0, v.into()),
+                    "y" => M::Coord(1, v.into()),
+                    "z" => M::Coord(2, v.into()),
+                    "justify" => M::Justify(JustifyChoice(
+                        crate::modules::draw::draw::attdef::Justify::from_keyword(v)
+                            .ok_or_else(|| failure("invalid_value", "Unknown justification"))?,
+                    )),
+                    "mode" => {
+                        let (bit, state) = v.split_once(':').unwrap_or((v, "1"));
+                        let bit = bit
+                            .parse::<u8>()
+                            .map_err(|_| failure("invalid_value", "mode=<bit>:0|1"))?;
+                        M::Mode(bit, state == "1")
+                    }
+                    _ => return Err(failure("invalid_value", "Unknown attdef dialog field")),
+                })
+            }
+            // The open Block Attribute Manager: `block=<name>`, `select=<row>`,
+            // `up`, `down`, `remove`, `edit`, `tab=attribute|text|properties`,
+            // `tag=…`, `prompt=…`, `default=…`, `mode=<invisible|verify|preset|multiline>:0|1`,
+            // `style=…`, `justify=MC`, `height=…`, `rotation=…`, `width=…`, `oblique=…`,
+            // `boundary=…`, `annotative=0|1`, `backwards=0|1`, `upside_down=0|1`,
+            // `layer=…`, `linetype=…`, `color=…`, `lineweight=…`, `column=<name>:0|1`,
+            // `more_columns`, `apply_existing=0|1`, `emphasize=0|1`, `live=0|1`,
+            // `pick`, `sync`, `apply`, `ok`, `cancel`.
+            "attman_dialog" => {
+                use crate::ui::window::attman_dialog::{AttManMsg as A, Column, EditTab};
+                let Some(state) = self.attman.as_ref() else {
+                    return Err(failure("no_dialog", "The attribute manager is not open"));
+                };
+                let value = string(req, "value")?;
+                let (key, v) = value.split_once('=').unwrap_or((value, ""));
+                let on = v == "1";
+                Message::AttMan(match key {
+                    "block" => A::Block(
+                        state
+                            .blocks
+                            .iter()
+                            .position(|b| b.name.eq_ignore_ascii_case(v))
+                            .ok_or_else(|| failure("invalid_value", "No such attributed block"))?,
+                    ),
+                    "select" => A::Select(
+                        v.parse()
+                            .ok()
+                            .filter(|r: &usize| *r < state.rows.len())
+                            .ok_or_else(|| failure("invalid_value", "No such row"))?,
+                    ),
+                    "up" => A::MoveUp,
+                    "down" => A::MoveDown,
+                    "remove" => A::Remove,
+                    "edit" => A::ToggleEdit,
+                    "tab" => A::Tab(match v {
+                        "text" => EditTab::Text,
+                        "properties" => EditTab::Properties,
+                        _ => EditTab::Attribute,
+                    }),
+                    "tag" => A::Tag(v.into()),
+                    "prompt" => A::Prompt(v.into()),
+                    "default" => A::Default(v.into()),
+                    "mode" => {
+                        let (mode, state) = v.split_once(':').unwrap_or((v, "1"));
+                        let mode = match mode {
+                            "invisible" => "invisible",
+                            "verify" => "verify",
+                            "preset" => "preset",
+                            "multiline" => "multiline",
+                            _ => return Err(failure("invalid_value", "Unknown mode")),
+                        };
+                        A::Mode(mode, state == "1")
+                    }
+                    "style" => A::Style(v.into()),
+                    "justify" => A::Justify(
+                        crate::modules::draw::draw::attdef::Justify::from_keyword(v)
+                            .ok_or_else(|| failure("invalid_value", "Unknown justification"))?,
+                    ),
+                    "height" => A::Height(v.into()),
+                    "rotation" => A::Rotation(v.into()),
+                    "width" => A::Width(v.into()),
+                    "oblique" => A::Oblique(v.into()),
+                    "boundary" => A::Boundary(v.into()),
+                    "annotative" => A::Annotative(on),
+                    "backwards" => A::Backwards(on),
+                    "upside_down" => A::UpsideDown(on),
+                    "layer" => A::Layer(v.into()),
+                    "linetype" => A::Linetype(v.into()),
+                    "color" => A::Color(v.into()),
+                    "lineweight" => A::Lineweight(v.into()),
+                    "column" => {
+                        let (name, state) = v.split_once(':').unwrap_or((v, "1"));
+                        A::Column(
+                            Column::from_name(name)
+                                .ok_or_else(|| failure("invalid_value", "Unknown column"))?,
+                            state == "1",
+                        )
+                    }
+                    "more_columns" => A::MoreColumns,
+                    "apply_existing" => A::ApplyExisting(on),
+                    "emphasize" => A::Emphasize(on),
+                    "live" => A::Live(on),
+                    "pick" => A::PickBlock,
+                    "sync" => A::Sync,
+                    "apply" => A::Apply,
+                    "ok" => A::Ok,
+                    "cancel" => A::Cancel,
+                    _ => return Err(failure("invalid_value", "Unknown attribute manager field")),
+                })
+            }
+            // One field of the open Field dialog: `category=<index>`, `name=Date`,
+            // `date=yyyy-MM-dd`, `case=0..4`, `file=1|2|3`, `ext=0|1`, `size=0..2`,
+            // `sysvar=dimscale`, `diesel=…`, `named_type=<index>`, `named=<index>`,
+            // `prop=Area`, `select_object`, `formula=(1+2)*3`, `formula_format=<index>`,
+            // `precision=<index>`, `link_text=…`, `link_url=…`, `plot_scale=<index>`.
+            "field_dialog" => {
+                use crate::ui::window::field_dialog::{self as fd, FieldDialogMsg as F};
+                let value = string(req, "value")?;
+                let (key, v) = value.split_once('=').unwrap_or((value, ""));
+                // The dialog indexes its lists with these, so one out of range
+                // would panic while it draws.
+                let index = |len: usize| {
+                    v.parse::<usize>()
+                        .ok()
+                        .filter(|i| *i < len)
+                        .ok_or_else(|| failure("invalid_value", "index out of range"))
+                };
+                let named_len = self
+                    .field_dialog
+                    .as_ref()
+                    .map_or(0, |d| d.named_names.len());
+                let known = |list: &[&'static str]| {
+                    list.iter()
+                        .copied()
+                        .find(|n| n.eq_ignore_ascii_case(v))
+                        .ok_or_else(|| failure("invalid_value", "unknown name"))
+                };
+                Message::FieldDialog(match key {
+                    "category" => F::Category(index(fd::CATEGORIES.len())?),
+                    "name" => F::Name(known(&fd::fields_of(0))?),
+                    "date" => F::DateFormat(v.into()),
+                    "case" => F::TextCase(index(fd::TEXT_CASES.len())?),
+                    "file" => F::FileParts(
+                        v.parse::<u8>()
+                            .map_err(|_| failure("invalid_value", "1|2|3"))?,
+                    ),
+                    "ext" => F::FileExtension(v == "1"),
+                    "size" => F::SizeUnit(index(fd::SIZE_UNITS.len())?),
+                    "sysvar" => F::SysVar(v.into()),
+                    "diesel" => F::Diesel(v.into()),
+                    "named_type" => F::NamedType(index(fd::NAMED_TYPES.len())?),
+                    "named" => F::Named(index(named_len)?),
+                    "prop" => F::ObjectProp(known(&[
+                        "Area",
+                        "Center",
+                        "Circumference",
+                        "Diameter",
+                        "EndPoint",
+                        "Length",
+                        "Radius",
+                        "StartPoint",
+                    ])?),
+                    "select_object" => F::SelectObject,
+                    "formula" => F::Formula(v.into()),
+                    "formula_format" => {
+                        F::FormulaFormat(index(document::fields::FORMULA_FORMATS.len())?)
+                    }
+                    "precision" => F::FormulaPrecision(index(fd::FORMULA_PRECISIONS.len())?),
+                    "link_text" => F::HyperlinkText(v.into()),
+                    "link_url" => F::HyperlinkUrl(v.into()),
+                    "plot_scale" => {
+                        F::PlotScale(index(document::fields::PLOT_SCALE_FORMATS.len())?)
+                    }
+                    "count" => F::CountExpression(v.into()),
+                    "show_instances" => F::ShowCountInstances,
+                    "ss_custom" => F::SsCustom(v.into()),
+                    "ss_set" => F::SsSet(v.parse().map_err(|_| failure("invalid_value", "index"))?),
+                    "ss_dst" => F::SsPicked(Some(std::path::PathBuf::from(v))),
+                    "ss_node" => {
+                        let state = self
+                            .field_dialog
+                            .as_ref()
+                            .ok_or_else(|| failure("invalid_state", "No Field dialog"))?;
+                        let db = state
+                            .ss_sets
+                            .get(state.ss_set)
+                            .ok_or_else(|| failure("invalid_state", "No sheet set"))?;
+                        let views = state.name == "SheetView";
+                        let id = fd::nav_nodes(db, views)
+                            .into_iter()
+                            .find(|(_, id, label, _)| label == v || id == v)
+                            .map(|(_, id, _, _)| id)
+                            .ok_or_else(|| failure("invalid_value", "No such node"))?;
+                        F::SsNode(id)
+                    }
+                    "ss_prop" => F::SsProp(v.into()),
+                    "ss_href" => F::SsHref(v == "1"),
+                    "ss_placeholder" => F::SsPlaceholder(index(fd::PLACEHOLDER_TYPES.len())?),
+                    "ss_scale" => {
+                        F::SsScaleFormat(index(document::fields::PLOT_SCALE_FORMATS.len())?)
+                    }
+                    "placeholder" => F::PlaceholderProperty(index(
+                        document::fields::BLOCK_PLACEHOLDER_PROPERTIES.len(),
+                    )?),
+                    "table_function" => F::TableFunction(
+                        ["Average", "Sum", "Count", "Cell"]
+                            .into_iter()
+                            .find(|f| f.eq_ignore_ascii_case(v))
+                            .ok_or_else(|| failure("invalid_value", "Average|Sum|Count|Cell"))?,
+                    ),
+                    _ => return Err(failure("invalid_value", "Unknown field dialog key")),
+                })
+            }
+            // Sheet Set Manager and its dialogs: "open=<dst>", "tab=list|views|model",
+            // "select=<target>", "activate=<target>", "menu=<action>:<target>"
+            // (open, new_sheet, new_subset, import, rename, remove, properties,
+            // close; a target is a sheet number or title, a subset name or
+            // "set"), "import_file=<dwg>", "new" (wizard), "existing=0|1",
+            // "step=<n>", "name=", "description=", "folder=", "hierarchy=0|1",
+            // "add_folder=<dir>", "layout=<i>:0|1", "wizard_props",
+            // "row=<i>:<value>", "prompt=0|1:<row>", "template=<file>",
+            // "custom=<i>:<value>", "add_custom", "custom_name=", "custom_default=",
+            // "custom_owner=0|1", "add_custom_ok", "number=", "title=",
+            // "file_name=", "pick_layout=<i>", "ok", "cancel".
+            "sheet_set" => {
+                use crate::ui::window::sheet_set::{
+                    FieldId as F, MenuAction as A, SheetSetMsg as M, SsmTab, WizardMsg as W,
+                };
+                let value = string(req, "value")?;
+                let (key, arg) = value.split_once('=').unwrap_or((value, ""));
+                let target = |app: &Self, spec: &str| {
+                    app.sheet_set_target(spec)
+                        .ok_or_else(|| failure("invalid_value", "No such sheet set component"))
+                };
+                let index_value = |spec: &str| -> Result<(usize, String), Value> {
+                    let (i, v) = spec.split_once(':').unwrap_or((spec, ""));
+                    Ok((
+                        i.parse()
+                            .map_err(|_| failure("invalid_value", "Expected <index>:<value>"))?,
+                        v.to_string(),
+                    ))
+                };
+                Message::SheetSet(match key {
+                    "open" => M::OpenPicked(Some(std::path::PathBuf::from(arg))),
+                    "import_file" => M::ImportPicked(Some(std::path::PathBuf::from(arg))),
+                    "tab" => M::Tab(match arg {
+                        "views" => SsmTab::SheetViews,
+                        "model" => SsmTab::ModelViews,
+                        _ => SsmTab::SheetList,
+                    }),
+                    "select" => M::Select(target(self, arg)?),
+                    "activate" => M::Activate(target(self, arg)?),
+                    "menu" => {
+                        let (action, spec) = arg.split_once(':').unwrap_or((arg, "set"));
+                        let action = match action {
+                            "open" => A::Open,
+                            "new_sheet" => A::NewSheet,
+                            "new_subset" => A::NewSubset,
+                            "import" => A::ImportLayout,
+                            "rename" => A::Rename,
+                            "remove" => A::Remove,
+                            "properties" => A::Properties,
+                            "close" => A::Close,
+                            _ => {
+                                return Err(failure(
+                                    "invalid_value",
+                                    "Unknown sheet set menu action",
+                                ))
+                            }
+                        };
+                        if action == A::ImportLayout {
+                            self.sheet_set_import_parent = Some(target(self, spec)?);
+                            return Ok(Task::none());
+                        }
+                        M::Menu(target(self, spec)?, action)
+                    }
+                    "new" => return Ok(self.dispatch_command("NEWSHEETSET")),
+                    "existing" => M::Wizard(W::Existing(arg == "1")),
+                    "step" => M::Wizard(W::Step(
+                        arg.parse().map_err(|_| failure("invalid_value", "step"))?,
+                    )),
+                    "layout" => {
+                        let (i, v) = index_value(arg)?;
+                        M::Wizard(W::LayoutOn(i, v == "1"))
+                    }
+                    "name" => M::Input(F::Name, arg.into()),
+                    "description" => M::Input(F::Description, arg.into()),
+                    "folder" => M::Input(F::Folder, arg.into()),
+                    "hierarchy" => M::Toggle(F::Hierarchy, arg == "1"),
+                    "add_folder" => {
+                        M::FolderPicked(F::AddFolder, Some(std::path::PathBuf::from(arg)))
+                    }
+                    "wizard_props" => M::WizardProperties,
+                    "row" => {
+                        let (i, v) = index_value(arg)?;
+                        M::Input(F::Row(i), v)
+                    }
+                    "prompt" => {
+                        let (i, v) = index_value(arg)?;
+                        M::Choose(F::Row(i), usize::from(v != "1"))
+                    }
+                    "template" => M::TemplatePicked(Some(std::path::PathBuf::from(arg))),
+                    "custom" => {
+                        let (i, v) = index_value(arg)?;
+                        M::CustomValue(i, v)
+                    }
+                    "add_custom" => M::AddCustom,
+                    "custom_name" => M::Input(F::CustomName, arg.into()),
+                    "custom_default" => M::Input(F::CustomDefault, arg.into()),
+                    "custom_owner" => M::Choose(F::CustomOwner, usize::from(arg == "1")),
+                    "add_custom_ok" => M::AddCustomOk,
+                    "number" => M::Input(F::Number, arg.into()),
+                    "title" => M::Input(F::Title, arg.into()),
+                    "file_name" => M::Input(F::FileName, arg.into()),
+                    "pick_layout" => M::Choose(
+                        F::Layout,
+                        arg.parse().map_err(|_| failure("invalid_value", "index"))?,
+                    ),
+                    "refresh" => M::Refresh,
+                    "open_after" => M::Toggle(F::OpenAfter, arg == "1"),
+                    "row_toggle" => {
+                        let (i, v) = index_value(arg)?;
+                        M::Toggle(F::Row(i), v == "1")
+                    }
+                    "publish" => M::Toggle(F::Publish, arg == "1"),
+                    "layout_name" => M::Input(F::LayoutName, arg.into()),
+                    "rename_opt" => {
+                        let (i, v) = index_value(arg)?;
+                        M::Toggle(F::RenameOption(i.min(3)), v == "1")
+                    }
+                    "import_add" => {
+                        M::ImportAdd(arg.split('|').map(std::path::PathBuf::from).collect())
+                    }
+                    "import_row" => {
+                        let (i, v) = index_value(arg)?;
+                        M::Toggle(F::ImportRow(i), v == "1")
+                    }
+                    "prefix" => M::Toggle(F::ImportPrefix, arg == "1"),
+                    "previous" => M::Previous,
+                    "next" => M::Next,
+                    "views_by_category" => M::ViewsByCategory(arg == "1"),
+                    "new_category" => M::NewCategory,
+                    "category" => {
+                        let id = self
+                            .sheet_set
+                            .db()
+                            .and_then(|db| {
+                                db.view_categories()
+                                    .iter()
+                                    .find(|c| c.prop("Name") == Some(arg))
+                                    .map(|c| c.id().to_string())
+                            })
+                            .ok_or_else(|| failure("invalid_value", "No such view category"))?;
+                        M::CategoryProperties(id)
+                    }
+                    "remove_category" => {
+                        let id = self
+                            .sheet_set
+                            .db()
+                            .and_then(|db| {
+                                db.view_categories()
+                                    .iter()
+                                    .find(|c| c.prop("Name") == Some(arg))
+                                    .map(|c| c.id().to_string())
+                            })
+                            .ok_or_else(|| failure("invalid_value", "No such view category"))?;
+                        M::CategoryRemove(id)
+                    }
+                    "category_block" => {
+                        let (i, v) = index_value(arg)?;
+                        M::Toggle(F::CategoryBlock(i), v == "1")
+                    }
+                    "add_location" => M::LocationPicked(Some(std::path::PathBuf::from(arg))),
+                    "remove_location" => {
+                        let id = self
+                            .sheet_set
+                            .locations
+                            .iter()
+                            .find(|(_, folder, _)| {
+                                document::sheet_set::path_key(folder)
+                                    == document::sheet_set::path_key(arg)
+                            })
+                            .map(|(id, _, _)| id.clone())
+                            .ok_or_else(|| failure("invalid_value", "No such location"))?;
+                        M::RemoveLocation(id)
+                    }
+                    "open_drawing" => M::OpenDrawing(arg.into()),
+                    "toggle_drawing" => M::ToggleDrawing(arg.into()),
+                    "see_views" => M::SeeViews(arg.into()),
+                    // place=<drawing>[|<view>]
+                    "place" => {
+                        let (drawing, view) = arg
+                            .split_once('|')
+                            .map_or((arg, None), |(d, v)| (d, Some(v.to_string())));
+                        M::PlaceOnSheet(drawing.into(), view)
+                    }
+                    // view=<view title or number - title>:<display|rename|label|category=<name>|callout=<block>>
+                    "view" => {
+                        use crate::ui::window::sheet_set::ViewAction as VA;
+                        let (spec, action) = arg
+                            .rsplit_once(':')
+                            .ok_or_else(|| failure("invalid_value", "view=<view>:<action>"))?;
+                        let db = self
+                            .sheet_set
+                            .db()
+                            .ok_or_else(|| failure("invalid_state", "No sheet set"))?;
+                        let view = db
+                            .sheets()
+                            .into_iter()
+                            .flat_map(|s| db.sheet_views(s))
+                            .find(|v| {
+                                document::sheet_set::number_and_title(v) == spec
+                                    || v.prop("Title") == Some(spec)
+                            })
+                            .map(|v| v.id().to_string())
+                            .ok_or_else(|| failure("invalid_value", "No such sheet view"))?;
+                        let (verb, name) = action.split_once('=').unwrap_or((action, ""));
+                        let a = match verb {
+                            "display" => VA::Display,
+                            "rename" => VA::Rename,
+                            "label" => VA::Label,
+                            "category" => VA::Category(
+                                db.view_categories()
+                                    .iter()
+                                    .find(|c| c.prop("Name") == Some(name))
+                                    .map(|c| c.id().to_string())
+                                    .ok_or_else(|| {
+                                        failure("invalid_value", "No such view category")
+                                    })?,
+                            ),
+                            "callout" => VA::Callout(
+                                db.callout_blocks()
+                                    .iter()
+                                    .find(|b| b.prop("Name") == Some(name))
+                                    .map(|b| b.id().to_string())
+                                    .ok_or_else(|| {
+                                        failure("invalid_value", "No such callout block")
+                                    })?,
+                            ),
+                            _ => {
+                                return Err(failure(
+                                    "invalid_value",
+                                    "display|rename|label|category=|callout=",
+                                ))
+                            }
+                        };
+                        M::ViewMenu(view, a)
+                    }
+                    "add_blocks" => M::AddBlocks,
+                    "block_list_select" => M::BlockListSelect(
+                        arg.parse().map_err(|_| failure("invalid_value", "index"))?,
+                    ),
+                    "block_list_add" => M::BlockListAdd,
+                    "block_list_delete" => M::BlockListDelete,
+                    "select_block_file" => {
+                        M::SelectBlockPicked(Some(std::path::PathBuf::from(arg)))
+                    }
+                    "select_block_whole" => M::SelectBlockWhole(arg == "1"),
+                    "select_block_check" => {
+                        let (i, v) = index_value(arg)?;
+                        M::SelectBlockCheck(i, v == "1")
+                    }
+                    "ok" => M::Ok,
+                    "cancel" => M::Cancel,
+                    _ => return Err(failure("invalid_value", "Unknown sheet set action")),
+                })
+            }
             "ribbon_dropdown" => Message::ToggleRibbonDropdown(string(req, "value")?.into()),
+            // The Password Protected PDF window, one field per call:
+            // "password=<text>", "show=0|1", "remember=0|1", "ok", "cancel" or
+            // "help".
+            "pdf_password_dialog" => {
+                use crate::ui::window::pdf_password_dialog::PdfPasswordMsg as P;
+                if !self.focus_dialog(crate::app::ModalKind::PdfPassword) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The Password Protected PDF window is not open",
+                    ));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let flag = || match value {
+                    "1" => Ok(true),
+                    "0" => Ok(false),
+                    _ => Err(failure("invalid_value", spec)),
+                };
+                if key == "cancel" {
+                    Message::CloseModal
+                } else {
+                    Message::PdfPassword(match key {
+                        "password" => P::Input(value.to_string()),
+                        "show" => P::Show(flag()?),
+                        "remember" => P::Remember(flag()?),
+                        "ok" => P::Ok,
+                        "help" => P::Help,
+                        _ => {
+                            return Err(failure(
+                                "invalid_value",
+                                "Unknown Password Protected PDF field",
+                            ))
+                        }
+                    })
+                }
+            }
+            // The Check Spelling window, one step per call:
+            // "scope=drawing|space|selection", "start", "replacement=<text>",
+            // "change", "change_all", "ignore", "ignore_all", "add", "undo",
+            // "language=<name>", "settings", "option=<n>,0|1" (0 dimension
+            // text … 7 punctuation) or "close".
+            "spell_dialog" => {
+                use crate::ui::window::spell_dialog::{SpellMsg as S, SpellScope, SpellSetting};
+                if !self.focus_dialog(crate::app::ModalKind::Spell) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The Check Spelling window is not open",
+                    ));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let message = match key {
+                    "close" => S::Help,
+                    "scope" => S::Scope(match value {
+                        "space" => SpellScope::Space,
+                        "selection" => SpellScope::Selection,
+                        _ => SpellScope::Drawing,
+                    }),
+                    "start" => S::Start,
+                    "replacement" => S::Replacement(value.to_string()),
+                    "change" => S::Change,
+                    "change_all" => S::ChangeAll,
+                    "ignore" => S::Ignore,
+                    "ignore_all" => S::IgnoreAll,
+                    "add" => S::AddWord,
+                    "undo" => S::Undo,
+                    "language" => S::Language(value.to_string()),
+                    "settings" => S::ToggleSettings,
+                    "option" => {
+                        let (n, on) = value.split_once(',').unwrap_or((value, "1"));
+                        let setting = match n {
+                            "0" => SpellSetting::Dimensions,
+                            "1" => SpellSetting::Attributes,
+                            "2" => SpellSetting::Xrefs,
+                            "3" => SpellSetting::IgnoreCapitalized,
+                            "4" => SpellSetting::IgnoreMixed,
+                            "5" => SpellSetting::IgnoreUpper,
+                            "6" => SpellSetting::IgnoreNumbers,
+                            _ => SpellSetting::IgnorePunctuation,
+                        };
+                        S::Setting(setting, on != "0")
+                    }
+                    _ => return Err(failure("invalid_value", spec)),
+                };
+                if key == "close" {
+                    Message::CloseModal
+                } else {
+                    Message::Spell(message)
+                }
+            }
+            // The Find and Replace window, one step per call: "search=<text>",
+            // "replace=<text>", "scope=drawing|space|selection", "select",
+            // "list=0|1", "more=0|1", "option=<name>,0|1" (match_case,
+            // whole_words, wildcards, xrefs, blocks, ignore_hidden,
+            // diacritics, half_full, attributes, dimensions, texts, tables,
+            // link_texts, links), "find", "replace_one", "replace_all",
+            // "row=<n>[,ctrl|,shift]", "zoom", "select_row", "select_all", "ok", "help",
+            // "answer=keep|unlock|skip_locked|all_blocks|this_block|
+            // skip_block|this_xref|all_xrefs|skip_xref|cancel", "done", or
+            // "ribbon=<text>" (the ribbon's Find text box).
+            "find_replace_dialog" => {
+                use crate::ui::window::find_replace::{FindAnswer as A, FindMsg as F, FindOpt, FindScope};
+                // "ribbon=<text>": the ribbon's Find text box, which opens
+                // the window itself.
+                if let Some(text) = string(req, "value")?.strip_prefix("ribbon=") {
+                    self.ribbon.text_find = text.to_string();
+                    return Ok(iced::Task::done(Message::RibbonTextFindSubmit));
+                }
+                if !self.focus_dialog(crate::app::ModalKind::FindReplace) {
+                    return Err(failure("no_dialog", "The Find and Replace window is not open"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let on = value != "0";
+                let message = match key {
+                    "search" => F::Search(value.to_string()),
+                    "replace" => F::Replacement(value.to_string()),
+                    "scope" => F::Scope(match value {
+                        "space" => FindScope::Space,
+                        "selection" => FindScope::Selection,
+                        _ => FindScope::Drawing,
+                    }),
+                    "select" => F::SelectObjects,
+                    "list" => F::ListResults(on),
+                    "more" => F::MoreOptions(on),
+                    "option" => {
+                        let (name, state) = value.split_once(',').unwrap_or((value, "1"));
+                        let opt = FindOpt::ALL
+                            .into_iter()
+                            .find(|o| o.key() == name)
+                            .ok_or_else(|| failure("invalid_value", spec))?;
+                        F::Option(opt, state != "0")
+                    }
+                    "find" => F::Find,
+                    "replace_one" => F::Replace,
+                    "replace_all" => F::ReplaceAll,
+                    "row" => {
+                        let (n, held) = value.split_once(',').unwrap_or((value, ""));
+                        let n = n.parse().map_err(|_| failure("invalid_value", spec))?;
+                        F::Row(n, Some((held == "ctrl", held == "shift")))
+                    }
+                    "zoom" => F::ZoomToResult,
+                    "select_row" => F::SelectHighlighted,
+                    "select_all" => F::SelectAll,
+                    "ok" => F::Dismiss,
+                    "help" => F::Help,
+                    "done" => F::Done,
+                    "answer" => F::Answer(match value {
+                        "keep" => A::KeepLocked,
+                        "unlock" => A::Unlock,
+                        "skip_locked" => A::SkipLocked,
+                        "all_blocks" => A::AllBlocks,
+                        "this_block" => A::ThisBlock,
+                        "skip_block" => A::SkipBlock,
+                        "this_xref" => A::ThisXref,
+                        "all_xrefs" => A::AllXrefs,
+                        "skip_xref" => A::SkipXref,
+                        _ => A::Cancel,
+                    }),
+                    _ => return Err(failure("invalid_value", spec)),
+                };
+                Message::Find(message)
+            }
+            // The Inspection Dimension window, one field per call:
+            // "shape=round|angular|none", "label_on=0|1", "label=<text>",
+            // "rate_on=0|1", "rate=<text>", "select", "remove", "ok" or
+            // "cancel".
+            // The Cell Borders / Cell Contents window, one field per call:
+            // "lineweight=<name>", "linetype=<name>", "color=<name>",
+            // "double=0|1", "spacing=<n>", "edges=all|outside|inside|none|
+            // top|bottom|left|right|inside_h|inside_v", "pick=<n>", "up",
+            // "down", "delete", "layout=1|2|4", "content_spacing=<n>"; the
+            // Cell Block window: "block=<name>", "align=1..9",
+            // "scale=<n>", "autofit=0|1", "rotation=<deg>"; the Cell Data
+            // Format window: "kind=0..8", "unit=<n>", "precision=<text>", "use_current=0|1",
+            // "symbol=<s>", "append=0|1", "negative=0|1", "separator=0..2",
+            // "axis=0..2", "date=<picture>", "conversion=<n>", "prefix=<s>",
+            // "suffix=<s>", "decimal=0..2", "thousands=0..3",
+            // "zero=4|8|1|2" (toggles); "ok" or "cancel".
+            "table_cell_dialog" => {
+                use crate::ui::window::table_cell_dialog::{
+                    BorderSet as B, TableCellDialogMsg as T,
+                };
+                if !matches!(
+                    self.active_modal,
+                    Some(crate::app::ModalKind::TableCellBorders)
+                        | Some(crate::app::ModalKind::TableCellContents)
+                        | Some(crate::app::ModalKind::TableCellBlock)
+                        | Some(crate::app::ModalKind::TableCellFormat)
+                ) {
+                    return Err(failure("no_dialog", "No table cell window is open"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let bad = || failure("invalid_value", spec);
+                if key == "cancel" {
+                    Message::CloseModal
+                } else {
+                    Message::TableCellDialog(match key {
+                        "lineweight" => T::Lineweight(value.to_string()),
+                        "linetype" => T::Linetype(value.to_string()),
+                        "color" => T::Color(value.to_string()),
+                        "double" => T::Double(value == "1"),
+                        "spacing" => T::Spacing(value.to_string()),
+                        "edges" => T::Edges(match value {
+                            "all" => B::All,
+                            "outside" => B::Outside,
+                            "inside" => B::Inside,
+                            "none" => B::None,
+                            "top" => B::Top,
+                            "bottom" => B::Bottom,
+                            "left" => B::Left,
+                            "right" => B::Right,
+                            "inside_h" => B::InsideHorizontal,
+                            "inside_v" => B::InsideVertical,
+                            _ => return Err(bad()),
+                        }),
+                        "pick" => T::Pick(value.parse().map_err(|_| bad())?),
+                        "up" => T::Up,
+                        "down" => T::Down,
+                        "delete" => T::Delete,
+                        "layout" => T::Layout(value.parse().map_err(|_| bad())?),
+                        "content_spacing" => T::ContentSpacing(value.to_string()),
+                        "block" => T::BlockName(value.to_string()),
+                        "align" => T::Align(value.parse().map_err(|_| bad())?),
+                        "scale" => T::BlockScale(value.to_string()),
+                        "autofit" => T::AutoFit(value == "1"),
+                        "rotation" => T::BlockRotation(value.to_string()),
+                        "kind" => T::FormatKind(value.parse().map_err(|_| bad())?),
+                        "unit" => T::FormatUnit(value.parse().map_err(|_| bad())?),
+                        "precision" => T::Precision(value.to_string()),
+                        "use_current" => T::UseCurrent(value == "1"),
+                        "symbol" => T::Symbol(value.to_string()),
+                        "append" => T::Append(value == "1"),
+                        "negative" => T::Negative(value == "1"),
+                        "separator" => T::Separator(value.parse().map_err(|_| bad())?),
+                        "axis" => T::Axis(value.parse().map_err(|_| bad())?),
+                        "date" => T::DateFormat(value.to_string()),
+                        "conversion" => T::Conversion(value.to_string()),
+                        "prefix" => T::Prefix(value.to_string()),
+                        "suffix" => T::Suffix(value.to_string()),
+                        "decimal" => T::DecimalSeparator(value.parse().map_err(|_| bad())?),
+                        "thousands" => T::ThousandsSeparator(value.parse().map_err(|_| bad())?),
+                        "zero" => T::Zero(value.parse().map_err(|_| bad())?),
+                        "ok" => T::Ok,
+                        _ => return Err(bad()),
+                    })
+                }
+            }
+            // The invalid table cell data type warning: "ok" converts,
+            // "cancel" leaves the cells as they were.
+            "table_cell_warning" => {
+                if !self.focus_dialog(crate::app::ModalKind::TableCellWarning) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The invalid data type warning is not open",
+                    ));
+                }
+                let spec = string(req, "value")?;
+                match spec {
+                    "ok" => Message::TableCellDialog(
+                        crate::ui::window::table_cell_dialog::TableCellDialogMsg::WarnOk,
+                    ),
+                    "cancel" | "close" => Message::CloseModal,
+                    _ => return Err(failure("invalid_value", spec)),
+                }
+            }
+            // A typed value that is not of the cell's data type: "type"
+            // changes the cell's type, "value" edits the value again,
+            // "cancel" drops it.
+            "table_cell_entry" => {
+                if !self.focus_dialog(crate::app::ModalKind::TableCellEntry) {
+                    return Err(failure("no_dialog", "The cell value question is not open"));
+                }
+                use crate::ui::window::table_cell_dialog::TableCellDialogMsg as T;
+                let spec = string(req, "value")?;
+                match spec {
+                    "type" => Message::TableCellDialog(T::EntryType),
+                    "value" => Message::TableCellDialog(T::EntryValue),
+                    "cancel" | "close" => Message::CloseModal,
+                    _ => return Err(failure("invalid_value", spec)),
+                }
+            }
+            "dim_inspect_dialog" => {
+                use crate::entities::dim_inspect::Shape;
+                use crate::ui::window::dim_inspect_dialog::DimInspectMsg as D;
+                if !self.focus_dialog(crate::app::ModalKind::DimInspect) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The Inspection Dimension window is not open",
+                    ));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let flag = || match value {
+                    "1" => Ok(true),
+                    "0" => Ok(false),
+                    _ => Err(failure("invalid_value", spec)),
+                };
+                if key == "cancel" {
+                    Message::CloseModal
+                } else {
+                    Message::DimInspect(match key {
+                        "shape" => D::Shape(match value {
+                            "angular" => Shape::Angular,
+                            "none" => Shape::None,
+                            "round" => Shape::Round,
+                            _ => return Err(failure("invalid_value", spec)),
+                        }),
+                        "label_on" => D::LabelOn(flag()?),
+                        "label" => D::Label(value.to_string()),
+                        "rate_on" => D::RateOn(flag()?),
+                        "rate" => D::Rate(value.to_string()),
+                        "select" => D::Select,
+                        "remove" => D::Remove,
+                        "ok" => D::Ok,
+                        _ => {
+                            return Err(failure(
+                                "invalid_value",
+                                "Unknown Inspection Dimension field",
+                            ))
+                        }
+                    })
+                }
+            }
+            // The Multileader Style window, one field per call. Manager:
+            // "select=<style>", "filter=all|used", "set_current", "new",
+            // "modify", "delete", "delete_yes", "delete_no", "help", "close".
+            // New: "name=<text>", "start=<style>", "annotative=0|1",
+            // "continue", "create_cancel", "notice_close". Modify:
+            // "tab=0|1|2", "value=<field>:<text>" (arrowhead_size, break_gap,
+            // max_points, landing_distance, scale_factor, text_height,
+            // landing_gap, block_scale, line_color, text_color, block_color),
+            // "toggle=<field>" (enable_landing, enable_dogleg, annotative,
+            // text_frame, text_always_left, extend_leader),
+            // "set=<field>:<code>" (path_type, content_type, text_angle_type,
+            // text_attachment_direction, text_*_attachment,
+            // block_content_connection, first_seg_angle, second_seg_angle),
+            // "handle=<field>:<name|other>" (line_type_handle,
+            // arrowhead_handle, text_style_handle, block_content_handle),
+            // "lineweight=<1/100 mm|-1|-2|-3>", "constraint=<key>:0|1",
+            // "scale_layout=0|1", "color_list=<field>" (line_color,
+            // text_color, block_color, line_type, line_weight),
+            // "pick=<name>", "pick_ok", "pick_cancel", "pick_load",
+            // "load_file", "load_path=<.lin path>", "load_toggle=<linetype>",
+            // "load_ok", "load_cancel",
+            // "reload=this|all|skip|skip_rest|cancel",
+            // "default_text",
+            // "text_styles", "ok", "cancel".
+            "mleader_style_dialog" => {
+                if !self.focus_dialog(crate::app::ModalKind::MLeaderStyle) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The Multileader Style window is not open",
+                    ));
+                }
+                use crate::ui::style::mleaderstyle::MlsMsg as M;
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let (field, arg) = value.split_once(':').unwrap_or((value, ""));
+                let known = |names: &[&'static str]| -> Result<&'static str, Value> {
+                    names
+                        .iter()
+                        .find(|name| **name == field)
+                        .copied()
+                        .ok_or_else(|| failure("invalid_value", "Unknown Multileader Style field"))
+                };
+                let dlg = Message::MLeaderStyleDlg;
+                match key {
+                    "select" => dlg(M::Select(value.to_string())),
+                    "filter" => dlg(M::ListFilter(value == "used")),
+                    "set_current" => dlg(M::SetCurrent),
+                    "new" => dlg(M::New),
+                    "modify" => dlg(M::Modify),
+                    "delete" => dlg(M::Delete),
+                    "delete_yes" => dlg(M::DeleteAnswer(true)),
+                    "delete_no" => dlg(M::DeleteAnswer(false)),
+                    "help" => dlg(M::Help),
+                    "close" => Message::CloseModal,
+                    "name" => dlg(M::CreateName(value.to_string())),
+                    "start" => dlg(M::CreateStart(value.to_string())),
+                    "annotative" => dlg(M::CreateAnnotative(value == "1")),
+                    "continue" => dlg(M::CreateContinue),
+                    "create_cancel" => dlg(M::CreateCancel),
+                    "notice_close" => dlg(M::NoticeClose),
+                    "tab" => dlg(M::Tab(value.parse().unwrap_or(0))),
+                    "value" => Message::MLeaderStyleEdit {
+                        field: known(&[
+                            "arrowhead_size",
+                            "break_gap",
+                            "max_points",
+                            "landing_distance",
+                            "scale_factor",
+                            "text_height",
+                            "landing_gap",
+                            "block_scale",
+                            "line_color",
+                            "text_color",
+                            "block_color",
+                        ])?,
+                        value: arg.to_string(),
+                    },
+                    "toggle" => Message::MLeaderStyleToggle(known(&[
+                        "enable_landing",
+                        "enable_dogleg",
+                        "annotative",
+                        "text_frame",
+                        "text_always_left",
+                        "extend_leader",
+                    ])?),
+                    "set" => Message::MLeaderStyleSetEnum {
+                        field: known(&[
+                            "path_type",
+                            "content_type",
+                            "text_angle_type",
+                            "text_attachment_direction",
+                            "text_left_attachment",
+                            "text_right_attachment",
+                            "text_top_attachment",
+                            "text_bottom_attachment",
+                            "block_content_connection",
+                            "first_seg_angle",
+                            "second_seg_angle",
+                        ])?,
+                        value: arg.to_string(),
+                    },
+                    "handle" => Message::MLeaderStyleSetHandle {
+                        field: known(&[
+                            "line_type_handle",
+                            "arrowhead_handle",
+                            "text_style_handle",
+                            "block_content_handle",
+                        ])?,
+                        value: if arg == "other" {
+                            crate::ui::style::mleaderstyle::OTHER.to_string()
+                        } else {
+                            arg.to_string()
+                        },
+                    },
+                    "lineweight" => Message::MLeaderStyleLineWeightChanged(
+                        document::types::LineWeight::from_value(value.parse().unwrap_or(-2)),
+                    ),
+                    "constraint" => dlg(M::Constraint(
+                        known(&["max_points", "first_angle", "second_angle"])?,
+                        arg == "1",
+                    )),
+                    "scale_layout" => dlg(M::ScaleToLayout(value == "1")),
+                    "color_list" => Message::MLeaderColorMore(known(&[
+                        "line_color",
+                        "text_color",
+                        "block_color",
+                        "line_type",
+                        "line_weight",
+                    ])?),
+                    "pick" => dlg(M::PickChoice(value.to_string())),
+                    "pick_ok" => dlg(M::PickOk),
+                    "pick_cancel" => dlg(M::PickCancel),
+                    "pick_load" => dlg(M::PickLoad),
+                    "load_file" => dlg(M::LoadFile),
+                    // The file Load Linetypes' File… would pick, by path.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    "load_path" => dlg(M::LoadFileChosen(Some(
+                        crate::io::PickedLinetypeFile::read(std::path::Path::new(value))
+                            .map_err(|error| failure("invalid_value", error.to_string()))?,
+                    ))),
+                    "load_toggle" => dlg(M::LoadToggle(value.to_string())),
+                    "load_ok" => dlg(M::LoadOk),
+                    "load_cancel" => dlg(M::LoadCancel),
+                    "reload" => {
+                        use crate::ui::style::mleaderstyle::Reload;
+                        dlg(M::ReloadAnswer(match value {
+                            "this" => Reload::This,
+                            "all" => Reload::All,
+                            "skip" => Reload::Skip,
+                            "skip_rest" => Reload::SkipRest,
+                            "cancel" => Reload::Cancel,
+                            _ => {
+                                return Err(failure(
+                                    "invalid_value",
+                                    "reload is this, all, skip, skip_rest or cancel",
+                                ))
+                            }
+                        }))
+                    }
+                    "default_text" => dlg(M::DefaultText),
+                    "text_styles" => dlg(M::TextStyles),
+                    "ok" => dlg(M::Ok),
+                    "cancel" => dlg(M::Cancel),
+                    _ => return Err(failure("invalid_value", "Unknown Multileader Style field")),
+                }
+            }
+            // The Dimension Style window, one field per call. Manager:
+            // "select=<style>", "overrides", "filter=all|used",
+            // "hide_xrefs=0|1", "context=<style>", "rename=<style>",
+            // "rename_to=<text>", "rename_ok", "set_current", "new",
+            // "modify", "override", "compare", "delete=<style>",
+            // "delete_yes", "delete_no", "save_overrides", "discard_yes",
+            // "discard_no", "help", "close" ("overrides" also names the
+            // overrides entry in context/rename/delete). New: "name=<text>",
+            // "start=<style>", "annotative=0|1", "use_for=0..6", "continue",
+            // "create_cancel", "notice_close". Settings: "tab=0..6",
+            // "text=<field>:<value>", "set=<field>:<code>",
+            // "toggle=<field>:0|1", "color=<field>:<aci|bylayer|byblock>",
+            // "color_more=<field>", "list=<field>",
+            // "arrow=<0|1|2>:<name|other>", "linetype=<field>:<name|other>",
+            // "lineweight=<field>:<1/100 mm|-1|-2|-3>", "pick=<name>",
+            // "pick_ok", "pick_cancel", "pick_load", "load_file",
+            // "load_path=<.lin path>", "load_toggle=<linetype>", "load_ok",
+            // "load_cancel", "reload=this|all|skip|skip_rest|cancel",
+            // "text_styles", "ok", "cancel". Compare:
+            // "first=<style>", "second=<style|none>", "copy", "compare_close".
+            // The annotation scale question: "pick=<scale>", "dont_ask=0|1",
+            // "ok".
+            "anno_scale_prompt" => {
+                use crate::ui::window::anno_scale_prompt::AnnoScaleMsg as A;
+                if !self.focus_dialog(crate::app::ModalKind::AnnotationScalePrompt) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The annotation scale question is not open",
+                    ));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                Message::AnnoScalePrompt(match key {
+                    "pick" => A::Pick(value.to_string()),
+                    "dont_ask" => A::DontAsk(value == "1"),
+                    "ok" => A::Ok,
+                    _ => return Err(failure("invalid_value", spec)),
+                })
+            }
+            // A window of the Text Editor tab, one step per call:
+            // "first=<n>", "hanging=<n>", "right=<n>", "tab=<kind>:<n>"
+            // (left, center, right, decimal), "align=<l|c|r|j|d>",
+            // "before=<n>", "after=<n>", "line=<exactly|atleast|multiple>:<n>",
+            // "columns=<auto|manual|static|none>", "number=<n>",
+            // "height=<n>", "width=<n>", "gutter=<n>", "mask=0|1",
+            // "factor=<n>", "background=0|1", "color=<1..7>", "find=<text>",
+            // "replace=<text>", "match_case=0|1", "whole=0|1", "wild=0|1",
+            // "diacritics=0|1", "half_full=0|1", "notice_ok", "next",
+            // "replace_one", "replace_all", "ok", "cancel".
+            // Character set "charset=<code>"; style question "style_always=0|1",
+            // "style_yes", "style_no"; lists question "lists_always=0|1",
+            // "lists_continue"; dictionaries "dict_language=<tag>",
+            // "dict_source=<n>|none", "dict_word=<text>", "dict_add",
+            // "dict_select=<n>", "dict_delete", "dict_manage=0|1",
+            // "dict_file=<path>" (adds a file), "dict_new=<path>",
+            // "dict_remove"; spelling "spell_option=<capitalized|mixed|upper|
+            // numbers|punctuation>:0|1"; "highlight=<r>,<g>,<b>",
+            // "highlight_theme"; stack "stack_upper=<text>",
+            // "stack_lower=<text>", "stack_style=h|d|t|dec",
+            // "stack_position=top|center|bottom", "stack_size=<n>%",
+            // "stack_defaults=save|restore", "autostack_open";
+            // AutoStack "auto_enabled=0|1", "auto_diagonal=0|1",
+            // "auto_trim=0|1", "auto_back". "import=<path>" puts a .txt or
+            // .rtf file in at the caret and "select=<from>,<to>" makes a
+            // pointer selection (Match takes it); no window is needed for
+            // either.
+            "mtext_dialog" => {
+                use crate::ui::window::mtext_dialogs::{
+                    Align, ColumnKind, LineMode, MTextDialogMsg as D, TabKind,
+                };
+                use crate::ui::window::mtext_tool_dialogs::{StackPosition, StackStyle};
+                let spec = string(req, "value")?;
+                if let Some(path) = spec.strip_prefix("import=") {
+                    if self.mtext_editor.is_none() {
+                        return Err(failure("no_editor", "No multiline text is edited"));
+                    }
+                    Message::MTextImport(path.to_string())
+                } else if let Some(range) = spec.strip_prefix("select=") {
+                    if self.mtext_editor.is_none() {
+                        return Err(failure("no_editor", "No multiline text is edited"));
+                    }
+                    let (from, to) = range
+                        .split_once(',')
+                        .and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)))
+                        .ok_or_else(|| failure("invalid_value", spec))?;
+                    let _ = self.update(Message::MTextSelStart(from));
+                    let _ = self.update(Message::MTextSelTo(to));
+                    Message::MTextSelEnd
+                } else {
+                if !self.focus_dialog(crate::app::ModalKind::MTextDialog) {
+                    return Err(failure("no_dialog", "No Text Editor window is open"));
+                }
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let on = value == "1";
+                let invalid = || failure("invalid_value", spec);
+                let step = |app: &mut Self, message: D| {
+                    let _ = app.update(Message::MTextDialog(message));
+                };
+                match key {
+                    "first" => Message::MTextDialog(D::FirstLine(value.into())),
+                    "hanging" => Message::MTextDialog(D::Hanging(value.into())),
+                    "right" => Message::MTextDialog(D::Right(value.into())),
+                    "tab" => {
+                        let (kind, position) = value.split_once(':').ok_or_else(invalid)?;
+                        step(
+                            self,
+                            D::TabKind(match kind {
+                                "center" => TabKind::Center,
+                                "right" => TabKind::Right,
+                                "decimal" => TabKind::Decimal,
+                                _ => TabKind::Left,
+                            }),
+                        );
+                        step(self, D::TabPosition(position.into()));
+                        Message::MTextDialog(D::TabAdd)
+                    }
+                    "align" => {
+                        step(self, D::AlignOn(true));
+                        Message::MTextDialog(D::Align(match value {
+                            "c" => Align::Center,
+                            "r" => Align::Right,
+                            "j" => Align::Justified,
+                            "d" => Align::Distributed,
+                            _ => Align::Left,
+                        }))
+                    }
+                    "before" | "after" => {
+                        step(self, D::SpacingOn(true));
+                        Message::MTextDialog(if key == "before" {
+                            D::Before(value.into())
+                        } else {
+                            D::After(value.into())
+                        })
+                    }
+                    "line" => {
+                        let (mode, at) = value.split_once(':').ok_or_else(invalid)?;
+                        step(self, D::LineOn(true));
+                        step(
+                            self,
+                            D::LineMode(match mode {
+                                "exactly" => LineMode::Exactly,
+                                "atleast" => LineMode::AtLeast,
+                                _ => LineMode::Multiple,
+                            }),
+                        );
+                        Message::MTextDialog(D::LineAt(at.into()))
+                    }
+                    "columns" => Message::MTextDialog(D::ColumnKind(match value {
+                        "auto" => ColumnKind::DynamicAuto,
+                        "manual" => ColumnKind::DynamicManual,
+                        "static" => ColumnKind::Static,
+                        _ => ColumnKind::None,
+                    })),
+                    "number" => Message::MTextDialog(D::ColumnNumber(value.into())),
+                    "height" => Message::MTextDialog(D::ColumnHeight(value.into())),
+                    "width" => Message::MTextDialog(D::ColumnWidth(value.into())),
+                    "gutter" => Message::MTextDialog(D::ColumnGutter(value.into())),
+                    "mask" => Message::MTextDialog(D::MaskOn(on)),
+                    "factor" => Message::MTextDialog(D::MaskFactor(value.into())),
+                    "background" => Message::MTextDialog(D::MaskBackground(on)),
+                    "color" => Message::MTextDialog(D::MaskColor(document::types::Color::Index(
+                        value.parse().map_err(|_| invalid())?,
+                    ))),
+                    "find" => Message::MTextDialog(D::Find(value.into())),
+                    "replace" => Message::MTextDialog(D::Replace(value.into())),
+                    "match_case" => Message::MTextDialog(D::MatchCase(on)),
+                    "whole" => Message::MTextDialog(D::WholeWords(on)),
+                    "wild" => Message::MTextDialog(D::Wildcards(on)),
+                    "diacritics" => Message::MTextDialog(D::Diacritics(on)),
+                    "half_full" => Message::MTextDialog(D::HalfFull(on)),
+                    "notice_ok" => Message::MTextDialog(D::DismissNotice),
+                    "next" => Message::MTextDialog(D::FindNext),
+                    "replace_one" => Message::MTextDialog(D::ReplaceOne),
+                    "replace_all" => Message::MTextDialog(D::ReplaceAll),
+                    "charset" => Message::MTextDialog(D::Charset(
+                        value.parse().map_err(|_| invalid())?,
+                    )),
+                    "style_always" => Message::MTextDialog(D::StyleAlways(on)),
+                    "style_yes" => Message::MTextDialog(D::StyleYes),
+                    "style_no" => Message::MTextDialog(D::StyleNo),
+                    "lists_always" => Message::MTextDialog(D::ListsAlways(on)),
+                    "lists_continue" => Message::MTextDialog(D::ListsContinue),
+                    "dict_language" => Message::MTextDialog(D::DictLanguage(value.into())),
+                    "dict_source" => Message::MTextDialog(D::DictSource(value.parse().ok())),
+                    "dict_word" => Message::MTextDialog(D::DictWord(value.into())),
+                    "dict_add" => Message::MTextDialog(D::DictAdd),
+                    "dict_select" => Message::MTextDialog(D::DictSelect(
+                        value.parse().map_err(|_| invalid())?,
+                    )),
+                    "dict_delete" => Message::MTextDialog(D::DictDelete),
+                    "dict_manage" => Message::MTextDialog(D::DictManage(on)),
+                    "dict_file" => Message::MTextDialog(D::DictFilePicked(value.into(), false)),
+                    "dict_new" => Message::MTextDialog(D::DictFilePicked(value.into(), true)),
+                    "dict_remove" => Message::MTextDialog(D::DictRemoveFile),
+                    "dict_manage_select" => Message::MTextDialog(D::DictManageSelect(
+                        value.parse().map_err(|_| invalid())?,
+                    )),
+                    "spell_option" => {
+                        use crate::ui::window::spell_dialog::SpellSetting as S;
+                        let (name, state) = value.split_once(':').ok_or_else(invalid)?;
+                        let setting = match name {
+                            "capitalized" => S::IgnoreCapitalized,
+                            "mixed" => S::IgnoreMixed,
+                            "upper" => S::IgnoreUpper,
+                            "numbers" => S::IgnoreNumbers,
+                            "punctuation" => S::IgnorePunctuation,
+                            _ => return Err(invalid()),
+                        };
+                        Message::MTextDialog(D::SpellOption(setting, state == "1"))
+                    }
+                    "highlight" => {
+                        let parts: Vec<&str> = value.split(',').collect();
+                        let [r, g, b] = parts[..] else {
+                            return Err(invalid());
+                        };
+                        step(self, D::HighlightR(r.into()));
+                        step(self, D::HighlightG(g.into()));
+                        Message::MTextDialog(D::HighlightB(b.into()))
+                    }
+                    "highlight_theme" => Message::MTextDialog(D::HighlightTheme),
+                    "stack_upper" => Message::MTextDialog(D::StackUpper(value.into())),
+                    "stack_lower" => Message::MTextDialog(D::StackLower(value.into())),
+                    "stack_style" => Message::MTextDialog(D::StackStyleSet(match value {
+                        "d" => StackStyle::Diagonal,
+                        "t" => StackStyle::Tolerance,
+                        "dec" => StackStyle::Decimal,
+                        _ => StackStyle::Horizontal,
+                    })),
+                    "stack_position" => Message::MTextDialog(D::StackPositionSet(match value {
+                        "top" => StackPosition::Top,
+                        "bottom" => StackPosition::Bottom,
+                        _ => StackPosition::Center,
+                    })),
+                    "stack_size" => Message::MTextDialog(D::StackSize(value.into())),
+                    "stack_defaults" => Message::MTextDialog(D::StackDefaults(value == "save")),
+                    "autostack_open" => Message::MTextDialog(D::AutoStackOpen),
+                    "auto_enabled" => Message::MTextDialog(D::AutoEnabled(on)),
+                    "auto_diagonal" => Message::MTextDialog(D::AutoDiagonal(on)),
+                    "auto_trim" => Message::MTextDialog(D::AutoTrim(on)),
+                    "auto_back" => Message::MTextDialog(D::AutoBack),
+                    "ok" => Message::MTextDialog(D::Ok),
+                    "cancel" => Message::CloseModal,
+                    _ => return Err(invalid()),
+                }
+                }
+            }
+            // The Text Style window, one step per call: "select=<name>",
+            // "context=<name>" (right click),
+            // "in_use=0|1", "set_current", "new", "name=<text>", "new_ok",
+            // "new_cancel", "notice_close", "delete", "delete_yes",
+            // "delete_no", "modified_yes", "modified_no", "rename=<old>:<new>",
+            // "font=<SHX file or TrueType family>", "big_font=<SHX file>",
+            // "toggle=backward|upside_down|vertical|annotative|orientation|
+            // use_big_font", "height|width|oblique=<text>", "apply" or
+            // "close".
+            "text_style_dialog" => {
+                use crate::ui::font_picker::{FontChoice, FontPickerEvent as F};
+                use crate::ui::style::textstyle::CardMsg as C;
+                if !self.focus_dialog(crate::app::ModalKind::TextStyle) {
+                    return Err(failure("no_dialog", "The Text Style window is not open"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                const TOGGLES: &[&str] = &[
+                    "backward",
+                    "upside_down",
+                    "vertical",
+                    "annotative",
+                    "orientation",
+                    "use_big_font",
+                ];
+                match key {
+                    "select" => Message::TextStyleDialogSelect(value.to_string()),
+                    "context" => Message::TextStyleContext(value.to_string()),
+                    "in_use" => Message::TextStyleInUseFilter(value == "1"),
+                    "set_current" => Message::TextStyleDialogSetCurrent,
+                    "new" => Message::TextStyleDialogNew,
+                    "name" => Message::TextStyleCard(C::NewName(value.to_string())),
+                    "new_ok" => Message::TextStyleCard(C::NewOk),
+                    "new_cancel" => Message::TextStyleCard(C::NewCancel),
+                    "notice_close" => Message::TextStyleCard(C::NoticeClose),
+                    "delete" => Message::TextStyleDialogDelete,
+                    "delete_yes" => Message::TextStyleCard(C::DeleteAnswer(true)),
+                    "delete_no" => Message::TextStyleCard(C::DeleteAnswer(false)),
+                    "modified_yes" => Message::TextStyleCard(C::ModifiedAnswer(true)),
+                    "modified_no" => Message::TextStyleCard(C::ModifiedAnswer(false)),
+                    "rename" => {
+                        let (old, new) = value
+                            .split_once(':')
+                            .ok_or_else(|| failure("invalid_value", spec))?;
+                        let _ = self.update(Message::StyleRenameStart(
+                            crate::app::StyleKind::Text,
+                            old.to_string(),
+                        ));
+                        if self.style_rename.is_some() {
+                            let _ = self.update(Message::StyleRenameEdit(new.to_string()));
+                            Message::StyleRenameCommit(crate::app::StyleKind::Text)
+                        } else {
+                            Message::TextStyleDialogSelect(old.to_string())
+                        }
+                    }
+                    "font" => Message::TextStyleFont(F::Pick(FontChoice::of_name(value))),
+                    "big_font" => Message::TextStyleBigFont(F::Pick(FontChoice::Stroke(
+                        value.to_string(),
+                    ))),
+                    "toggle" => match TOGGLES.iter().find(|name| **name == value) {
+                        Some(name) => Message::TextStyleToggle(name),
+                        None => return Err(failure("invalid_value", spec)),
+                    },
+                    "height" | "width" | "oblique" => Message::TextStyleEdit {
+                        field: match key {
+                            "height" => "height",
+                            "width" => "width",
+                            _ => "oblique",
+                        },
+                        value: value.to_string(),
+                    },
+                    "apply" => Message::TextStyleApply,
+                    "close" => Message::CloseModal,
+                    _ => return Err(failure("invalid_value", spec)),
+                }
+            }
+            "dimstyle_dialog" => {
+                if !self.focus_dialog(crate::app::ModalKind::DimStyle) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The Dimension Style window is not open",
+                    ));
+                }
+                use crate::ui::style::dimstyle::{DsMsg as M, OTHER, OVERRIDES};
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let (field, arg) = value.split_once(':').unwrap_or((value, ""));
+                // The fields of the settings face, as the window names them.
+                const FIELDS: &[&str] = &[
+                    "dimdle",
+                    "dimdli",
+                    "dimexe",
+                    "dimexo",
+                    "dimfxl",
+                    "dimasz",
+                    "dimcen",
+                    "dimbreak",
+                    "dimjogang",
+                    "dimjag",
+                    "dimtxt",
+                    "dimtfac",
+                    "dimgap",
+                    "dimscale",
+                    "dimrnd",
+                    "prefix",
+                    "suffix",
+                    "dimlfac",
+                    "dimmzf",
+                    "dimmzs",
+                    "dimaltf",
+                    "dimaltrnd",
+                    "alt_prefix",
+                    "alt_suffix",
+                    "dimaltmzf",
+                    "dimaltmzs",
+                    "dimtp",
+                    "dimtm",
+                    "dimtxsty",
+                    "center",
+                    "dimarcsym",
+                    "dimtad",
+                    "dimjust",
+                    "dimtxtdirection",
+                    "text_align",
+                    "fit",
+                    "dimtmove",
+                    "scale_mode",
+                    "dimlunit",
+                    "dimdec",
+                    "dimfrac",
+                    "dimdsep",
+                    "dimaunit",
+                    "dimadec",
+                    "dimaltu",
+                    "dimaltd",
+                    "dimalttd",
+                    "alt_place",
+                    "tol_method",
+                    "dimtdec",
+                    "dimtolj",
+                    "dimtaln",
+                    "dimsd1",
+                    "dimsd2",
+                    "dimse1",
+                    "dimse2",
+                    "dimfxlon",
+                    "frame",
+                    "annotative",
+                    "dimsoxd",
+                    "dimupt",
+                    "dimtofl",
+                    "dimalt",
+                    "layout_only",
+                    "dimazin.lead",
+                    "dimazin.trail",
+                    "dimzin.lead",
+                    "dimzin.trail",
+                    "dimzin.feet",
+                    "dimzin.inch",
+                    "dimaltz.lead",
+                    "dimaltz.trail",
+                    "dimaltz.feet",
+                    "dimaltz.inch",
+                    "dimtzin.lead",
+                    "dimtzin.trail",
+                    "dimtzin.feet",
+                    "dimtzin.inch",
+                    "dimalttz.lead",
+                    "dimalttz.trail",
+                    "dimalttz.feet",
+                    "dimalttz.inch",
+                    "dimclrd",
+                    "dimclre",
+                    "dimclrt",
+                    "fill",
+                    "dimltype",
+                    "dimltex1",
+                    "dimltex2",
+                    "dimlwd",
+                    "dimlwe",
+                ];
+                let known = |name: &str| -> Result<&'static str, Value> {
+                    FIELDS
+                        .iter()
+                        .find(|known| **known == name)
+                        .copied()
+                        .ok_or_else(|| failure("invalid_value", "Unknown Dimension Style field"))
+                };
+                let other = |name: &str| {
+                    if name == "other" {
+                        OTHER.to_string()
+                    } else {
+                        name.to_string()
+                    }
+                };
+                let dlg = Message::DimStyleDlg;
+                let entry = |name: &str| {
+                    if name == "overrides" {
+                        OVERRIDES.to_string()
+                    } else {
+                        name.to_string()
+                    }
+                };
+                match key {
+                    "select" => dlg(M::Select(value.to_string())),
+                    "overrides" => dlg(M::SelectOverrides),
+                    "filter" => dlg(M::ListFilter(value == "used")),
+                    "hide_xrefs" => dlg(M::HideXrefs(value == "1")),
+                    "context" => dlg(M::Context(Some(entry(value)))),
+                    "rename" => dlg(M::RenameStart(entry(value))),
+                    "rename_to" => dlg(M::RenameInput(value.to_string())),
+                    "rename_ok" => dlg(M::RenameCommit),
+                    "set_current" => dlg(M::SetCurrent),
+                    "new" => dlg(M::New),
+                    "modify" => dlg(M::Modify),
+                    "override" => dlg(M::Override),
+                    "compare" => dlg(M::Compare),
+                    "delete" => dlg(M::Delete(entry(value))),
+                    "delete_yes" => dlg(M::DeleteAnswer(true)),
+                    "delete_no" => dlg(M::DeleteAnswer(false)),
+                    "save_overrides" => dlg(M::SaveOverrides),
+                    "reload" => {
+                        use crate::ui::style::mleaderstyle::Reload;
+                        dlg(M::ReloadAnswer(match value {
+                            "this" => Reload::This,
+                            "all" => Reload::All,
+                            "skip" => Reload::Skip,
+                            "skip_rest" => Reload::SkipRest,
+                            "cancel" => Reload::Cancel,
+                            _ => {
+                                return Err(failure(
+                                    "invalid_value",
+                                    "reload is this, all, skip, skip_rest or cancel",
+                                ))
+                            }
+                        }))
+                    }
+                    "discard_yes" => dlg(M::DiscardAnswer(true)),
+                    "discard_no" => dlg(M::DiscardAnswer(false)),
+                    "help" => dlg(M::Help),
+                    "close" => Message::CloseModal,
+                    "name" => dlg(M::CreateName(value.to_string())),
+                    "start" => dlg(M::CreateStart(value.to_string())),
+                    "annotative" => dlg(M::CreateAnnotative(value == "1")),
+                    "use_for" => dlg(M::CreateUse(value.parse().unwrap_or(0))),
+                    "continue" => dlg(M::CreateContinue),
+                    "create_cancel" => dlg(M::CreateCancel),
+                    "notice_close" => dlg(M::NoticeClose),
+                    "tab" => dlg(M::Tab(value.parse().unwrap_or(0))),
+                    "text" => dlg(M::Text(known(field)?, arg.to_string())),
+                    "set" => dlg(M::Set(known(field)?, arg.to_string())),
+                    "toggle" => dlg(M::Toggle(known(field)?, arg == "1")),
+                    "color" => dlg(M::Color(
+                        known(field)?,
+                        match arg.to_ascii_lowercase().as_str() {
+                            "bylayer" => document::types::Color::ByLayer,
+                            "byblock" => document::types::Color::ByBlock,
+                            index => document::types::Color::from_index(index.parse().unwrap_or(7)),
+                        },
+                    )),
+                    "color_more" => dlg(M::ColorMore(known(value)?)),
+                    "list" => dlg(M::OpenList(known(value)?)),
+                    "arrow" => dlg(M::Arrow(field.parse().unwrap_or(0), other(arg))),
+                    "linetype" => dlg(M::Linetype(known(field)?, other(arg))),
+                    "lineweight" => dlg(M::Lineweight(
+                        known(field)?,
+                        document::types::LineWeight::from_value(arg.parse().unwrap_or(-2)),
+                    )),
+                    "pick" => dlg(M::PickChoice(value.to_string())),
+                    "pick_ok" => dlg(M::PickOk),
+                    "pick_cancel" => dlg(M::PickCancel),
+                    "pick_load" => dlg(M::PickLoad),
+                    "load_file" => dlg(M::LoadFile),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    "load_path" => dlg(M::LoadFileChosen(Some(
+                        crate::io::PickedLinetypeFile::read(std::path::Path::new(value))
+                            .map_err(|error| failure("invalid_value", error.to_string()))?,
+                    ))),
+                    "load_toggle" => dlg(M::LoadToggle(value.to_string())),
+                    "load_ok" => dlg(M::LoadOk),
+                    "load_cancel" => dlg(M::LoadCancel),
+                    "text_styles" => dlg(M::TextStyles),
+                    "ok" => dlg(M::Ok),
+                    "cancel" => dlg(M::Cancel),
+                    "first" => dlg(M::CompareFirst(value.to_string())),
+                    "second" => dlg(M::CompareSecond(if value == "none" {
+                        crate::tr!("dim-style", "none-style")
+                    } else {
+                        value.to_string()
+                    })),
+                    "copy" => dlg(M::CompareCopy),
+                    "compare_close" => dlg(M::CompareClose),
+                    _ => return Err(failure("invalid_value", "Unknown Dimension Style field")),
+                }
+            }
+            // The Annotation Object Scale window, one field per call:
+            // "select=<scale>", "ctrl=<scale>" (adds or drops it),
+            // "shift=<scale>" (the run from the last clicked one),
+            // "common=0|1", "add", "delete", "ok" or "cancel".
+            "object_scale_dialog" => {
+                if !self.focus_dialog(crate::app::ModalKind::AnnoObjectScale) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The Annotation Object Scale window is not open",
+                    ));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                self.ctrl_down = key == "ctrl";
+                self.shift_down = key == "shift";
+                match key {
+                    "select" | "ctrl" | "shift" => {
+                        Message::AnnoObjectScaleSelect(value.to_string())
+                    }
+                    "common" => Message::AnnoObjectScaleCommon(value == "1"),
+                    "add" => Message::AnnoObjectScaleAdd,
+                    "delete" => Message::AnnoObjectScaleDelete,
+                    "ok" => Message::AnnoObjectScaleOk,
+                    "cancel" => Message::CloseModal,
+                    _ => {
+                        return Err(failure(
+                            "invalid_value",
+                            "Unknown Annotation Object Scale field",
+                        ))
+                    }
+                }
+            }
+            // The scale list window, one field per call: "select=<scale>",
+            // "ctrl=<scale>", "shift=<scale>", "add", "edit", "name=<text>",
+            // "paper=<n>", "drawing=<n>", "apply", "back" (closes the card),
+            // "delete", "delete_yes", "delete_no", "up", "down",
+            // "reset=metric|imperial|both|cancel", "ok" or "cancel".
+            "scale_list_dialog" => {
+                if !self.focus_dialog(crate::app::ModalKind::ScaleManager) {
+                    return Err(failure("no_dialog", "The scale list window is not open"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                self.ctrl_down = key == "ctrl";
+                self.shift_down = key == "shift";
+                match key {
+                    "select" | "ctrl" | "shift" => Message::ScaleManagerSelect(value.to_string()),
+                    "add" => Message::ScaleManagerNew,
+                    "edit" => Message::ScaleManagerEdit,
+                    "name" => Message::ScaleRenameEdit(value.to_string()),
+                    "paper" => Message::ScaleManagerPaperBuf(value.to_string()),
+                    "drawing" => Message::ScaleManagerDrawingBuf(value.to_string()),
+                    "apply" => Message::ScaleRenameCommit,
+                    "back" => Message::ScaleManagerEditCancel,
+                    "delete" => Message::ScaleManagerDelete,
+                    "delete_yes" => Message::ScaleManagerDeleteChoice(true),
+                    "delete_no" => Message::ScaleManagerDeleteChoice(false),
+                    "up" => Message::ScaleManagerMove(-1),
+                    "down" => Message::ScaleManagerMove(1),
+                    "reset" => match value {
+                        "" => Message::ScaleManagerReset,
+                        "metric" => Message::ScaleManagerResetChoice(0),
+                        "imperial" => Message::ScaleManagerResetChoice(1),
+                        "both" => Message::ScaleManagerResetChoice(2),
+                        "cancel" => Message::ScaleManagerResetChoice(3),
+                        _ => return Err(failure("invalid_value", spec)),
+                    },
+                    "ok" => Message::ScaleManagerOk,
+                    "cancel" => Message::CloseModal,
+                    _ => return Err(failure("invalid_value", "Unknown scale list field")),
+                }
+            }
+            // The Insert / Edit Hyperlink window, one field per call:
+            // "address=<file, web address or file#location>", "text=<text>",
+            // "target=file|view", "view=<name>", "relative=0|1", "dwf=0|1",
+            // "browse", "ok", "remove" or "cancel".
+            "hyperlink_dialog" => {
+                use crate::ui::window::hyperlink_dialog::HyperlinkMsg as H;
+                if !self.focus_dialog(crate::app::ModalKind::Hyperlink) {
+                    return Err(failure("no_dialog", "The Hyperlink window is not open"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let flag = || match value {
+                    "1" => Ok(true),
+                    "0" => Ok(false),
+                    _ => Err(failure("invalid_value", spec)),
+                };
+                match key {
+                    "address" => Message::HyperlinkUrlChanged(value.to_string()),
+                    "text" => Message::HyperlinkDescriptionChanged(value.to_string()),
+                    "target" => Message::HyperlinkDialog(H::ViewTarget(value == "view")),
+                    "view" => Message::HyperlinkDialog(H::View(value.to_string())),
+                    "relative" => Message::HyperlinkDialog(H::Relative(flag()?)),
+                    "dwf" => Message::HyperlinkDialog(H::Dwf(flag()?)),
+                    "browse" => Message::HyperlinkDialog(H::Browse),
+                    "ok" => Message::HyperlinkApply,
+                    "remove" => Message::HyperlinkRemove,
+                    "cancel" => Message::HyperlinkCancel,
+                    _ => return Err(failure("invalid_value", "Unknown Hyperlink window field")),
+                }
+            }
+            // The Edit Reference dialog, one field per call: "level=<n>" (0 =
+            // the picked reference), "nested=0|1" (pick the working set in the
+            // drawing), "attributes=0|1", "lock=0|1", "unique=0|1", "ok" or
+            // "cancel".
+            "refedit_dialog" => {
+                use crate::ui::window::refedit_dialog::RefEditDialogMsg as R;
+                if !self.focus_dialog(crate::app::ModalKind::RefEdit) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The Reference Edit dialog is not open",
+                    ));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let flag = || match value {
+                    "1" => Ok(true),
+                    "0" => Ok(false),
+                    _ => Err(failure("invalid_value", spec)),
+                };
+                if key == "cancel" {
+                    Message::CloseModal
+                } else {
+                    Message::RefEditDialog(match key {
+                        "ok" => R::Ok,
+                        "level" => {
+                            R::Level(value.parse().map_err(|_| failure("invalid_value", spec))?)
+                        }
+                        "nested" => R::Nested(flag()?),
+                        "attributes" => R::Attributes(flag()?),
+                        "lock" => R::Lock(flag()?),
+                        "unique" => R::Unique(flag()?),
+                        _ => return Err(failure("invalid_value", "Unknown Reference Edit field")),
+                    })
+                }
+            }
+            // Ribbon key tips: `show`, `alt` (a lone Alt), `type:<codes>`, `enter`,
+            // `esc` or `hide`. Read them back with the `keytips` read operation.
+            "keytips" => {
+                use crate::ui::ribbon::KeyTipInput as K;
+                let value = string(req, "value")?;
+                let inputs: Vec<K> = match value {
+                    "show" => vec![K::Open { refocus: false }],
+                    "alt" => vec![K::AltTap],
+                    "esc" => vec![K::Escape],
+                    "hide" => vec![K::Hide],
+                    "enter" => vec![K::Enter],
+                    _ => match value.strip_prefix("type:") {
+                        Some(codes) if !codes.is_empty() => codes
+                            .chars()
+                            .map(|ch| K::Char(ch.to_uppercase().collect()))
+                            .collect(),
+                        _ => {
+                            return Err(failure(
+                                "invalid_value",
+                                "Use show, alt, type:<codes>, enter, esc or hide",
+                            ))
+                        }
+                    },
+                };
+                let tasks: Vec<_> = inputs
+                    .into_iter()
+                    .map(|input| self.on_keytip(input))
+                    .collect();
+                return Ok(Task::batch(tasks));
+            }
+            // The -VIEW Background dialog, one field per call: "type=gradient",
+            // "color|top|middle|bottom=r,g,b", "three=1", "rotation=30",
+            // "image=<path>", "position=center|stretch|tile", "aspect=1", "offset=x,y" (pixels), "scale=x,y",
+            // "step=offset_x|offset_y|scale_x|scale_y,+1|-1", "reset",
+            // "apply" or "cancel".
+            "view_background" => {
+                use crate::ui::window::pdf_dialogs::{BgKind, BgPosition, PdfDialogMsg as P};
+                if !self.focus_dialog(crate::app::ModalKind::ViewBackground) {
+                    return Err(failure("no_dialog", "The Background dialog is not open"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let bad = || failure("invalid_value", spec);
+                let rgb = || -> Result<[u8; 3], Value> {
+                    let parts: Vec<u8> = value
+                        .split(',')
+                        .map(|part| part.trim().parse::<u8>())
+                        .collect::<Result<_, _>>()
+                        .map_err(|_| bad())?;
+                    <[u8; 3]>::try_from(parts).map_err(|_| bad())
+                };
+                match key {
+                    "cancel" => Message::CloseModal,
+                    "apply" => Message::PdfDialog(P::BgApply),
+                    "type" => Message::PdfDialog(P::BgKind(match value {
+                        "none" => BgKind::None,
+                        "solid" => BgKind::Solid,
+                        "gradient" => BgKind::Gradient,
+                        "image" => BgKind::Image,
+                        _ => return Err(bad()),
+                    })),
+                    "color" => Message::PdfDialog(P::BgColor(0, rgb()?)),
+                    "top" => Message::PdfDialog(P::BgColor(1, rgb()?)),
+                    "middle" => Message::PdfDialog(P::BgColor(2, rgb()?)),
+                    "bottom" => Message::PdfDialog(P::BgColor(3, rgb()?)),
+                    "three" => Message::PdfDialog(P::BgThree(value == "1")),
+                    "rotation" => Message::PdfDialog(P::BgRotation(value.to_string())),
+                    "image" => Message::PdfDialog(P::BgImage(value.to_string())),
+                    "position" => Message::PdfDialog(P::BgPosition(match value {
+                        "center" => BgPosition::Center,
+                        "stretch" => BgPosition::Stretch,
+                        "tile" => BgPosition::Tile,
+                        _ => return Err(bad()),
+                    })),
+                    "aspect" => Message::PdfDialog(P::BgAspect(value == "1")),
+                    "offset" | "scale" => {
+                        let pair: Vec<String> = value
+                            .split(',')
+                            .map(|part| part.trim().to_string())
+                            .collect();
+                        let pair = <[String; 2]>::try_from(pair).map_err(|_| bad())?;
+                        if pair
+                            .iter()
+                            .any(|v| v.parse::<f64>().map_or(true, |v| !v.is_finite()))
+                        {
+                            return Err(bad());
+                        }
+                        if key == "offset" {
+                            Message::PdfDialog(P::BgOffset(pair))
+                        } else {
+                            Message::PdfDialog(P::BgScale(pair))
+                        }
+                    }
+                    "step" => {
+                        // step=offset_x|offset_y|scale_x|scale_y,+1|-1
+                        let (field, dir) = value.split_once(',').ok_or_else(bad)?;
+                        let field = match field {
+                            "offset_x" => 0,
+                            "offset_y" => 1,
+                            "scale_x" => 2,
+                            "scale_y" => 3,
+                            _ => return Err(bad()),
+                        };
+                        let dir: i8 = dir.trim().parse().map_err(|_| bad())?;
+                        Message::PdfDialog(P::BgStep(field, dir))
+                    }
+                    "reset" => Message::PdfDialog(P::BgReset),
+                    _ => return Err(bad()),
+                }
+            }
+            // The file the next PDF import picker returns, without showing
+            // it (value: the path).
+            "pdf_import_pick" => {
+                crate::sys::set_pdf_import_pick(string(req, "value")?.into());
+                return Ok(Task::none());
+            }
+            // The Import PDF window, one field per call: "page=<n>" (1-based),
+            // "on_screen=0|1" (insertion point asked after OK), "scale=<value>",
+            // "rotation=0|90|180|270", "ok" or "cancel".
+            "pdf_import_dialog" => {
+                use crate::ui::window::pdf_dialogs::{PdfDialogMsg as P, RotationChoice};
+                if !self.focus_dialog(crate::app::ModalKind::PdfImportFile) {
+                    return Err(failure("no_dialog", "The Import PDF window is not open"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let bad = || failure("invalid_value", spec);
+                if key == "cancel" {
+                    return Ok(self.update(Message::CloseModal));
+                }
+                Message::PdfDialog(match key {
+                    "ok" => P::ImportOk,
+                    "page" => P::ImportPageText(value.to_string()),
+                    "on_screen" => P::ImportInsertOnScreen(value == "1"),
+                    "scale" => P::ImportScale(value.to_string()),
+                    "rotation" => P::ImportRotation(
+                        RotationChoice::ALL
+                            .into_iter()
+                            .find(|r| value.trim().parse() == Ok(r.0))
+                            .ok_or_else(bad)?,
+                    ),
+                    _ => return Err(bad()),
+                })
+            }
+            // The Import File window, one field per call: "path=<file>",
+            // "format=<index or name>", "search=<text>", "filter=all|supported",
+            // "recent=<n>", "ok" or "cancel".
+            "import_file_dialog" => {
+                use crate::ui::window::import_dialogs::{ImportDialogMsg as I, FORMATS};
+                if !self.focus_dialog(crate::app::ModalKind::ImportFile) {
+                    return Err(failure("no_dialog", "The Import File window is not open"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let bad = || failure("invalid_value", spec);
+                if key == "cancel" {
+                    return Ok(self.update(Message::CloseModal));
+                }
+                Message::ImportDialog(match key {
+                    "ok" => I::ImportOk,
+                    "path" => I::Path(value.to_string()),
+                    "search" => I::Search(value.to_string()),
+                    "filter" => I::OnlySupported(match value {
+                        "all" => false,
+                        "supported" => true,
+                        _ => return Err(bad()),
+                    }),
+                    "recent" => I::Recent(value.trim().parse().map_err(|_| bad())?),
+                    "format" => I::Format(match value.trim().parse::<usize>() {
+                        Ok(k) if k < FORMATS.len() => k,
+                        _ => FORMATS
+                            .iter()
+                            .position(|f| f.name.eq_ignore_ascii_case(value.trim()))
+                            .ok_or_else(bad)?,
+                    }),
+                    _ => return Err(bad()),
+                })
+            }
+            // The 3D Studio Import window, one field per call: "check=<name>"
+            // and "uncheck=<name>" (the object's name, or "Global Settings"),
+            // "all", "clear", "filter=all|mesh|light|camera|general",
+            // "search=<text>", "layers=object|material|color|single",
+            // "multi=ask|split|first|none", "path=<file>" (as Change… picks
+            // it), "ok" or "cancel".
+            "tds_import_dialog" => {
+                use crate::ui::window::import_dialogs::ImportDialogMsg as I;
+                if !self.focus_dialog(crate::app::ModalKind::TdsImport) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The 3D Studio Import window is not open",
+                    ));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let bad = || failure("invalid_value", spec);
+                if key == "cancel" {
+                    return Ok(self.update(Message::CloseModal));
+                }
+                let pick =
+                    |options: &[&str]| options.iter().position(|o| *o == value).ok_or_else(bad);
+                Message::ImportDialog(match key {
+                    "ok" => I::TdsOk,
+                    "all" => I::TdsAll,
+                    "clear" => I::TdsClear,
+                    "check" | "uncheck" => {
+                        let k = self
+                            .import_dialogs
+                            .tds
+                            .as_ref()
+                            .and_then(|s| {
+                                s.objects
+                                    .iter()
+                                    .position(|(name, _, _)| name.eq_ignore_ascii_case(value))
+                            })
+                            .ok_or_else(bad)?;
+                        I::TdsCheck(k, key == "check")
+                    }
+                    "filter" => I::TdsFilter(pick(&["all", "mesh", "light", "camera", "general"])?),
+                    "search" => I::TdsSearch(value.to_string()),
+                    "layers" => I::TdsLayers(pick(&["object", "material", "color", "single"])?),
+                    "multi" => I::TdsMulti(pick(&["ask", "split", "first", "none"])?),
+                    "path" => I::TdsPicked(Some(value.to_string())),
+                    _ => return Err(bad()),
+                })
+            }
+            // The multiple-material mesh window of a 3D Studio import, one
+            // field per call: "split", "first", "select",
+            // "material=<name>" ("material=" for no material; selects the
+            // choice too), "remember=on|off", "apply" or "cancel".
+            "tds_material_dialog" => {
+                use crate::ui::window::import_dialogs::ImportDialogMsg as I;
+                if !self.focus_dialog(crate::app::ModalKind::TdsMaterial) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The multiple-material window is not open",
+                    ));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let bad = || failure("invalid_value", spec);
+                Message::ImportDialog(match key {
+                    "split" => I::TdsMatChoice(0),
+                    "first" => I::TdsMatChoice(1),
+                    "select" => I::TdsMatChoice(2),
+                    "material" => {
+                        let k = if value.is_empty() {
+                            0
+                        } else {
+                            self.import_dialogs
+                                .tds_material
+                                .as_ref()
+                                .and_then(|s| s.queue.first())
+                                .and_then(|(_, m)| {
+                                    m.iter()
+                                        .position(|(name, _)| name.eq_ignore_ascii_case(value))
+                                })
+                                .map(|k| k + 1)
+                                .ok_or_else(bad)?
+                        };
+                        I::TdsMatPick(k)
+                    }
+                    "remember" => I::TdsMatRemember(match value {
+                        "on" | "1" | "true" => true,
+                        "off" | "0" | "false" => false,
+                        _ => return Err(bad()),
+                    }),
+                    "apply" | "ok" => I::TdsMatApply,
+                    "cancel" => return Ok(self.update(Message::CloseModal)),
+                    _ => return Err(bad()),
+                })
+            }
+            // The Data Extraction wizard, one step per call: "next", "back",
+            // "finish", "settings=<file.dxex>", "begin=new|template|edit",
+            // "source=drawings|selection", "object=<name>:on|off",
+            // "property=<key>:on|off", "category=<name>:on|off",
+            // "combine|count|name=on|off", "table=on|off", "file=on|off",
+            // "path=<file>", "style=<table style>", "title=<text>",
+            // "headers=on|off".
+            "data_extraction" => {
+                use crate::ui::window::annotation_data::{
+                    DataExtractionField as F, ExtractionBegin, ExtractionSource,
+                };
+                if !self.focus_dialog(crate::app::ModalKind::DataExtraction) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The Data Extraction wizard is not open",
+                    ));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let bad = || failure("invalid_value", spec);
+                let on = |v: &str| match v {
+                    "on" | "1" | "true" => Ok(true),
+                    "off" | "0" | "false" => Ok(false),
+                    _ => Err(bad()),
+                };
+                let named = value.rsplit_once(':');
+                match key {
+                    "next" => Message::DataExtractionNext,
+                    "back" => Message::DataExtractionBack,
+                    "finish" => Message::DataExtractionFinish,
+                    "settings" => Message::DataExtractionField(F::SettingsPath(value.to_string())),
+                    "begin" => Message::DataExtractionField(F::Begin(match value {
+                        "new" => ExtractionBegin::New,
+                        "template" => ExtractionBegin::Template,
+                        "edit" => ExtractionBegin::Edit,
+                        _ => return Err(bad()),
+                    })),
+                    "source" => Message::DataExtractionField(F::Source(match value {
+                        "drawings" => ExtractionSource::DrawingsAndFolders,
+                        "selection" => ExtractionSource::CurrentSelection,
+                        _ => return Err(bad()),
+                    })),
+                    "object" => {
+                        let (name, state) = named.ok_or_else(bad)?;
+                        let index = self
+                            .data_extraction
+                            .objects
+                            .iter()
+                            .position(|item| item.name.eq_ignore_ascii_case(name))
+                            .ok_or_else(bad)?;
+                        Message::DataExtractionField(F::Object(index, on(state)?))
+                    }
+                    "property" => {
+                        let (name, state) = named.ok_or_else(bad)?;
+                        let index = self
+                            .data_extraction
+                            .properties
+                            .iter()
+                            .position(|item| {
+                                item.key == name || item.name.eq_ignore_ascii_case(name)
+                            })
+                            .ok_or_else(bad)?;
+                        Message::DataExtractionField(F::Property(index, on(state)?))
+                    }
+                    "category" => {
+                        let (name, state) = named.ok_or_else(bad)?;
+                        Message::DataExtractionField(F::Category(name.to_string(), on(state)?))
+                    }
+                    "combine" => Message::DataExtractionField(F::CombineIdentical(on(value)?)),
+                    "count" => Message::DataExtractionField(F::ShowCount(on(value)?)),
+                    "name" => Message::DataExtractionField(F::ShowName(on(value)?)),
+                    "table" => Message::DataExtractionField(F::OutputTable(on(value)?)),
+                    "file" => Message::DataExtractionField(F::OutputFile(on(value)?)),
+                    "path" => Message::DataExtractionField(F::OutputPath(value.to_string())),
+                    "style" => Message::DataExtractionField(F::TableStyle(value.to_string())),
+                    "title" => Message::DataExtractionField(F::TableTitle(value.to_string())),
+                    "headers" => Message::DataExtractionField(F::PropertyHeaders(on(value)?)),
+                    _ => return Err(bad()),
+                }
+            }
+            // The Data Link Manager, one step per call: "new", "name=<text>",
+            // "path=<file>" (as the file picker sets it), "sheet=<name>",
+            // "range=entire|named|cell", "cells=<A1:C4 or name>",
+            // "write=on|off", "insert_after=on|off", "save", "cancel_edit",
+            // "select=<link name>", "edit", "delete", "insert" or "close".
+            "data_link_manager" => {
+                use crate::ui::window::annotation_data::{DataLinkField as F, LinkRange};
+                if !self.focus_dialog(crate::app::ModalKind::DataLinkManager) {
+                    return Err(failure("no_dialog", "The Data Link Manager is not open"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let bad = || failure("invalid_value", spec);
+                let on = |v: &str| match v {
+                    "on" | "1" | "true" => Ok(true),
+                    "off" | "0" | "false" => Ok(false),
+                    _ => Err(bad()),
+                };
+                match key {
+                    "new" => Message::DataLinkNew,
+                    "name" => Message::DataLinkField(F::Name(value.to_string())),
+                    "path" => Message::DataLinkBrowseResult(Some(value.into())),
+                    "sheet" => Message::DataLinkField(F::Sheet(value.to_string())),
+                    "range" => Message::DataLinkField(F::RangeKind(match value {
+                        "entire" => LinkRange::EntireSheet,
+                        "named" => LinkRange::NamedRange,
+                        "cell" => LinkRange::CellRange,
+                        _ => return Err(bad()),
+                    })),
+                    "cells" => Message::DataLinkField(F::Range(value.to_string())),
+                    "write" => {
+                        self.data_link_manager.more_options = true;
+                        Message::DataLinkField(F::AllowWrite(on(value)?))
+                    }
+                    "insert_after" => Message::DataLinkField(F::InsertTable(on(value)?)),
+                    "save" => Message::DataLinkSave,
+                    "cancel_edit" => Message::DataLinkEditCancel,
+                    "select" => Message::DataLinkSelect(
+                        self.data_link_manager
+                            .links
+                            .iter()
+                            .find(|link| link.name.eq_ignore_ascii_case(value))
+                            .map(|link| link.handle)
+                            .ok_or_else(bad)?,
+                    ),
+                    "edit" => Message::DataLinkEdit,
+                    "delete" => Message::DataLinkDelete,
+                    "insert" => Message::DataLinkInsert,
+                    "close" => Message::DataLinkClose,
+                    _ => return Err(bad()),
+                }
+            }
+            // The missing texture map window of a 3D Studio import: "ok"
+            // (or "close") dismisses the shown map; the next one follows.
+            // The outdated extraction table window: "update", "update_all",
+            // "skip", "skip_all" or "close".
+            "extraction_outdated" => {
+                use crate::ui::window::extraction_outdated::OutdatedChoice as C;
+                if !self.focus_dialog(crate::app::ModalKind::ExtractionOutdated) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The outdated extraction table window is not open",
+                    ));
+                }
+                let spec = string(req, "value")?;
+                match spec {
+                    "update" => Message::ExtractionOutdated(C::Update),
+                    "update_all" => Message::ExtractionOutdated(C::UpdateAll),
+                    "skip" => Message::ExtractionOutdated(C::Skip),
+                    "skip_all" => Message::ExtractionOutdated(C::SkipAll),
+                    "close" => Message::CloseModal,
+                    _ => return Err(failure("invalid_value", spec)),
+                }
+            }
+            // The Print All (PUBLISH) window: "open", "pdf=<path>" (the PDF
+            // button with its file already picked), "print" or "close". Both
+            // outputs run the DXEVAL publish check first.
+            "print_all" => {
+                let spec = string(req, "value")?;
+                let open = self.focus_dialog(crate::app::ModalKind::PrintAll);
+                match spec.split_once('=') {
+                    _ if spec == "open" => Message::PrintAllOpen,
+                    _ if !open => {
+                        return Err(failure("no_dialog", "The Print All window is not open"));
+                    }
+                    Some(("pdf", path)) if !path.is_empty() => {
+                        Message::PrintAllPdfTo(std::path::PathBuf::from(path))
+                    }
+                    _ if spec == "print" => Message::PrintAllPrint,
+                    _ if spec == "close" => Message::CloseModal,
+                    _ => return Err(failure("invalid_value", spec)),
+                }
+            }
+            // The Hatch panel of a running HATCH / GRADIENT, one edit per
+            // call: "kind=solid|gradient|pattern|user", "pattern=<name>",
+            // "gradient=<label>", "color=<label>", "background=<label>",
+            // "angle=<deg>", "scale=<n>", "spacing=<n>", "double=on|off",
+            // "origin_x=<n>", "origin_y=<n>", "method=pick|select|draw",
+            // "associative=on|off", "separate=on|off", "keep=on|off",
+            // "island=normal|outer|ignore", "gap=<n>", "layer=<name>",
+            // "transparency=<0-90 or empty>", "color1=<label>",
+            // "color2=<label>", "draw_order=<0-4>", "annotative=on|off",
+            // "ok" or "cancel".
+            "hatch_panel" => {
+                use crate::ui::window::hatch_panel::HatchPanelMsg as H;
+                let i = self.active_tab;
+                if self.tabs[i]
+                    .active_cmd
+                    .as_ref()
+                    .and_then(|command| command.hatch_settings())
+                    .is_none()
+                {
+                    return Err(failure("no_dialog", "No HATCH or GRADIENT is running"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let on = matches!(value, "on" | "1" | "true");
+                let text = value.to_string();
+                let code = |names: &[&str]| {
+                    names
+                        .iter()
+                        .position(|name| *name == value)
+                        .map(|code| code as u8)
+                        .ok_or_else(|| failure("invalid_value", spec))
+                };
+                let message = match key {
+                    "kind" => H::Kind(code(&["solid", "gradient", "pattern", "user"])?),
+                    "pattern" => H::Pattern(text),
+                    "gradient" => H::Gradient(text),
+                    "color" => H::Color(text),
+                    "background" => H::Background(text),
+                    "angle" => H::Angle(text),
+                    "scale" => H::Scale(text),
+                    "spacing" => H::Spacing(text),
+                    "double" => H::Double(on),
+                    "origin_x" => H::OriginX(text),
+                    "origin_y" => H::OriginY(text),
+                    "method" => H::Method(code(&["pick", "select", "draw"])?),
+                    "associative" => H::Associative(on),
+                    "separate" => H::Separate(on),
+                    "keep" => H::KeepBoundaries(on),
+                    "island" => H::Islands(code(&["normal", "outer", "ignore"])?),
+                    "gap" => H::Gap(text),
+                    "layer" => H::Layer(text),
+                    "transparency" => H::Transparency(text),
+                    "color1" => H::GradientColor1(text),
+                    "color2" => H::GradientColor2(text),
+                    "draw_order" => H::DrawOrder(code(&["0", "1", "2", "3", "4"])?),
+                    "annotative" => H::Annotative(on),
+                    "ok" => H::Accept,
+                    "cancel" => H::Cancel,
+                    _ => return Err(failure("invalid_value", spec)),
+                };
+                Message::HatchPanel(message)
+            }
+            // The boundary warning of an empty-area HATCH pick: "details",
+            // "dont_show" (ticks "Do not show this message again"), "close".
+            "hatch_boundary_warning" => {
+                use crate::ui::window::hatch_dialogs::HatchDialogMsg as H;
+                if !self.focus_dialog(crate::app::ModalKind::HatchBoundaryWarning) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The hatch boundary warning is not open",
+                    ));
+                }
+                let state = self.hatch_boundary_warning.clone().unwrap_or_default();
+                match string(req, "value")? {
+                    "details" => Message::HatchDialog(H::WarningDetails(!state.details)),
+                    "dont_show" => Message::HatchDialog(H::WarningDontShow(true)),
+                    "close" => Message::HatchDialog(H::WarningClose),
+                    other => return Err(failure("invalid_value", other)),
+                }
+            }
+            "tds_map_dialog" => {
+                if !self.focus_dialog(crate::app::ModalKind::TdsMissingMap) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The missing texture map window is not open",
+                    ));
+                }
+                let spec = string(req, "value")?;
+                match spec {
+                    "ok" | "close" => Message::CloseModal,
+                    _ => return Err(failure("invalid_value", spec)),
+                }
+            }
+            // The DGN Import window, one field per call: "path=<file>" (as
+            // Change… picks it), "model=<n>", "target=new|current",
+            // "conflict=prefix|ignore", "units=master|sub", "explode=on|off",
+            // "references=translate|ignore|underlay", "existing=prompt|overwrite|keep",
+            // "mapping=layer|linetype|lineweight|color", "ok" or "cancel".
+            "dgn_import_dialog" => {
+                use crate::ui::window::import_dialogs::ImportDialogMsg as I;
+                if !self.focus_dialog(crate::app::ModalKind::DgnImport) {
+                    return Err(failure("no_dialog", "The DGN Import window is not open"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let bad = || failure("invalid_value", spec);
+                let on = |v: &str| match v {
+                    "on" | "1" | "true" => Ok(true),
+                    "off" | "0" | "false" => Ok(false),
+                    _ => Err(bad()),
+                };
+                if key == "cancel" {
+                    return Ok(self.update(Message::CloseModal));
+                }
+                Message::ImportDialog(match key {
+                    "ok" => I::DgnOk,
+                    "path" => I::DgnPicked(Some(value.to_string())),
+                    "model" => I::DgnModel(value.trim().parse().map_err(|_| bad())?),
+                    "target" => I::DgnCurrent(match value {
+                        "new" => false,
+                        "current" => true,
+                        _ => return Err(bad()),
+                    }),
+                    "conflict" => I::DgnPrefix(match value {
+                        "prefix" => true,
+                        "ignore" => false,
+                        _ => return Err(bad()),
+                    }),
+                    "units" => I::DgnSub(match value {
+                        "master" => false,
+                        "sub" => true,
+                        _ => return Err(bad()),
+                    }),
+                    "explode" => I::DgnExplode(on(value)?),
+                    // V7 text code page given as its Windows number (1252 or
+                    // "default" = the plain 1252 default).
+                    "code_page" => {
+                        use crate::scene::model::underlay_vector::code_page_supported;
+                        let page = match value {
+                            "1252" | "default" | "off" | "none" => None,
+                            page => match page.parse::<u16>() {
+                                Ok(page) if code_page_supported(page) => Some(page),
+                                _ => return Err(bad()),
+                            },
+                        };
+                        I::DgnCodePage(crate::modules::insert::dgn_import::code_page_label(page))
+                    }
+                    "references" => I::DgnReferences(match value {
+                        "translate" => crate::modules::insert::dgn_import::ReferenceMode::Translate,
+                        "ignore" => crate::modules::insert::dgn_import::ReferenceMode::Ignore,
+                        "underlay" => crate::modules::insert::dgn_import::ReferenceMode::Underlay,
+                        _ => return Err(bad()),
+                    }),
+                    "existing" => I::DgnExisting(match value {
+                        "prompt" => crate::modules::insert::dgn_import::ExistingReference::Prompt,
+                        "overwrite" => {
+                            crate::modules::insert::dgn_import::ExistingReference::Overwrite
+                        }
+                        "keep" => crate::modules::insert::dgn_import::ExistingReference::Keep,
+                        _ => return Err(bad()),
+                    }),
+                    "mapping" => I::DgnMappingTab(match value {
+                        "layer" => 0,
+                        "linetype" => 1,
+                        "lineweight" => 2,
+                        "color" => 3,
+                        _ => return Err(bad()),
+                    }),
+                    _ => return Err(bad()),
+                })
+            }
+            // The Image Adjust dialog, one field per call: "brightness=70",
+            // "contrast=40", "fade=20" (the bar), "type=fade,abc" (typed into
+            // the box), "step=brightness,+1|-1", "reset", "apply" or "cancel".
+            "image_adjust" => {
+                use crate::ui::window::pdf_dialogs::PdfDialogMsg as P;
+                if !self.focus_dialog(crate::app::ModalKind::ImageAdjust) {
+                    return Err(failure("no_dialog", "The Image Adjust dialog is not open"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let bad = || failure("invalid_value", spec);
+                let row = |name: &str| match name.trim() {
+                    "brightness" => Ok(0u8),
+                    "contrast" => Ok(1),
+                    "fade" => Ok(2),
+                    _ => Err(bad()),
+                };
+                match key {
+                    "cancel" => Message::CloseModal,
+                    "apply" => Message::PdfDialog(P::IaApply),
+                    "reset" => Message::PdfDialog(P::IaReset),
+                    "brightness" | "contrast" | "fade" => {
+                        let v: u8 = value
+                            .trim()
+                            .parse()
+                            .ok()
+                            .filter(|v| *v <= 100)
+                            .ok_or_else(bad)?;
+                        Message::PdfDialog(P::IaValue(row(key)?, v))
+                    }
+                    "type" => {
+                        let (name, typed) = value.split_once(',').ok_or_else(bad)?;
+                        Message::PdfDialog(P::IaText(row(name)?, typed.to_string()))
+                    }
+                    "step" => {
+                        let (name, dir) = value.split_once(',').ok_or_else(bad)?;
+                        let dir: i8 = dir.trim().parse().map_err(|_| bad())?;
+                        Message::PdfDialog(P::IaStep(row(name)?, dir))
+                    }
+                    _ => return Err(bad()),
+                }
+            }
+            // Text to MText Settings (TXT2MTXT SEttings): "combine=0",
+            // "order=select" / "order=top", "wrap=0", "uniform=1", "ok",
+            // "cancel".
+            "txt2mtxt_settings" => {
+                use crate::ui::window::pdf_dialogs::PdfDialogMsg as M;
+                if !self.focus_dialog(crate::app::ModalKind::Txt2MtxtSettings) {
+                    return Err(failure("no_dialog", "Text to MText Settings is not open"));
+                }
+                let value = string(req, "value")?;
+                let (key, arg) = value.split_once('=').unwrap_or((value, ""));
+                let on = arg != "0";
+                match key {
+                    "combine" => Message::PdfDialog(M::T2mCombine(on)),
+                    "order" => Message::PdfDialog(M::T2mSelectOrder(arg == "select")),
+                    "wrap" => Message::PdfDialog(M::T2mWrap(on)),
+                    "uniform" => Message::PdfDialog(M::T2mUniform(on)),
+                    "ok" => Message::PdfDialog(M::T2mOk),
+                    "cancel" => Message::CloseModal,
+                    _ => return Err(failure("invalid_value", "Unknown setting")),
+                }
+            }
+            // MATCHPROP's Property Settings: "toggle=<MATCHMODE bit>",
+            // "all", "none", "ok", "cancel".
+            "matchprop_settings" => {
+                use crate::ui::window::pdf_dialogs::PdfDialogMsg as M;
+                if !self.focus_dialog(crate::app::ModalKind::MatchPropSettings) {
+                    return Err(failure("no_dialog", "Property Settings is not open"));
+                }
+                let value = string(req, "value")?;
+                let (key, arg) = value.split_once('=').unwrap_or((value, ""));
+                match key {
+                    "toggle" => match arg.trim().parse::<u32>() {
+                        Ok(bit) if bit.is_power_of_two() => Message::PdfDialog(M::MpToggle(bit)),
+                        _ => return Err(failure("invalid_value", value)),
+                    },
+                    "all" => Message::PdfDialog(M::MpAll),
+                    "none" => Message::PdfDialog(M::MpNone),
+                    "ok" => Message::PdfDialog(M::MpOk),
+                    "cancel" => Message::CloseModal,
+                    _ => return Err(failure("invalid_value", "Unknown setting")),
+                }
+            }
+            // The PDF Text Recognition Settings dialog, one edit per call:
+            // "select=<n>", "toggle=<n>,0|1", "up", "down", "remove",
+            // "add=<path to .shx>", "move=<from>,<to>" (dragging a row),
+            // "threshold=<1-100>", "threshold_text=<typed>", "step=+1|-1",
+            // "layer=current|geometry", "best=0|1", "sample=<text>",
+            // "defaults", "apply" or "cancel" (rows count from 0).
+            "pdf_shx_settings" => {
+                use crate::ui::window::pdf_shx_dialog::ShxDialogMsg as S;
+                if !self.focus_dialog(crate::app::ModalKind::PdfShxSettings) {
+                    return Err(failure(
+                        "no_dialog",
+                        "The PDF Text Recognition Settings dialog is not open",
+                    ));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let bad = || failure("invalid_value", spec);
+                let index = |v: &str| v.trim().parse::<usize>().map_err(|_| bad());
+                let flag = |v: &str| match v.trim() {
+                    "1" => Ok(true),
+                    "0" => Ok(false),
+                    _ => Err(bad()),
+                };
+                match key {
+                    "cancel" => Message::CloseModal,
+                    "move" => {
+                        let (from, to) = value.split_once(',').ok_or_else(bad)?;
+                        let (from, to) = (index(from)?, index(to)?);
+                        return Ok(Task::batch([
+                            self.update(Message::PdfShxDialog(S::DragStart(from))),
+                            self.update(Message::PdfShxDialog(S::DragDrop(to))),
+                        ]));
+                    }
+                    _ => Message::PdfShxDialog(match key {
+                        "apply" => S::Apply,
+                        "defaults" => S::Defaults,
+                        "up" => S::Up,
+                        "down" => S::Down,
+                        "remove" => S::Remove,
+                        "select" => S::Select(index(value)?),
+                        "toggle" => {
+                            let (row, on) = value.split_once(',').ok_or_else(bad)?;
+                            S::Toggle(index(row)?, flag(on)?)
+                        }
+                        "add" => S::Added(Some(std::path::PathBuf::from(value.trim()))),
+                        "threshold" => S::Threshold(
+                            value
+                                .trim()
+                                .parse::<u8>()
+                                .ok()
+                                .filter(|v| (1..=100).contains(v))
+                                .ok_or_else(bad)?,
+                        ),
+                        "threshold_text" => S::ThresholdText(value.to_string()),
+                        "step" => S::Step(value.trim().parse::<i8>().map_err(|_| bad())?),
+                        "layer" => match value.trim() {
+                            "current" => S::CurrentLayer(true),
+                            "geometry" => S::CurrentLayer(false),
+                            _ => return Err(bad()),
+                        },
+                        "best" => S::BestFont(flag(value)?),
+                        "sample" => S::Sample(value.to_string()),
+                        _ => return Err(bad()),
+                    }),
+                }
+            }
             "pdf_dialog_ok" => {
                 use crate::ui::window::pdf_dialogs::PdfDialogMsg;
                 Message::PdfDialog(match self.active_modal {
                     Some(crate::app::ModalKind::PdfAttach) => PdfDialogMsg::AttachOk,
+                    Some(crate::app::ModalKind::PointCloudAttach) => PdfDialogMsg::CloudOk,
+                    Some(crate::app::ModalKind::PointCloudColorMap) => PdfDialogMsg::MapOk,
+                    Some(crate::app::ModalKind::PcSection) => PdfDialogMsg::SecCreate,
                     Some(crate::app::ModalKind::UnderlayLayers) => PdfDialogMsg::LayersOk,
                     Some(crate::app::ModalKind::PdfImportSettings) => PdfDialogMsg::SettingsOk,
                     Some(crate::app::ModalKind::PdfImportFile) => PdfDialogMsg::ImportOk,
@@ -721,18 +5054,120 @@ impl OpenCADStudio {
             }
             // The open dialog's OK button.
             "dialog_ok" => match self.active_modal {
-                Some(crate::app::ModalKind::XrefAttach) => Message::XrefAttach(
-                    crate::ui::window::xref_attach::XrefAttachMsg::Apply,
-                ),
+                Some(crate::app::ModalKind::Unsaved) => Message::UnsavedDialogSave,
+                Some(crate::app::ModalKind::BlockEditChanges) => Message::BlockEditChangesSave,
+                Some(crate::app::ModalKind::WriteBlock) => Message::WblockApply,
+                Some(crate::app::ModalKind::XrefAttach) => {
+                    Message::XrefAttach(crate::ui::window::xref_attach::XrefAttachMsg::Apply)
+                }
                 Some(crate::app::ModalKind::BlockDefinition) => Message::BlockDefApply,
+                Some(crate::app::ModalKind::AttDef) => {
+                    Message::AttdefDialog(crate::ui::window::attdef_dialog::AttdefDialogMsg::Ok)
+                }
+                Some(crate::app::ModalKind::AttDefEdit) => {
+                    Message::AttdefDialog(crate::ui::window::attdef_dialog::AttdefDialogMsg::EditOk)
+                }
+                Some(crate::app::ModalKind::InsertAttributes) => Message::InsertAttrDialog(
+                    crate::ui::window::insert_attr_dialog::InsertAttrMsg::Ok,
+                ),
+                Some(crate::app::ModalKind::SheetSet) => {
+                    Message::SheetSet(crate::ui::window::sheet_set::SheetSetMsg::Ok)
+                }
+                Some(crate::app::ModalKind::Field) => {
+                    Message::FieldDialog(crate::ui::window::field_dialog::FieldDialogMsg::Ok)
+                }
+                Some(crate::app::ModalKind::AttMan) => {
+                    Message::AttMan(crate::ui::window::attman_dialog::AttManMsg::Ok)
+                }
                 _ => return Err(failure("no_dialog", "No dialog with an OK button is open")),
             },
-            "close_document" => Message::TabClose(self.active_tab),
+            // One row of the form an attributed insertion answers in a page:
+            // a script has no command line to type the answer into.
+            "dialog_answer" => {
+                let tag = string(req, "tag")?;
+                let value = string(req, "value")?;
+                let rows = match self.active_modal {
+                    Some(crate::app::ModalKind::InsertAttributes) => match self
+                        .insert_attr_dialog
+                        .as_ref()
+                    {
+                        Some(form) => &form.rows,
+                        None => return Err(failure("no_dialog", "The attribute form is not open")),
+                    },
+                    _ => return Err(failure("no_dialog", "The attribute form is not open")),
+                };
+                // A tag names a row outright; only when none does is a tag
+                // allowed to stand for the caption a row shows.
+                let Some(index) = rows.iter().position(|row| row.tag == tag).or_else(|| {
+                    rows.iter().position(|row| {
+                        row.label == tag
+                            || crate::ui::window::insert_attr_dialog::caption(&row.label) == tag
+                    })
+                }) else {
+                    return Err(failure("unknown_tag", "tag is not a row of the open form"));
+                };
+                Message::InsertAttrDialog(
+                    crate::ui::window::insert_attr_dialog::InsertAttrMsg::Value(
+                        index,
+                        value.to_string(),
+                    ),
+                )
+            }
+            "dialog_page" if self.active_modal == Some(crate::app::ModalKind::InsertAttributes) => {
+                Message::InsertAttrDialog(match string(req, "page")? {
+                    "next" => crate::ui::window::insert_attr_dialog::InsertAttrMsg::Next,
+                    "previous" => crate::ui::window::insert_attr_dialog::InsertAttrMsg::Previous,
+                    _ => return Err(failure("invalid_value", "page is next or previous")),
+                })
+            }
+            "dialog_page" => {
+                return Err(failure("no_dialog", "The attribute form is not open"));
+            }
+            // The attribute form's Cancel is the plain decline of the parked
+            // placement, so it is the modal closing itself.
+            "dialog_cancel" if self.focus_dialog(crate::app::ModalKind::InsertAttributes) => {
+                Message::CloseModal
+            }
+            "dialog_discard" | "dialog_cancel" => match self.active_modal {
+                Some(crate::app::ModalKind::Unsaved) => {
+                    if name == "dialog_discard" {
+                        Message::UnsavedDialogDiscard
+                    } else {
+                        Message::UnsavedDialogCancel
+                    }
+                }
+                Some(crate::app::ModalKind::BlockEditChanges) => {
+                    if name == "dialog_discard" {
+                        Message::BlockEditChangesDiscard
+                    } else {
+                        Message::BlockEditChangesCancel
+                    }
+                }
+                _ => return Err(failure("no_dialog", "No dialog with that button is open")),
+            },
+            "close_document" => Message::TabClose(self.tabs[self.active_tab].id),
             "toggle_properties" => Message::ToggleProperties,
             "toggle_layers" => Message::ToggleLayers,
             "toggle_grid" => Message::ToggleGrid,
             "toggle_snap" => Message::ToggleSnapEnabled,
             "toggle_ortho" => Message::ToggleOrtho,
+            // Choose an entry of the open multi-functional grip menu by its
+            // position (0 = first), as a click on it does.
+            "grip_menu_pick" => {
+                let entries = self
+                    .grip_popup
+                    .as_ref()
+                    .map_or(0, |popup| popup.items.len());
+                if entries == 0 {
+                    return Err(failure("menu_closed", "No grip menu is open"));
+                }
+                let index = string(req, "value")?
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|index| *index < entries)
+                    .ok_or_else(|| failure("invalid_value", "value is a menu entry index"))?;
+                Message::GripMenuPick(index)
+            }
             "mtext_insert" => {
                 if self.mtext_editor.is_none() {
                     return Err(failure("editor_closed", "MText editor is closed"));
@@ -743,7 +5178,13 @@ impl OpenCADStudio {
             "mtext_cancel" => Message::MTextCancel,
             "text_input" => Message::TextInlineInput(string(req, "value")?.into()),
             "text_commit" => Message::TextInlineOk,
-            "pointer_move" | "pointer_press" | "pointer_release" | "pointer_right_press"
+            // One Esc key press, as the keyboard gives it: a command that
+            // steps back on Esc (a sub-prompt) stays active.
+            "command_escape" => Message::CommandEscape,
+            "pointer_move"
+            | "pointer_press"
+            | "pointer_release"
+            | "pointer_right_press"
             | "pointer_right_release" => {
                 let x = req["x"]
                     .as_f64()
@@ -755,7 +5196,12 @@ impl OpenCADStudio {
                     .filter(|v| v.is_finite())
                     .ok_or_else(|| failure("invalid_point", "Missing finite y"))?
                     as f32;
-                let size = self.tabs[self.active_tab].scene.selection.borrow().vp_size;
+                let size = self.tabs[self.active_tab]
+                    .scene
+                    .selection
+                    .borrow()
+                    .view
+                    .vp_size;
                 if x < 0. || y < 0. || x > size.0 || y > size.1 {
                     return Err(failure(
                         "outside_viewport",
@@ -779,20 +5225,24 @@ impl OpenCADStudio {
             "undo" => Message::Undo,
             "redo" => Message::Redo,
             "layer_visible" | "layer_locked" | "layer_frozen" | "layer_current" => {
-                let layer = string(req, "layer")?;
-                let index = self.tabs[self.active_tab]
+                let layer = string(req, "layer")?.to_string();
+                // The Layer* messages carry the layer name and resolve it to
+                // the current panel row at dispatch time (#22) — no index
+                // lookup here, so panel sort order cannot mistarget the CLI.
+                if !self.tabs[self.active_tab]
                     .scene
                     .document
                     .layers
-                    .iter()
-                    .position(|l| l.name == layer)
-                    .ok_or_else(|| failure("unknown_layer", "Layer does not exist"))?;
+                    .contains(&layer)
+                {
+                    return Err(failure("unknown_layer", "Layer does not exist"));
+                }
                 match name {
-                    "layer_visible" => Message::LayerToggleVisible(index),
-                    "layer_locked" => Message::LayerToggleLock(index),
-                    "layer_frozen" => Message::LayerToggleFreeze(index),
+                    "layer_visible" => Message::LayerToggleVisible(layer),
+                    "layer_locked" => Message::LayerToggleLock(layer),
+                    "layer_frozen" => Message::LayerToggleFreeze(layer),
                     _ => {
-                        let select = self.update(Message::LayerSelect(index));
+                        let select = self.update(Message::LayerSelect(layer));
                         let current = self.update(Message::LayerSetCurrent);
                         return Ok(Task::batch([select, current]));
                     }
@@ -805,6 +5255,8 @@ impl OpenCADStudio {
                 ))
             }
         };
-        Ok(self.update(msg))
+        let task = self.update(msg);
+        (self.ctrl_down, self.shift_down) = modifiers;
+        Ok(task)
     }
 }

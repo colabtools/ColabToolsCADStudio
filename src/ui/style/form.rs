@@ -6,8 +6,9 @@
 //! tweak lands everywhere.
 
 use crate::app::Message;
+use crate::ui::dropdown_list::pick_list;
 use crate::ui::style::common::muted_style;
-use iced::widget::{button, container, pick_list, radio, row, text, text_input, Space};
+use iced::widget::{button, container, radio, row, text, text_input, Space};
 use iced::{Background, Border, Element, Length, Theme};
 use std::borrow::Cow;
 
@@ -69,6 +70,19 @@ where
 
 /// Width of the label column in a `label : control` row.
 pub const LABEL_WIDTH: f32 = 92.0;
+/// Height of a row in a dialog form (colour picker, gradient editor). The
+/// palettes use `kit_metrics::ROW_H`.
+pub const ROW_H: f32 = 26.0;
+
+/// [`button_style`] as a plain function, for the main action.
+pub fn accent_button(theme: &Theme, status: button::Status) -> button::Style {
+    button_style(true)(theme, status)
+}
+
+/// [`button_style`] as a plain function, for every other action.
+pub fn neutral_button(theme: &Theme, status: button::Status) -> button::Style {
+    button_style(false)(theme, status)
+}
 
 /// Dialog button: accent (primary action) or neutral.
 pub fn button_style(accent: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
@@ -96,6 +110,19 @@ pub fn button_style(accent: bool) -> impl Fn(&Theme, button::Status) -> button::
 
 /// Text field: base background, neutral border that turns primary on focus.
 pub fn field_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
+    field_style_with_radius(theme, status, 3.0)
+}
+
+/// Shared text-field styling with a caller-selected corner radius.
+///
+/// The default dialog radius is 3px. A small number of compact dialogs use
+/// 4px; they can preserve that visual choice without duplicating the palette
+/// and focus-border logic.
+pub fn field_style_with_radius(
+    theme: &Theme,
+    status: text_input::Status,
+    radius: f32,
+) -> text_input::Style {
     let palette = theme.palette();
     let border = match status {
         text_input::Status::Focused { .. } => palette.primary.base.color,
@@ -106,10 +133,10 @@ pub fn field_style(theme: &Theme, status: text_input::Status) -> text_input::Sty
         border: Border {
             color: border,
             width: 1.0,
-            radius: 3.0.into(),
+            radius: radius.into(),
         },
         icon: palette.background.base.text,
-        placeholder: palette.background.base.text.scale_alpha(0.48),
+        placeholder: crate::ui::style::readable::hint_text(theme),
         value: palette.background.base.text,
         selection: palette.primary.base.color.scale_alpha(0.5),
     }
@@ -216,11 +243,32 @@ pub fn labeled_field<'a>(
     label: Cow<'static, str>,
     value: &'a str,
     on_input: impl Fn(String) -> Message + 'a,
-    width: f32,
+    width: impl Into<Length>,
 ) -> Element<'a, Message> {
     row![
         row_label(label),
         text_input("", value)
+            .on_input(on_input)
+            .style(field_style)
+            .size(12)
+            .width(width),
+    ]
+    .spacing(8)
+    .align_y(iced::Center)
+    .into()
+}
+
+/// A `label : text field` row whose empty field shows `hint`.
+pub fn labeled_field_hint<'a>(
+    label: Cow<'static, str>,
+    value: &'a str,
+    hint: &str,
+    on_input: impl Fn(String) -> Message + 'a,
+    width: impl Into<Length>,
+) -> Element<'a, Message> {
+    row![
+        row_label(label),
+        text_input(hint, value)
             .on_input(on_input)
             .style(field_style)
             .size(12)

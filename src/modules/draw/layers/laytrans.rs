@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use codec::tables::Layer;
+use document::tables::Layer;
 
 use crate::scene::Scene;
 
@@ -28,6 +28,45 @@ pub struct TargetLayer {
 pub struct Mapping {
     pub from: String,
     pub to: String,
+}
+
+impl Mapping {
+    /// Read one `from=to` (or `from->to`) argument. A mapping file uses the
+    /// same two spellings, so what a command line accepts can also be written
+    /// to a file and read back unchanged.
+    pub fn parse(token: &str) -> Option<Mapping> {
+        let (from, to) = token.split_once('=').or_else(|| token.split_once("->"))?;
+        let (from, to) = (from.trim(), to.trim());
+        (!from.is_empty() && !to.is_empty()).then(|| Mapping {
+            from: from.to_string(),
+            to: to.to_string(),
+        })
+    }
+}
+
+/// Write a mapping list as plain `from -> to` lines.
+///
+/// A drawing standards file is where the reference application keeps these,
+/// but writing them there would mean inventing a place inside the drawing for
+/// something no other application reads back. A small text file beside the
+/// drawing carries the same information without touching the drawing's own
+/// structure.
+pub fn save_mappings(path: &Path, mappings: &[Mapping]) -> Result<(), String> {
+    let body: String = mappings
+        .iter()
+        .map(|mapping| format!("{} -> {}\n", mapping.from, mapping.to))
+        .collect();
+    std::fs::write(path, body).map_err(|error| error.to_string())
+}
+
+/// Read a mapping list written by [`save_mappings`]. Blank and unparsable
+/// lines are ignored, so a hand-edited file with a comment still loads.
+pub fn load_mappings(path: &Path) -> Result<Vec<Mapping>, String> {
+    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    Ok(text
+        .lines()
+        .filter_map(|line| Mapping::parse(line.trim()))
+        .collect())
 }
 
 /// What a translation should do beyond moving the objects.
@@ -72,6 +111,13 @@ impl Report {
 /// drawing. They are all the same format, so nothing here cares which.
 pub fn load_targets(path: &Path) -> Result<Vec<TargetLayer>, String> {
     let document = crate::io::load_file(path)?;
+    targets_from_document(&document)
+}
+
+/// Extract the translation targets from an already-parsed drawing — the
+/// tail of [`load_targets`], reused by the web flow, which parses the
+/// picked file's bytes before it gets here.
+pub fn targets_from_document(document: &document::Document) -> Result<Vec<TargetLayer>, String> {
     let mut targets: Vec<TargetLayer> = document
         .layers
         .iter()
@@ -141,9 +187,10 @@ pub fn translate(
             continue;
         }
         if mapping.from == "0" {
-            report
-                .skipped
-                .push((mapping.from.clone(), crate::t!("layer \"0\" cannot be translated").into_owned()));
+            report.skipped.push((
+                mapping.from.clone(),
+                crate::t!("layer \"0\" cannot be translated").into_owned(),
+            ));
             continue;
         }
         if mapping.from.eq_ignore_ascii_case(current_layer) {
@@ -154,9 +201,10 @@ pub fn translate(
             continue;
         }
         if !scene.document.layers.contains(&mapping.from) {
-            report
-                .skipped
-                .push((mapping.from.clone(), crate::t!("no such layer in this drawing").into_owned()));
+            report.skipped.push((
+                mapping.from.clone(),
+                crate::t!("no such layer in this drawing").into_owned(),
+            ));
             continue;
         }
         // Bring the target in with the standard's own properties. An existing
@@ -168,9 +216,10 @@ pub fn translate(
                 .iter()
                 .find(|target| target.name.eq_ignore_ascii_case(&mapping.to))
             else {
-                report
-                    .skipped
-                    .push((mapping.from.clone(), crate::t!("target layer is not in the loaded set").into_owned()));
+                report.skipped.push((
+                    mapping.from.clone(),
+                    crate::t!("target layer is not in the loaded set").into_owned(),
+                ));
                 continue;
             };
             let mut layer = target.layer.clone();
@@ -179,7 +228,7 @@ pub fn translate(
             // Whatever reference the target drawing held it through does not
             // come with it.
             layer.flags.xref_dependent = false;
-            layer.xref_block_record_handle = codec::Handle::NULL;
+            layer.xref_block_record_handle = document::Handle::NULL;
             let _ = scene.document.layers.add(layer);
         }
         let moved = merge_layer(scene, &mapping.from, &mapping.to, options.force_bylayer);
@@ -204,25 +253,65 @@ pub fn translate(
 ///
 /// The entity list is flat and holds block definitions too, so objects inside
 /// blocks travel with the rest rather than being left behind on a layer that no
-/// longer exists.
+/// longer exists. Attributes are not in that list: they live inside their
+/// insert and carry a layer of their own, so they are walked separately.
 pub fn merge_layer(scene: &mut Scene, from: &str, to: &str, force_bylayer: bool) -> usize {
     let mut moved = 0usize;
     for entity in scene.document.entities_mut() {
+        if let document::EntityType::Insert(insert) = entity {
+            for attribute in &mut insert.attributes {
+                if attribute.common.layer == from {
+                    move_common(&mut attribute.common, to, force_bylayer);
+                    moved += 1;
+                }
+            }
+        }
         if entity.common().layer != from {
             continue;
         }
-        let common = entity.common_mut();
-        common.layer = to.to_string();
-        if force_bylayer {
-            common.color = codec::Color::ByLayer;
-            common.color_name = None;
-            common.color_book_handle = None;
-            common.linetype = String::new();
-            common.linetype_handle = None;
-            common.line_weight = codec::LineWeight::ByLayer;
-        }
+        move_common(entity.common_mut(), to, force_bylayer);
         moved += 1;
     }
     scene.document.layers.remove(from);
     moved
+}
+
+fn move_common(common: &mut document::entities::EntityCommon, to: &str, force_bylayer: bool) {
+    common.layer = to.to_string();
+    if force_bylayer {
+        common.color = document::Color::ByLayer;
+        common.color_name = None;
+        common.color_book_handle = None;
+        common.linetype = String::new();
+        common.linetype_handle = None;
+        common.line_weight = document::LineWeight::ByLayer;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use document::entities::{AttributeEntity, EntityType, Insert};
+    use document::Vector3;
+
+    #[test]
+    fn merge_layer_moves_attributes_inside_inserts() {
+        let mut scene = Scene::new();
+        let mut attribute = AttributeEntity::new("TAG".into(), "value".into());
+        attribute.common.layer = "A".into();
+        attribute.common.color = document::Color::from_index(1);
+        let mut insert = Insert::new("BLK", Vector3::ZERO);
+        insert.attributes.push(attribute);
+        let handle = scene.add_entity(EntityType::Insert(insert));
+
+        let moved = merge_layer(&mut scene, "A", "B", true);
+
+        let Some(EntityType::Insert(insert)) = scene.document.get_entity(handle) else {
+            panic!("insert missing");
+        };
+        assert_eq!(moved, 1);
+        assert_eq!(insert.common.layer, "0");
+        assert_eq!(insert.attributes[0].common.layer, "B");
+        assert_eq!(insert.attributes[0].common.color, document::Color::ByLayer);
+    }
 }

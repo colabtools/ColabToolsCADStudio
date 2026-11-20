@@ -72,9 +72,11 @@ impl PlotDevice {
             return (PlotDevice::Pdf, false);
         }
         let lower = name.to_ascii_lowercase();
-        if lower.ends_with(".pc3") {
+        if lower.ends_with(".pc3") || lower.ends_with(".pc5") {
             // Any the source application plotter configuration: PDF ones are ours to drive,
             // the rest plot to PDF here but keep their name for the source application.
+            // `.pc5` is the same kind of file from another program ("DWG to PDF.pc5"):
+            // read as a printer name, the plot went to a queue that does not exist.
             return (PlotDevice::Pdf, true);
         }
         (PlotDevice::Printer(name.to_string()), true)
@@ -202,7 +204,12 @@ fn capability_cache() -> &'static Mutex<CapabilityCache> {
 
 /// The cached capabilities of `printer`, if they were queried already.
 pub fn cached_printer_capabilities(printer: &str) -> Option<Arc<PrinterCapabilities>> {
-    capability_cache().lock().ok()?.get(printer).cloned().flatten()
+    capability_cache()
+        .lock()
+        .ok()?
+        .get(printer)
+        .cloned()
+        .flatten()
 }
 
 /// Query `printer` for its media (blocking: a process spawn or a driver

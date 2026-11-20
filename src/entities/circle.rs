@@ -1,11 +1,11 @@
-use codec::entities::Circle;
 use crate::t;
+use document::entities::Circle;
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
-    center_grip, edit_prop as edit, parse_f64, square_grip,
+    center_grip, edit_prop as edit, format_decimal, parse_f64, ro_prop as ro, square_grip,
 };
 use crate::entities::traits::RenderConvertible;
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{extrusion_wall_tris, RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection};
 use crate::scene::model::wire_model::TangentGeom;
@@ -20,10 +20,16 @@ use crate::scene::model::wire_model::TangentGeom;
 pub fn circle_segments(radius: f64, wpp: Option<f32>) -> usize {
     const MIN_SEGMENTS: usize = 48;
     const MAX_SEGMENTS: usize = 4096;
+    let r = radius.abs();
     let Some(w) = wpp.filter(|&w| w.is_finite() && w > 0.0) else {
+        // The zoom-independent set draws circles up to the analytical cap on
+        // the GPU; a larger one is drawn from these points at every zoom, so
+        // its chords must stay within ~2e-8 of the radius.
+        if r > crate::scene::pipeline::circle_gpu::ANALYTIC_MAX_RADIUS && r.is_finite() {
+            return 16384;
+        }
         return MIN_SEGMENTS;
     };
-    let r = radius.abs();
     if !r.is_finite() || r <= 0.0 {
         return MIN_SEGMENTS;
     }
@@ -129,11 +135,11 @@ fn to_render(circle: &Circle) -> RenderEntity {
 
 /// Zoom-aware render converter for EntityType::Circle.
 pub fn relative_render(
-    entity: &codec::EntityType,
-    _document: &codec::CadDocument,
+    entity: &document::EntityType,
+    _document: &document::Document,
     wpp: Option<f32>,
 ) -> Option<RenderEntity> {
-    let codec::EntityType::Circle(circle) = entity else {
+    let document::EntityType::Circle(circle) = entity else {
         return None;
     };
     Some(to_render_with_wpp(circle, wpp))
@@ -169,9 +175,21 @@ fn properties(circle: &Circle) -> Vec<PropSection> {
             edit(t!("Diameter").as_ref(), "diameter", r * 2.0),
             edit(t!("Circumference").as_ref(), "circumference", 2.0 * PI * r),
             edit(t!("Area").as_ref(), "area", PI * r * r),
-            edit(t!("Normal X").as_ref(), "normal_x", circle.normal.x),
-            edit(t!("Normal Y").as_ref(), "normal_y", circle.normal.y),
-            edit(t!("Normal Z").as_ref(), "normal_z", circle.normal.z),
+            ro(
+                t!("Normal X").as_ref(),
+                "normal_x",
+                format_decimal(circle.normal.x),
+            ),
+            ro(
+                t!("Normal Y").as_ref(),
+                "normal_y",
+                format_decimal(circle.normal.y),
+            ),
+            ro(
+                t!("Normal Z").as_ref(),
+                "normal_z",
+                format_decimal(circle.normal.z),
+            ),
         ],
     }]
 }
@@ -192,8 +210,7 @@ fn apply_geom_prop(circle: &mut Circle, field: &str, value: &str) {
                 "center_z" => z = v,
                 _ => {}
             }
-            let (ox, oy, oz) =
-                crate::scene::view::transform::wcs_point_to_ocs((x, y, z), normal);
+            let (ox, oy, oz) = crate::scene::view::transform::wcs_point_to_ocs((x, y, z), normal);
             circle.center.x = ox;
             circle.center.y = oy;
             circle.center.z = oz;
@@ -202,28 +219,6 @@ fn apply_geom_prop(circle: &mut Circle, field: &str, value: &str) {
         "diameter" if v > 0.0 => circle.radius = v / 2.0,
         "circumference" if v > 0.0 => circle.radius = v / (2.0 * PI),
         "area" if v > 0.0 => circle.radius = (v / PI).sqrt(),
-        "normal_x" | "normal_y" | "normal_z" => {
-            let center = circle.center_wcs();
-            let mut normal = kernel::space::Vec3::new(
-                circle.normal.x,
-                circle.normal.y,
-                circle.normal.z,
-            );
-            match field {
-                "normal_x" => normal.x = v,
-                "normal_y" => normal.y = v,
-                "normal_z" => normal.z = v,
-                _ => {}
-            }
-            if let Some(normal) = normal.normalize() {
-                circle.normal = codec::types::Vector3::new(normal.x, normal.y, normal.z);
-                let (x, y, z) = crate::scene::view::transform::wcs_point_to_ocs(
-                    (center.x, center.y, center.z),
-                    (normal.x, normal.y, normal.z),
-                );
-                circle.center = codec::types::Vector3::new(x, y, z);
-            }
-        }
         _ => {}
     }
 }
@@ -262,7 +257,8 @@ fn apply_grip(circle: &mut Circle, grip_id: usize, apply: GripApply) {
 }
 
 fn apply_transform(circle: &mut Circle, t: &EntityTransform) {
-    crate::scene::view::transform::apply_standard_entity_transform(circle, t, |entity, p1, p2| {
+    let normal = circle.normal;
+    crate::scene::view::transform::apply_ocs_entity_transform(circle, t, normal, |entity, p1, p2| {
         crate::scene::view::transform::reflect_xy_point(
             &mut entity.center.x,
             &mut entity.center.y,
@@ -273,7 +269,7 @@ fn apply_transform(circle: &mut Circle, t: &EntityTransform) {
 }
 
 impl RenderConvertible for Circle {
-    fn to_render(&self, _document: &codec::CadDocument) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         Some(to_render(self))
     }
 }
@@ -287,10 +283,7 @@ impl crate::entities::traits::Grippable for Circle {
         apply_grip(self, grip_id, apply);
     }
 
-    fn grip_menu(
-        &self,
-        grip_id: usize,
-    ) -> Vec<crate::scene::model::object::GripMenuItem> {
+    fn grip_menu(&self, grip_id: usize) -> Vec<crate::scene::model::object::GripMenuItem> {
         use crate::scene::model::object::{GripMenuAction, GripMenuItem};
         let mut items = vec![GripMenuItem {
             label: "Stretch",
@@ -381,19 +374,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn editing_normal_preserves_world_center() {
-        let mut circle = Circle::from_coords(2.0, 3.0, 4.0, 5.0);
-        let center = circle.center_wcs();
-
-        apply_geom_prop(&mut circle, "normal_x", "1");
-
-        assert!((circle.center_wcs() - center).length() < 1.0e-9);
-        let normal_length =
-            (circle.normal.x.powi(2) + circle.normal.y.powi(2) + circle.normal.z.powi(2)).sqrt();
-        assert!((normal_length - 1.0).abs() < 1.0e-12);
-    }
-
-    #[test]
     fn quadrant_grips_offer_interactive_radius() {
         use crate::entities::traits::Grippable;
         use crate::scene::model::object::GripMenuAction;
@@ -436,9 +416,18 @@ mod tests {
         let seg_0_0001 = circle_segments(r, Some(0.0001));
 
         assert!(seg_0_1 >= 48, "seg_0_1 was {seg_0_1}");
-        assert!(seg_0_01 > seg_0_1, "seg_0_01 ({seg_0_01}) <= seg_0_1 ({seg_0_1})");
-        assert!(seg_0_001 > seg_0_01, "seg_0_001 ({seg_0_001}) <= seg_0_01 ({seg_0_01})");
-        assert!(seg_0_0001 > seg_0_001, "seg_0_0001 ({seg_0_0001}) <= seg_0_001 ({seg_0_001})");
+        assert!(
+            seg_0_01 > seg_0_1,
+            "seg_0_01 ({seg_0_01}) <= seg_0_1 ({seg_0_1})"
+        );
+        assert!(
+            seg_0_001 > seg_0_01,
+            "seg_0_001 ({seg_0_001}) <= seg_0_01 ({seg_0_01})"
+        );
+        assert!(
+            seg_0_0001 > seg_0_001,
+            "seg_0_0001 ({seg_0_0001}) <= seg_0_001 ({seg_0_001})"
+        );
 
         // Extreme zoom in hits maximum cap of 4096.
         assert_eq!(circle_segments(r, Some(1e-9)), 4096);
@@ -476,7 +465,10 @@ mod tests {
         };
 
         assert_eq!(far_count, 49); // 48 segments + 1 closing vertex
-        assert!(close_count > far_count, "close_count was {close_count} vs far_count {far_count}");
+        assert!(
+            close_count > far_count,
+            "close_count was {close_count} vs far_count {far_count}"
+        );
     }
 
     #[test]

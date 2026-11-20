@@ -30,9 +30,9 @@ pub struct HatchInstance {
     pub family_count: u32,          // 100
     /// Signed draw-order depth (-1,1); 0.0 = neutral. Applied as a clip-z
     /// bias in the vertex shader so this fill orders against other types.
-    pub draw_depth: f32,            // 104
+    pub draw_depth: f32, // 104
     /// Gradient shape (`GradientKind::shader_kind`), bit 4 = inverted stops.
-    pub grad_kind: u32,             // 108
+    pub grad_kind: u32, // 108
 }
 
 const _: () = assert!(std::mem::size_of::<HatchInstance>() == 112);
@@ -43,7 +43,29 @@ const _: () = assert!(std::mem::size_of::<HatchInstance>() == 112);
 fn split_origin_ds(o: [f64; 2]) -> ([f32; 2], [f32; 2]) {
     let hx = o[0] as f32;
     let hy = o[1] as f32;
-    ([hx, hy], [(o[0] - hx as f64) as f32, (o[1] - hy as f64) as f32])
+    (
+        [hx, hy],
+        [(o[0] - hx as f64) as f32, (o[1] - hy as f64) as f32],
+    )
+}
+
+/// Cull box of a fill off Z = 0. The screen cull projects an XY box on
+/// Z = 0, which says nothing about a fill above or below it in a 3D view;
+/// a NaN box is never culled, as for wipeouts off that plane.
+const OFF_GROUND_AABB: [f64; 4] = [f64::NAN; 4];
+
+/// Local-space AABB of an instance moved back to its world anchor, in f64.
+fn world_aabb(inst: &HatchInstance, offset: [f64; 2]) -> [f64; 4] {
+    let origin = [
+        inst.world_origin[0] as f64 + inst.world_origin_low[0] as f64 + offset[0],
+        inst.world_origin[1] as f64 + inst.world_origin_low[1] as f64 + offset[1],
+    ];
+    [
+        inst.aabb[0] as f64 + origin[0],
+        inst.aabb[1] as f64 + origin[1],
+        inst.aabb[2] as f64 + origin[0],
+        inst.aabb[3] as f64 + origin[1],
+    ]
 }
 
 /// Mirrors the per-family struct used by the existing per-hatch shader,
@@ -53,18 +75,18 @@ fn split_origin_ds(o: [f64; 2]) -> ([f32; 2], [f32; 2]) {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct LineFamilyGpu {
-    pub cos_a: f32,        //  0
-    pub sin_a: f32,        //  4
-    pub x0: f32,           //  8
-    pub y0: f32,           // 12
-    pub dx: f32,           // 16
-    pub dy: f32,           // 20
-    pub perp_step: f32,    // 24
-    pub along_step: f32,   // 28
-    pub line_width: f32,   // 32
-    pub period: f32,       // 36
-    pub n_dashes: u32,     // 40
-    pub dash_offset: u32,  // 44
+    pub cos_a: f32,       //  0
+    pub sin_a: f32,       //  4
+    pub x0: f32,          //  8
+    pub y0: f32,          // 12
+    pub dx: f32,          // 16
+    pub dy: f32,          // 20
+    pub perp_step: f32,   // 24
+    pub along_step: f32,  // 28
+    pub line_width: f32,  // 32
+    pub period: f32,      // 36
+    pub n_dashes: u32,    // 40
+    pub dash_offset: u32, // 44
 }
 
 const _: () = assert!(std::mem::size_of::<LineFamilyGpu>() == 48);
@@ -75,6 +97,7 @@ const _: () = assert!(std::mem::size_of::<LineFamilyGpu>() == 48);
 pub(super) struct HatchVertex {
     pub local_xy: [f32; 2],  // 0  — local-space position
     pub instance_index: u32, // 8  — index into InstanceBuffer
+    pub z: f32,              // 12 — height of the fill plane over this point
 }
 
 impl HatchVertex {
@@ -93,6 +116,11 @@ impl HatchVertex {
                     shader_location: 1,
                     format: wgpu::VertexFormat::Uint32,
                 },
+                wgpu::VertexAttribute {
+                    offset: 12,
+                    shader_location: 6,
+                    format: wgpu::VertexFormat::Float32,
+                },
             ],
         }
     }
@@ -105,6 +133,8 @@ pub(super) struct HatchPlacement {
     pub translation_low: [f32; 2],
     pub draw_depth: f32,
     pub visible: u32,
+    /// Height the copy is moved by, over its source's plane.
+    pub translation_z: f32,
 }
 
 impl HatchPlacement {
@@ -113,10 +143,31 @@ impl HatchPlacement {
             array_stride: std::mem::size_of::<Self>() as u64,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &[
-                wgpu::VertexAttribute { offset: 0, shader_location: 2, format: wgpu::VertexFormat::Float32x2 },
-                wgpu::VertexAttribute { offset: 8, shader_location: 3, format: wgpu::VertexFormat::Float32x2 },
-                wgpu::VertexAttribute { offset: 16, shader_location: 4, format: wgpu::VertexFormat::Float32 },
-                wgpu::VertexAttribute { offset: 20, shader_location: 5, format: wgpu::VertexFormat::Uint32 },
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 8,
+                    shader_location: 3,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 16,
+                    shader_location: 4,
+                    format: wgpu::VertexFormat::Float32,
+                },
+                wgpu::VertexAttribute {
+                    offset: 20,
+                    shader_location: 5,
+                    format: wgpu::VertexFormat::Uint32,
+                },
+                wgpu::VertexAttribute {
+                    offset: 24,
+                    shader_location: 7,
+                    format: wgpu::VertexFormat::Float32,
+                },
             ],
         }
     }
@@ -137,30 +188,37 @@ pub(super) struct StorageHatchBatch {
     // dropping them would invalidate it, but the bind group is the
     // only direct consumer. Keep them as fields to keep ownership in
     // one place; `#[allow(dead_code)]` silences the read-never warning.
-    #[allow(dead_code)] pub instance_buffer: wgpu::Buffer,
-    #[allow(dead_code)] pub family_buffer:   wgpu::Buffer,
-    #[allow(dead_code)] pub dash_buffer:     wgpu::Buffer,
+    #[allow(dead_code)]
+    pub instance_buffer: wgpu::Buffer,
+    #[allow(dead_code)]
+    pub family_buffer: wgpu::Buffer,
+    #[allow(dead_code)]
+    pub dash_buffer: wgpu::Buffer,
     /// Per-instance visibility flag (1=draw, 0=skip). Stored in its
     /// own small storage buffer so per-frame updates don't have to
     /// touch the large `instance_buffer`. Vertex shader reads
     /// `visibility[instance_index]` — when 0 it emits an out-of-NDC
     /// clip position so the GPU clips the primitive before the
     /// fragment stage runs.
-    #[allow(dead_code)] pub visibility_buffer: wgpu::Buffer,
+    #[allow(dead_code)]
+    pub visibility_buffer: wgpu::Buffer,
     pub bind_group: wgpu::BindGroup,
-    #[allow(dead_code)] pub instance_count: u32,
+    #[allow(dead_code)]
+    pub instance_count: u32,
     /// CPU mirror — `update_visibility` re-uploads this whole slice
     /// when any flag changes. ~4 B per hatch, so 40 KB / 10 k hatches
     /// per pan tick. Far cheaper than touching the instance data.
     pub placements: Vec<HatchPlacement>,
     pub source_visibility: Vec<u32>,
-    pub source_aabbs: Vec<[f32; 4]>,
+    pub source_aabbs: Vec<[f64; 4]>,
     pub unique_source_count: usize,
     /// CPU-side mirror of each instance's local-space AABB (world-
     /// offset-subtracted, world_origin already added back). Used by
     /// `compute_hatch_lod` to evaluate the sub-pixel + frustum cull
-    /// without reading back from the GPU.
-    pub instance_aabbs: Vec<[f32; 4]>,
+    /// without reading back from the GPU. Kept in f64: at large drawing
+    /// coordinates an f32 sum collapses a small fill's box to zero size, and
+    /// the cull then skips it as sub-pixel.
+    pub instance_aabbs: Vec<[f64; 4]>,
 }
 
 fn hatch_buffer_cost(hatch: &HatchModel) -> [u64; 7] {
@@ -168,7 +226,10 @@ fn hatch_buffer_cost(hatch: &HatchModel) -> [u64; 7] {
     let (families, dashes) = match &hatch.pattern {
         HatchPattern::Pattern(families) => (
             families.len() as u64,
-            families.iter().map(|family| family.dashes.len() as u64).sum(),
+            families
+                .iter()
+                .map(|family| family.dashes.len() as u64)
+                .sum(),
         ),
         _ => (0, 0),
     };
@@ -183,6 +244,28 @@ fn hatch_buffer_cost(hatch: &HatchModel) -> [u64; 7] {
     ]
 }
 
+/// A hatch fill as triangles: local vertices and indices into them.
+type FillMesh = std::sync::Arc<(Vec<[f32; 2]>, Vec<u32>)>;
+
+/// Triangulated fills kept between uploads. A fill depends only on its
+/// boundary, and a hatch that an edit did not touch keeps the very same
+/// boundary allocation, so the allocation's identity finds its triangles
+/// again. Each entry holds its boundary alive, which keeps that identity from
+/// ever naming a different one.
+#[derive(Default)]
+pub(super) struct FillMeshCache {
+    entries: rustc_hash::FxHashMap<usize, (std::sync::Arc<Vec<[f32; 2]>>, FillMesh)>,
+    touched: rustc_hash::FxHashSet<usize>,
+}
+
+impl FillMeshCache {
+    /// Drop what the upload just finished did not use.
+    pub(super) fn finish(&mut self) {
+        let touched = std::mem::take(&mut self.touched);
+        self.entries.retain(|key, _| touched.contains(key));
+    }
+}
+
 impl StorageHatchBatch {
     /// Builds whole-hatch chunks within the device's buffer limits.
     pub(super) fn build(
@@ -190,6 +273,7 @@ impl StorageHatchBatch {
         queue: &wgpu::Queue,
         bgl: &wgpu::BindGroupLayout,
         hatches: &[HatchModel],
+        cache: &mut FillMeshCache,
     ) -> Vec<Self> {
         if hatches.is_empty() {
             return Vec::new();
@@ -201,7 +285,7 @@ impl StorageHatchBatch {
         // just size checks — the `*_fits` predicates below are the checks).
         let chunk_limit = limits
             .max_buffer_size
-            .min(limits.max_storage_buffer_binding_size as u64)
+            .min(limits.max_storage_buffer_binding_size)
             .min(crate::scene::pipeline::gpu_budget::buffer_budget(device) as u64);
         let mut ranges = Vec::new();
         let mut start = 0;
@@ -224,7 +308,7 @@ impl StorageHatchBatch {
         ranges.push(start..hatches.len());
         ranges
             .into_iter()
-            .filter_map(|range| Self::build_chunk(device, queue, bgl, &hatches[range]))
+            .filter_map(|range| Self::build_chunk(device, queue, bgl, &hatches[range], cache))
             .collect()
     }
 
@@ -233,8 +317,8 @@ impl StorageHatchBatch {
         queue: &wgpu::Queue,
         bgl: &wgpu::BindGroupLayout,
         hatches: &[HatchModel],
+        cache: &mut FillMeshCache,
     ) -> Option<Self> {
-
         let mut instances: Vec<HatchInstance> = Vec::with_capacity(hatches.len());
         let mut families: Vec<LineFamilyGpu> = Vec::new();
         let mut dashes: Vec<f32> = Vec::new();
@@ -256,11 +340,44 @@ impl StorageHatchBatch {
         groups.sort_by_key(|group| std::cmp::Reverse(group.len() == 1));
         let unique_source_count = groups.iter().take_while(|group| group.len() == 1).count();
 
-        for group in &groups {
+        // Triangulating every unique source is the bulk of a rebuild and each
+        // fill is independent, so run them in parallel; the ordered collect
+        // keeps the meshes aligned with `groups`.
+        let chunk_started = crate::perf::enabled().then(std::time::Instant::now);
+        let keys: Vec<usize> = groups
+            .iter()
+            .map(|group| std::sync::Arc::as_ptr(&group[0].boundary) as usize)
+            .collect();
+        let missing: Vec<usize> = (0..groups.len())
+            .filter(|&index| !cache.entries.contains_key(&keys[index]))
+            .collect();
+        let computed: Vec<(usize, FillMesh)> = {
+            use crate::par::prelude::*;
+            missing
+                .par_iter()
+                .map(|&index| (index, std::sync::Arc::new(groups[index][0].fill_mesh())))
+                .collect()
+        };
+        let triangulated = computed.len();
+        for (index, mesh) in computed {
+            cache.entries.insert(
+                keys[index],
+                (std::sync::Arc::clone(&groups[index][0].boundary), mesh),
+            );
+        }
+        let fill_meshes: Vec<FillMesh> = keys
+            .iter()
+            .map(|key| {
+                cache.touched.insert(*key);
+                std::sync::Arc::clone(&cache.entries[key].1)
+            })
+            .collect();
+        let meshes_ms = chunk_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+        for (group_index, group) in groups.iter().enumerate() {
             let h = group[0];
-            let mesh = h.fill_mesh();
+            let mesh = &fill_meshes[group_index];
             let has_mesh = !mesh.0.is_empty() && !mesh.1.is_empty();
-            meshes.push(mesh);
+            meshes.push(std::sync::Arc::clone(mesh));
             let family_offset = families.len() as u32;
             let mut family_count = 0u32;
 
@@ -295,7 +412,7 @@ impl StorageHatchBatch {
                         for &d in &fam.dashes {
                             dashes.push(d);
                         }
-                        let n_dashes = (dashes.len() as u32 - dash_offset).min(u32::MAX);
+                        let n_dashes = dashes.len() as u32 - dash_offset;
                         // PAT local frame: perpendicular spacing and
                         // along-line phase.
                         let perp_step = fam.dy;
@@ -332,10 +449,18 @@ impl StorageHatchBatch {
             let mut max_y = f32::NEG_INFINITY;
             for &[x, y] in h.boundary.iter() {
                 if x.is_finite() && y.is_finite() {
-                    if x < min_x { min_x = x; }
-                    if y < min_y { min_y = y; }
-                    if x > max_x { max_x = x; }
-                    if y > max_y { max_y = y; }
+                    if x < min_x {
+                        min_x = x;
+                    }
+                    if y < min_y {
+                        min_y = y;
+                    }
+                    if x > max_x {
+                        max_x = x;
+                    }
+                    if y > max_y {
+                        max_y = y;
+                    }
                 }
             }
             if !min_x.is_finite() {
@@ -393,21 +518,25 @@ impl StorageHatchBatch {
             dashes.push(0.0);
         }
 
+        let on_ground: Vec<bool> = groups.iter().map(|group| group[0].lies_on_ground()).collect();
         let mut verts = Vec::new();
         let mut indices = Vec::new();
         let mut mesh_ranges = Vec::with_capacity(meshes.len());
-        for (instance_index, (points, mesh_indices)) in meshes.into_iter().enumerate() {
+        for (instance_index, mesh) in meshes.iter().enumerate() {
+            let (points, mesh_indices) = &**mesh;
+            let height = groups[instance_index][0].plane_height();
             let Ok(base) = u32::try_from(verts.len()) else {
                 return None;
             };
             let Ok(start) = u32::try_from(indices.len()) else {
                 return None;
             };
-            verts.extend(points.into_iter().map(|local_xy| HatchVertex {
+            verts.extend(points.iter().map(|&local_xy| HatchVertex {
                 local_xy,
                 instance_index: instance_index as u32,
+                z: height(local_xy),
             }));
-            for index in mesh_indices {
+            for &index in mesh_indices {
                 let Some(index) = base.checked_add(index) else {
                     return None;
                 };
@@ -430,17 +559,24 @@ impl StorageHatchBatch {
                 translation_low: [0.0; 2],
                 draw_depth: 0.0,
                 visible: 1,
+                translation_z: 0.0,
             });
             let end = mesh_ranges[unique_source_count - 1].end;
             if end > 0 {
                 draws.push((0..end, 0..1));
             }
-            let mut union = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+            let mut union = [
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ];
             for inst in instances.iter().take(unique_source_count) {
-                union[0] = union[0].min(inst.aabb[0] + inst.world_origin[0]);
-                union[1] = union[1].min(inst.aabb[1] + inst.world_origin[1]);
-                union[2] = union[2].max(inst.aabb[2] + inst.world_origin[0]);
-                union[3] = union[3].max(inst.aabb[3] + inst.world_origin[1]);
+                let aabb = world_aabb(inst, [0.0; 2]);
+                union[0] = union[0].min(aabb[0]);
+                union[1] = union[1].min(aabb[1]);
+                union[2] = union[2].max(aabb[2]);
+                union[3] = union[3].max(aabb[3]);
             }
             instance_aabbs.push(union);
         }
@@ -455,6 +591,7 @@ impl StorageHatchBatch {
                     .render_instance
                     .map_or([0.0; 3], |instance| instance.translation);
                 let delta = [translation[0] - base[0], translation[1] - base[1]];
+                let delta_z = translation[2] - base[2];
                 let high = [delta[0] as f32, delta[1] as f32];
                 placements.push(HatchPlacement {
                     translation: high,
@@ -464,14 +601,13 @@ impl StorageHatchBatch {
                     ],
                     draw_depth: hatch.draw_depth,
                     visible: 1,
+                    translation_z: delta_z as f32,
                 });
-                let inst = &instances[source_index];
-                instance_aabbs.push([
-                    inst.aabb[0] + inst.world_origin[0] + high[0],
-                    inst.aabb[1] + inst.world_origin[1] + high[1],
-                    inst.aabb[2] + inst.world_origin[0] + high[0],
-                    inst.aabb[3] + inst.world_origin[1] + high[1],
-                ]);
+                instance_aabbs.push(if on_ground[source_index] && delta_z == 0.0 {
+                    world_aabb(&instances[source_index], delta)
+                } else {
+                    OFF_GROUND_AABB
+                });
             }
             if !mesh_ranges[source_index].is_empty() {
                 draws.push((
@@ -487,8 +623,7 @@ impl StorageHatchBatch {
             (count as u64).saturating_mul(stride as u64) <= limits.max_buffer_size
         };
         let storage_fits = |count: usize, stride: usize| {
-            (count as u64).saturating_mul(stride as u64)
-                <= limits.max_storage_buffer_binding_size as u64
+            (count as u64).saturating_mul(stride as u64) <= limits.max_storage_buffer_binding_size
         };
         if !buffer_fits(verts.len(), std::mem::size_of::<HatchVertex>())
             || !buffer_fits(indices.len(), std::mem::size_of::<u32>())
@@ -501,6 +636,7 @@ impl StorageHatchBatch {
             return None;
         }
 
+        let packed_ms = chunk_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
         let vertex_buffer = crate::scene::pipeline::gpu_upload::upload_buffer(
             device,
             queue,
@@ -576,14 +712,27 @@ impl StorageHatchBatch {
         });
         let source_aabbs = instances
             .iter()
-            .map(|inst| [
-                inst.aabb[0] + inst.world_origin[0],
-                inst.aabb[1] + inst.world_origin[1],
-                inst.aabb[2] + inst.world_origin[0],
-                inst.aabb[3] + inst.world_origin[1],
-            ])
+            .zip(&on_ground)
+            .map(|(inst, &on_ground)| {
+                if on_ground {
+                    world_aabb(inst, [0.0; 2])
+                } else {
+                    OFF_GROUND_AABB
+                }
+            })
             .collect();
 
+        if let Some(started) = chunk_started {
+            crate::perf_record!(
+                "[perf] hatch-chunk meshes={:.1}ms packed={:.1}ms total={:.1}ms hatches={} sources={} triangulated={}",
+                meshes_ms.unwrap_or(0.0),
+                packed_ms.unwrap_or(0.0),
+                started.elapsed().as_secs_f64() * 1000.0,
+                hatches.len(),
+                groups.len(),
+                triangulated,
+            );
+        }
         Some(Self {
             vertex_buffer,
             index_buffer,
@@ -663,4 +812,50 @@ impl LineFamilyGpu {
 #[allow(dead_code)]
 fn _assert_patfamily_fields(f: &PatFamily) -> (f32, f32, f32) {
     (f.angle_deg, f.x0, f.y0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fill a few units across, far from the origin. Its cull box must keep
+    /// its real size and place: an f32 sum of anchor and local box rounds it
+    /// to the f32 step there (32 in X, 512 in Y), so the box collapses to zero
+    /// size and the sub-pixel cull hides the fill at every zoom.
+    #[test]
+    fn small_fill_far_from_origin_keeps_its_cull_box() {
+        let origin = [334_050_775.121_066, 6_218_261_561.703_455];
+        let (high, low) = split_origin_ds(origin);
+        let mut instance: HatchInstance = bytemuck::Zeroable::zeroed();
+        instance.world_origin = high;
+        instance.world_origin_low = low;
+        instance.aabb = [-5.596, -2.926, 5.596, 2.926];
+
+        for offset in [[0.0, 0.0], [1_000.25, -2_000.5]] {
+            let aabb = world_aabb(&instance, offset);
+            let expected = [
+                origin[0] + offset[0] - 5.596,
+                origin[1] + offset[1] - 2.926,
+                origin[0] + offset[0] + 5.596,
+                origin[1] + offset[1] + 2.926,
+            ];
+            for (actual, expected) in aabb.iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() < 1e-3,
+                    "offset {offset:?}: {aabb:?} != {expected:?}"
+                );
+            }
+
+            // 60 units across 512 px, centred on the fill: it covers about
+            // 95 x 50 px, so the cull must draw it.
+            let view_rot = glam::Mat4::from_scale(glam::Vec3::new(2.0 / 60.0, 2.0 / 60.0, 1e-6));
+            let eye = glam::DVec3::new(origin[0] + offset[0], origin[1] + offset[1], 0.0);
+            assert!(!crate::scene::pipeline::aabb_below_pixel(
+                aabb, view_rot, eye, 512, 512, 2.0
+            ));
+            assert!(!crate::scene::pipeline::aabb_offscreen(
+                aabb, view_rot, eye, 512, 512
+            ));
+        }
+    }
 }

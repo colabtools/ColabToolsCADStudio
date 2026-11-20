@@ -1,14 +1,13 @@
 // ZOOM WINDOW command — pick two corners to define the zoom area.
 
-use glam::{DVec3, Vec3};
 use crate::t;
+use glam::{DVec3, Vec3};
 
 use crate::command::{CadCommand, CmdOption, CmdResult};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
 use crate::scene::model::wire_model::WireModel;
 
-pub const ICON: IconKind =
-    IconKind::Svg(include_bytes!("../../../assets/icons/zoom_window.svg"));
+pub const ICON: IconKind = IconKind::Svg(include_bytes!("../../../assets/icons/zoom_window.svg"));
 
 /// Ribbon button: zoom into a rectangle picked by two corners.
 pub fn tool() -> ToolDef {
@@ -23,6 +22,15 @@ pub fn tool() -> ToolDef {
 pub struct ZoomWindowCommand {
     first: Option<Vec3>,
     scale_prompt: bool,
+    /// Center option: `Some(None)` asks for the center point,
+    /// `Some(Some(c))` for the magnification or height.
+    center: Option<Option<DVec3>>,
+}
+
+impl Default for ZoomWindowCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ZoomWindowCommand {
@@ -30,6 +38,7 @@ impl ZoomWindowCommand {
         Self {
             first: None,
             scale_prompt: false,
+            center: None,
         }
     }
 }
@@ -40,7 +49,12 @@ impl CadCommand for ZoomWindowCommand {
     }
 
     fn prompt(&self) -> String {
-        if self.scale_prompt {
+        if let Some(center) = self.center {
+            match center {
+                None => t!("ZOOM CENTER  Specify center point:").into_owned(),
+                Some(_) => t!("ZOOM CENTER  Enter magnification or height:").into_owned(),
+            }
+        } else if self.scale_prompt {
             t!("ZOOM  scale factor (e.g. 2 or 0.5):").into_owned()
         } else if self.first.is_none() {
             t!("ZOOM WINDOW  Specify first corner:").into_owned()
@@ -50,11 +64,12 @@ impl CadCommand for ZoomWindowCommand {
     }
 
     fn options(&self) -> Vec<CmdOption> {
-        if self.first.is_some() || self.scale_prompt {
+        if self.first.is_some() || self.scale_prompt || self.center.is_some() {
             return Vec::new();
         }
         vec![
             CmdOption::new("Window", "W"),
+            CmdOption::new("Center", "C"),
             CmdOption::new("Extents", "E"),
             CmdOption::new("Previous", "P"),
             CmdOption::new("Object", "O"),
@@ -76,12 +91,23 @@ impl CadCommand for ZoomWindowCommand {
         if text.is_empty() {
             return None;
         }
+        if let Some(Some(c)) = self.center {
+            return Some(CmdResult::Dispatch(format!(
+                "ZOOM CENTER {} {} {} {text}",
+                c.x, c.y, c.z
+            )));
+        }
         if self.scale_prompt {
             return Some(CmdResult::Dispatch(format!("ZOOM SCALE {text}")));
         }
         let command = match text.to_uppercase().as_str() {
             "W" | "WINDOW" => {
                 self.first = None;
+                return Some(CmdResult::NeedPoint);
+            }
+            "C" | "CENTER" => {
+                self.first = None;
+                self.center = Some(None);
                 return Some(CmdResult::NeedPoint);
             }
             "E" | "EXTENTS" => "ZOOM EXTENTS",
@@ -97,18 +123,33 @@ impl CadCommand for ZoomWindowCommand {
                 self.scale_prompt = true;
                 return Some(CmdResult::NeedPoint);
             }
+            // A scale factor straight at the first prompt: n, nX or nXP.
+            upper
+                if upper.ends_with('X')
+                    || upper.ends_with("XP")
+                    || crate::entities::expr_eval::eval_number(upper).is_some() =>
+            {
+                return Some(CmdResult::Dispatch(format!("ZOOM SCALE {text}")));
+            }
             _ => return None,
         };
         Some(CmdResult::Dispatch(command.to_string()))
     }
 
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
-        if self.scale_prompt {
+        if self.center == Some(None) {
+            self.center = Some(Some(pt));
+            return CmdResult::NeedPoint;
+        }
+        if self.scale_prompt || self.center.is_some() {
             return CmdResult::NeedPoint;
         }
         let pt = pt.as_vec3();
         if let Some(p1) = self.first {
-            CmdResult::ZoomToWindow { p1: p1.as_dvec3(), p2: pt.as_dvec3() }
+            CmdResult::ZoomToWindow {
+                p1: p1.as_dvec3(),
+                p2: pt.as_dvec3(),
+            }
         } else {
             self.first = Some(pt);
             CmdResult::NeedPoint
@@ -116,7 +157,13 @@ impl CadCommand for ZoomWindowCommand {
     }
 
     fn on_enter(&mut self) -> CmdResult {
-        CmdResult::Cancel
+        // Enter at the magnification prompt keeps the current height.
+        match self.center {
+            Some(Some(c)) => {
+                CmdResult::Dispatch(format!("ZOOM CENTER {} {} {} 1X", c.x, c.y, c.z))
+            }
+            _ => CmdResult::Cancel,
+        }
     }
 
     fn on_escape(&mut self) -> CmdResult {
@@ -130,7 +177,14 @@ impl CadCommand for ZoomWindowCommand {
         true
     }
 
-    fn on_mouse_move(&mut self, pt: DVec3) -> Option<WireModel> { let pt = pt.as_vec3();
+    fn wants_raw_point(&self) -> bool {
+        // A display command: the window corners are where the cursor is, not
+        // the nearest object snap, which would pull the window onto geometry.
+        true
+    }
+
+    fn on_mouse_move(&mut self, pt: DVec3) -> Option<WireModel> {
+        let pt = pt.as_vec3();
         let p1 = self.first?;
         let min = p1.min(pt);
         let max = p1.max(pt);
@@ -138,8 +192,6 @@ impl CadCommand for ZoomWindowCommand {
         Some(WireModel {
             bg_adapt: None,
             point_marker: None,
-            taper_widths: Vec::new(),
-            pattern_stations: Vec::new(),
             world_width: 0.0,
             depth_override: None,
             display_visible: true,
@@ -147,34 +199,40 @@ impl CadCommand for ZoomWindowCommand {
             plot_visible: true,
             fill_is_3d: false,
             fill_is_2d_solid: false,
+            solid_normal: None,
             render_instance: None,
-            pick_tris: Vec::new(),
-            pick_tris_low: Vec::new(),
             dash_from_start: false,
-            dash_align_end: None,
-            text_verts: Vec::new(),
             name: "zoom_window_preview".into(),
-            points: vec![
-                [min.x, min.y, 0.0],
-                [max.x, min.y, 0.0],
-                [max.x, max.y, 0.0],
-                [min.x, max.y, 0.0],
-                [min.x, min.y, 0.0],
-            ],
-            points_low: Vec::new(),
             color: WireModel::CYAN,
             selected: false,
             pattern_length: 0.0,
             pattern: [0.0; 8],
             line_weight_px: 1.0,
-            snap_pts: vec![],
-            tangent_geoms: vec![],
             aci: 0,
-            key_vertices: vec![],
             aabb: WireModel::UNBOUNDED_AABB,
             plinegen: true,
-            fill_tris: vec![],
-            fill_tris_low: Vec::new(),
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                taper_widths: Vec::new(),
+                pattern_stations: Vec::new(),
+                pick_tris: Vec::new(),
+                pick_tris_low: Vec::new(),
+                text_verts: Vec::new(),
+                points: vec![
+                    [min.x, min.y, 0.0],
+                    [max.x, min.y, 0.0],
+                    [max.x, max.y, 0.0],
+                    [min.x, max.y, 0.0],
+                    [min.x, min.y, 0.0],
+                ],
+                points_low: Vec::new(),
+                snap_pts: vec![],
+                tangent_geoms: vec![],
+                key_vertices: vec![],
+                fill_tris: vec![],
+                fill_tris_low: Vec::new(),
+                ..crate::scene::WireGeom::default()
+            }),
+            ..Default::default()
         })
     }
 }

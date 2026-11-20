@@ -25,6 +25,7 @@ impl DraftingSettingsState {
             grid_major_input: format!("{}", app.grid_major_every),
             grid_adaptive: app.grid_adaptive,
             grid_beyond_limits: app.grid_beyond_limits,
+            grid_axes: app.grid_axes,
             isometric: app.isometric_drafting,
             iso_plane: app.iso_plane,
             snap_angle_deg: app.snap_angle_deg,
@@ -32,18 +33,49 @@ impl DraftingSettingsState {
             ortho_on: app.ortho_mode,
             polar_increment_deg: app.polar_increment_deg,
             osnap_on: app.snapper.snap_enabled,
+            osnap_aperture_input: format!("{}", app.snapper.osnap_radius_px),
             otrack_on: app.snapper.otrack_enabled,
             snap_modes: app.snapper.enabled.clone(),
             osnap3d_on: app.snapper.snap3d_enabled,
             snap3d_modes: app.snapper.enabled3d.clone(),
             dyn_input_on: app.dyn_input,
+            dyn_prefs: crate::ui::window::drafting_settings::DynInputPrefs {
+                pointer: app.dyn_pointer_input(),
+                dimension: app.dyn_dimension_input(),
+                cartesian: app.dyn_pointer_cartesian,
+                absolute: app.dyn_pointer_absolute,
+                on_type: app.dyn_pointer_on_type,
+            },
             quick_props_on: app.quick_properties,
-            selection_cycling_on: app.selection_cycling,
+            quick_props_float: app.quick_properties_float,
+            selection_cycling_on: app.selection_cycling > 0,
         }
     }
 }
 
 impl OpenCADStudio {
+    /// Turn Dynamic Input on or off with DYNMODE in step: off keeps the mode
+    /// negative (temporarily off), on restores it, or 3 when there was none.
+    pub(in crate::app) fn set_dyn_input(&mut self, on: bool) {
+        self.dyn_input = on;
+        let mode = self.dyn_mode.abs();
+        self.dyn_mode = match (on, mode) {
+            (true, 0) => 3,
+            (true, mode) => mode,
+            (false, mode) => -mode,
+        };
+    }
+
+    /// DYNMODE bit 1: pointer input, regardless of F12.
+    pub(in crate::app) fn dyn_pointer_input(&self) -> bool {
+        self.dyn_mode.abs() & 1 != 0
+    }
+
+    /// DYNMODE bit 2: dimension input, regardless of F12.
+    pub(in crate::app) fn dyn_dimension_input(&self) -> bool {
+        self.dyn_mode.abs() & 2 != 0
+    }
+
     pub(super) fn drafting_settings_dirty(&self) -> bool {
         match (&self.drafting_settings_state, &self.drafting_settings_saved) {
             (Some(curr), Some(saved)) => curr.is_dirty(saved),
@@ -86,6 +118,7 @@ impl OpenCADStudio {
         self.grid_major_every = gm;
         self.grid_adaptive = state.grid_adaptive;
         self.grid_beyond_limits = state.grid_beyond_limits;
+        self.grid_axes = state.grid_axes;
         self.snapper.grid_snap_on = state.snap_on;
         self.snapper.snap_spacing_x = sx;
         self.snapper.snap_spacing_y = sy;
@@ -95,14 +128,49 @@ impl OpenCADStudio {
         self.polar_mode = state.polar_on;
         self.ortho_mode = state.ortho_on;
         self.polar_increment_deg = state.polar_increment_deg;
+        let aperture = state
+            .osnap_aperture_input
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| {
+                (crate::snap::MIN_OSNAP_RADIUS_PX..=crate::snap::MAX_OSNAP_RADIUS_PX).contains(v)
+            });
+        let Some(aperture) = aperture else {
+            self.command_line
+                .push_error("OSNAP capture radius must be between 4 and 40 pixels.");
+            return false;
+        };
+        self.snapper.osnap_radius_px = aperture;
         self.snapper.snap_enabled = state.osnap_on;
         self.snapper.otrack_enabled = state.otrack_on;
         self.snapper.enabled = state.snap_modes.clone();
         self.snapper.snap3d_enabled = state.osnap3d_on;
         self.snapper.enabled3d = state.snap3d_modes.clone();
-        self.dyn_input = state.dyn_input_on;
+        let prefs = state.dyn_prefs;
+        let mode = i16::from(prefs.pointer) | i16::from(prefs.dimension) << 1;
+        self.dyn_mode = mode;
+        self.dyn_pointer_cartesian = prefs.cartesian;
+        self.dyn_pointer_absolute = prefs.absolute;
+        self.dyn_pointer_on_type = prefs.on_type;
+        // Both inputs off is DYNMODE 0: Dynamic Input is off.
+        self.set_dyn_input(state.dyn_input_on && mode != 0);
+        // A quick-properties list belongs to that panel; switching the panel
+        // off here takes the list with it, so switching it back on cannot
+        // revive it. Lists are per-tab and a tab switch closes them, so only
+        // the active tab can hold one. A docked-panel list stays open.
+        if self.quick_properties && !state.quick_props_on {
+            let panel = &mut self.tabs[self.active_tab].properties;
+            if panel.open_block_picker.is_some_and(|(_, quick)| quick) {
+                panel.open_block_picker = None;
+            }
+            if panel.open_choice.is_some_and(|(_, quick)| quick) {
+                panel.open_choice = None;
+            }
+        }
         self.quick_properties = state.quick_props_on;
-        self.selection_cycling = state.selection_cycling_on;
+        self.quick_properties_float = state.quick_props_float;
+        self.toggle_selection_cycling(state.selection_cycling_on);
         self.sync_vport_display(self.active_tab);
         true
     }
@@ -126,6 +194,7 @@ mod tests {
             grid_major_input: "5".to_string(),
             grid_adaptive: true,
             grid_beyond_limits: true,
+            grid_axes: true,
             isometric: false,
             iso_plane: crate::app::settings::IsoPlane::Left,
             snap_angle_deg: 0.0,
@@ -133,12 +202,21 @@ mod tests {
             ortho_on: false,
             polar_increment_deg: 15.0,
             osnap_on: true,
+            osnap_aperture_input: "15".to_string(),
             otrack_on: false,
             snap_modes: rustc_hash::FxHashSet::default(),
             osnap3d_on: false,
             snap3d_modes: rustc_hash::FxHashSet::default(),
             dyn_input_on: false,
+            dyn_prefs: crate::ui::window::drafting_settings::DynInputPrefs {
+                pointer: true,
+                dimension: true,
+                cartesian: false,
+                absolute: false,
+                on_type: false,
+            },
             quick_props_on: false,
+            quick_props_float: false,
             selection_cycling_on: false,
         };
         let mut state2 = state1.clone();
@@ -167,6 +245,7 @@ mod tests {
             grid_major_input: "5".to_string(),
             grid_adaptive: true,
             grid_beyond_limits: true,
+            grid_axes: true,
             isometric: false,
             iso_plane: crate::app::settings::IsoPlane::Left,
             snap_angle_deg: 0.0,
@@ -174,12 +253,21 @@ mod tests {
             ortho_on: false,
             polar_increment_deg: 15.0,
             osnap_on: true,
+            osnap_aperture_input: "15".to_string(),
             otrack_on: false,
             snap_modes: rustc_hash::FxHashSet::default(),
             osnap3d_on: false,
             snap3d_modes: rustc_hash::FxHashSet::default(),
             dyn_input_on: false,
+            dyn_prefs: crate::ui::window::drafting_settings::DynInputPrefs {
+                pointer: true,
+                dimension: true,
+                cartesian: false,
+                absolute: false,
+                on_type: false,
+            },
             quick_props_on: false,
+            quick_props_float: false,
             selection_cycling_on: false,
         };
 

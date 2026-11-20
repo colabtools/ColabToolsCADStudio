@@ -17,25 +17,23 @@ fn normalize_core(raw: &str, fold_case: bool) -> String {
 
     // 2. Prefix split: drive (`C:`), UNC (`//`), or none.
     let bytes = slashed.as_bytes();
-    let (prefix, mut rest, unc) = if bytes.len() >= 2
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-    {
-        let drive = &slashed[..2];
-        (
-            if fold_case {
-                drive.to_ascii_lowercase()
-            } else {
-                drive.to_string()
-            },
-            slashed[2..].to_string(),
-            false,
-        )
-    } else if let Some(stripped) = slashed.strip_prefix("//") {
-        ("//".to_string(), stripped.to_string(), true)
-    } else {
-        (String::new(), slashed, false)
-    };
+    let (prefix, mut rest, unc) =
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            let drive = &slashed[..2];
+            (
+                if fold_case {
+                    drive.to_ascii_lowercase()
+                } else {
+                    drive.to_string()
+                },
+                slashed[2..].to_string(),
+                false,
+            )
+        } else if let Some(stripped) = slashed.strip_prefix("//") {
+            ("//".to_string(), stripped.to_string(), true)
+        } else {
+            (String::new(), slashed, false)
+        };
     if unc {
         // Collapse `///share` → `//share` so the rejoin can't triple-slash.
         rest = rest.trim_start_matches('/').to_string();
@@ -147,9 +145,15 @@ fn comps_after_root(path_norm: &str) -> Vec<&str> {
     let is_drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
     let is_unc = path_norm.starts_with("//");
     if is_drive {
-        path_norm[2..].split('/').filter(|s| !s.is_empty()).collect()
+        path_norm[2..]
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect()
     } else if is_unc {
-        let all: Vec<&str> = path_norm[2..].split('/').filter(|s| !s.is_empty()).collect();
+        let all: Vec<&str> = path_norm[2..]
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
         if all.len() >= 2 {
             all[2..].to_vec()
         } else {
@@ -173,6 +177,18 @@ fn file_name_only(path: &str) -> String {
     base.to_string()
 }
 
+/// The path type a stored reference path already has: a rooted path is
+/// `Full`, a bare file name `None`, anything else `Relative`.
+pub fn pathtype_of(path: &str) -> Pathtype {
+    if !is_relative_path(&normalize_display(path)) {
+        Pathtype::Full
+    } else if path.contains(['/', '\\']) {
+        Pathtype::Relative
+    } else {
+        Pathtype::None
+    }
+}
+
 /// Fallible pathtype conversion. `Full` and `None` always succeed;
 /// `Relative` fails with [`PathtypeError::AcrossDrives`] when drive letters
 /// or UNC hosts differ (UNC vs drive-letter counts as different), and with
@@ -191,7 +207,10 @@ pub fn to_pathtype_result(
             if is_relative_path(&normalize_lexical(path)) && !normalize_lexical(path).is_empty() {
                 if let Some(dir) = host.parent() {
                     if !dir.as_os_str().is_empty() {
-                        let joined = dir.join(normalize_display(path)).to_string_lossy().into_owned();
+                        let joined = dir
+                            .join(normalize_display(path))
+                            .to_string_lossy()
+                            .into_owned();
                         return Ok(normalize_display(&joined));
                     }
                 }
@@ -270,6 +289,16 @@ pub fn to_pathtype(path: &str, host: &std::path::Path, pathtype: Pathtype) -> St
 /// Case-insensitive name match: `*` matches any run (including empty),
 /// `?` matches exactly one char.
 pub fn wildcard_match(name: &str, pattern: &str) -> bool {
+    wildcard_match_inner(name, pattern, false)
+}
+
+/// [`wildcard_match`] where `#` also matches one digit (or a literal `#`), as
+/// the selection filters read it.
+pub fn wildcard_match_with_digits(name: &str, pattern: &str) -> bool {
+    wildcard_match_inner(name, pattern, true)
+}
+
+fn wildcard_match_inner(name: &str, pattern: &str, digits: bool) -> bool {
     let n: Vec<char> = name.chars().flat_map(|c| c.to_lowercase()).collect();
     let p: Vec<char> = pattern.chars().flat_map(|c| c.to_lowercase()).collect();
     let mut si = 0usize;
@@ -277,12 +306,17 @@ pub fn wildcard_match(name: &str, pattern: &str) -> bool {
     let mut star: Option<usize> = None;
     let mut match_idx = 0usize;
     while si < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[si]) {
-            si += 1;
-            pi += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        // `*` first: a name may hold a literal `*` (anonymous blocks).
+        if pi < p.len() && p[pi] == '*' {
             star = Some(pi);
             match_idx = si;
+            pi += 1;
+        } else if pi < p.len()
+            && (p[pi] == '?'
+                || p[pi] == n[si]
+                || (digits && p[pi] == '#' && n[si].is_ascii_digit()))
+        {
+            si += 1;
             pi += 1;
         } else if let Some(s) = star {
             pi = s + 1;
@@ -305,6 +339,8 @@ pub enum RefKind {
     Image,
     /// A PDF, DWF or DGN underlay.
     Underlay,
+    /// A point cloud scan (.rcs) or project (.rcp).
+    PointCloud,
 }
 
 /// Lifecycle state of a [`ReferenceEntry`].
@@ -466,7 +502,10 @@ pub fn decide_status(
     }
     if resolved == RefStatus::Loaded {
         if let (Some(l), Some(c)) = (live, cached) {
-            let delta = l.duration_since(c).ok().or_else(|| c.duration_since(l).ok());
+            let delta = l
+                .duration_since(c)
+                .ok()
+                .or_else(|| c.duration_since(l).ok());
             if delta.is_some_and(|d| d > std::time::Duration::from_secs(1)) {
                 return RefStatus::Stale;
             }
@@ -501,6 +540,27 @@ pub enum UnloadKey {
 pub struct UnloadSet(pub std::collections::HashSet<UnloadKey>);
 
 impl UnloadSet {
+    /// The direct references `doc` stores as unloaded.
+    pub fn from_document(doc: &document::Document) -> Self {
+        let mut set = Self::default();
+        for br in doc.block_records.iter() {
+            if (br.flags.is_xref || br.flags.is_xref_overlay) && br.flags.is_xref_unloaded {
+                set.add(br.handle.value());
+            }
+        }
+        set
+    }
+
+    /// Store this session's load state on `doc`'s xref records, so a save
+    /// keeps which references are unloaded.
+    pub fn write_flags(&self, doc: &mut document::Document) {
+        for br in doc.block_records.iter_mut() {
+            if br.flags.is_xref || br.flags.is_xref_overlay {
+                br.flags.is_xref_unloaded = self.is_unloaded(br.handle.value());
+            }
+        }
+    }
+
     pub fn add(&mut self, key: u64) {
         self.0.insert(UnloadKey::Direct(key));
     }
@@ -559,9 +619,13 @@ impl RefStatCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_display, normalize_lexical, to_pathtype, to_pathtype_result, wildcard_match, Pathtype, PathtypeError};
+    use super::wildcard_match_with_digits;
     use super::{bind_symbol, bind_symbol_taken, RefKind, ReferenceEntry};
     use super::{child_key, decide_status, RefStatCache, RefStatus, UnloadSet};
+    use super::{
+        normalize_display, normalize_lexical, to_pathtype, to_pathtype_result, wildcard_match,
+        Pathtype, PathtypeError,
+    };
 
     #[test]
     fn child_key_differs_from_colliding_host_key() {
@@ -751,9 +815,9 @@ mod tests {
     // every SPIKE1 cell survived the round trip.
     #[cfg(not(target_arch = "wasm32"))]
     fn roundtrip_probe(ext: &str) {
-        use codec::objects::{ImageDefinition, ObjectType, UnderlayDefinition};
-        use codec::tables::BlockRecord;
-        use codec::CadDocument;
+        use document::objects::{ImageDefinition, ObjectType, UnderlayDefinition};
+        use document::tables::BlockRecord;
+        use document::Document;
 
         let dir = std::env::temp_dir().join(format!(
             "ocs_xref_probe_{}_{}",
@@ -765,7 +829,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("probe dir");
 
-        let mut doc = CadDocument::new();
+        let mut doc = Document::new();
 
         // Cell 1: xref block record — is_xref flag + absolute path.
         let xref_abs = dir.join("PROBE_REF.dwg").to_string_lossy().into_owned();
@@ -776,8 +840,7 @@ mod tests {
 
         // Cell 2: raster image definition with an absolute file path.
         let img_handle = doc.allocate_handle();
-        let mut img_def =
-            ImageDefinition::with_dimensions(r"C:\Probe\IMG.png", 64u32, 64u32);
+        let mut img_def = ImageDefinition::with_dimensions(r"C:\Probe\IMG.png", 64u32, 64u32);
         img_def.handle = img_handle;
         img_def.is_loaded = true;
         doc.objects
@@ -793,8 +856,7 @@ mod tests {
         // Cell 4: the retain flag itself ($VISRETAIN).
         doc.header.retain_xref_visibility = true;
 
-        let bytes = crate::io::save_to_bytes(&doc, ext, doc.version)
-            .expect("probe save");
+        let bytes = crate::io::save_to_bytes(&doc, ext, doc.version).expect("probe save");
         std::fs::write(dir.join(format!("probe.{ext}")), &bytes).expect("probe write");
 
         let back = crate::io::load_bytes(&format!("probe.{ext}"), bytes).expect("probe reload");
@@ -865,6 +927,10 @@ mod tests {
     #[test]
     fn wildcard_name_match_case_insensitive() {
         assert!(wildcard_match("PLAN-East", "plan-*"));
+        // `#` is a digit only for the selection filters; names keep it literal.
+        assert!(wildcard_match("A#", "A#") && !wildcard_match("A1", "A#"));
+        assert!(wildcard_match_with_digits("A1", "A#") && wildcard_match_with_digits("A#", "A#"));
+        assert!(!wildcard_match_with_digits("AB", "A#"));
         assert!(wildcard_match("A1", "a?"));
         assert!(!wildcard_match("A12", "a?"));
     }
@@ -878,7 +944,13 @@ mod tests {
     }
     #[test]
     fn bind_chain_naming_transitive() {
-        assert_eq!(bind_symbol("PLAN", "DETAIL", "WALLS"), "PLAN$0$DETAIL$0$WALLS");
-        assert_eq!(bind_symbol_taken("PLAN", "WALLS", &["PLAN$0$WALLS"]), "PLAN$1$WALLS");
+        assert_eq!(
+            bind_symbol("PLAN", "DETAIL", "WALLS"),
+            "PLAN$0$DETAIL$0$WALLS"
+        );
+        assert_eq!(
+            bind_symbol_taken("PLAN", "WALLS", &["PLAN$0$WALLS"]),
+            "PLAN$1$WALLS"
+        );
     }
 }

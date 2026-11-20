@@ -5,10 +5,6 @@ use serde_json::{json, Value};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
     time::Duration,
 };
 
@@ -53,16 +49,17 @@ fn listen(sender: mpsc::Sender<Envelope>) -> std::io::Result<()> {
     let mut file = options.open(&path)?;
     write!(file, "{descriptor}")?;
     drop(file);
-    let clients = Arc::new(AtomicUsize::new(0));
+    let _ = crate::mcp::sync_agent_tool_schemas();
+    let workers = crate::io::connection_workers::ConnectionWorkers::new("ocs-control", 8)?;
     for stream in listener.incoming().flatten() {
-        if clients.fetch_add(1, Ordering::SeqCst) >= 8 {
-            clients.fetch_sub(1, Ordering::SeqCst);
-            continue;
-        }
-        let clients = clients.clone();
+        // Replies are one-shot request/response lines: Nagle would hold each
+        // reply's tail segment for the peer's delayed ACK (the bridge sends
+        // nothing back until the full reply arrives). Disable coalescing on
+        // both ends of the exchange.
+        let _ = stream.set_nodelay(true);
         let mut sender = sender.clone();
         let token = token.clone();
-        std::thread::spawn(move || {
+        workers.try_execute(move || {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
             let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
             if let Ok(write_half) = stream.try_clone() {
@@ -91,12 +88,19 @@ fn listen(sender: mpsc::Sender<Envelope>) -> std::io::Result<()> {
                             } else {
                                 json!({"ok":false,"code":"busy","error":"GUI queue full"})
                             };
-                            let _ = writeln!(writer, "{result}");
+                            // write_fmt streams a Value Display token by
+                            // token: one unbuffered TCP syscall per JSON
+                            // token (tens of thousands for a records reply,
+                            // ~20 us each on loopback = the dominant ocs_read
+                            // cost). Serialize once, write once; the bytes
+                            // are identical (Value's Display == to_string).
+                            let mut reply_line = result.to_string();
+                            reply_line.push('\n');
+                            let _ = writer.write_all(reply_line.as_bytes());
                         }
                     }
                 }
             }
-            clients.fetch_sub(1, Ordering::SeqCst);
         });
     }
     let _ = std::fs::remove_file(path);

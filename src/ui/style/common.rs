@@ -1,8 +1,9 @@
 //! Style helpers shared across the style windows.
 //!
 //! Centralizes `muted_style` (and its alias `muted_text_style`) which were
-//! previously duplicated in 7 style files with byte-identical bodies (alpha
-//! 0.68). A single source ensures a theme change updates one place.
+//! previously duplicated in 7 style files with byte-identical bodies (they
+//! faded text to 0.68 alpha; it is now opaque, see `readable::muted_text`).
+//! A single source ensures a theme change updates one place.
 //!
 //! **`btn_s` is intentionally NOT deduped here.** The two `btn_s` locals
 //! (`plotstyle.rs:41` and `style_manager.rs:299`) have divergent bodies:
@@ -12,11 +13,10 @@
 
 use iced::{Color, Theme};
 
-/// Muted secondary text style — `background.base.text` at 68% opacity.
+/// Muted secondary text style: opaque and readable in every theme (see
+/// [`crate::ui::style::readable::muted_text`]).
 pub(crate) fn muted_style(theme: &Theme) -> iced::widget::text::Style {
-    iced::widget::text::Style {
-        color: Some(theme.palette().background.base.text.scale_alpha(0.68)),
-    }
+    crate::ui::style::readable::muted_style(theme)
 }
 
 /// Alias for call sites that used `muted_text_style` (e.g. `style_manager`).
@@ -69,6 +69,16 @@ pub(crate) fn accessible_accent(accent: Color, bg: Color, fallback: Color) -> Co
     accessible_accent_threshold(accent, bg, fallback, 3.0)
 }
 
+/// `accent` as text on `bg`: moved towards `text` only as far as it takes
+/// to reach the 4.5:1 of body text (WCAG 1.4.3), so it keeps its hue in a
+/// light and a dark theme alike.
+pub(crate) fn readable_accent(accent: Color, bg: Color, text: Color) -> Color {
+    (0..=10)
+        .map(|step| crate::ui::style::chrome::mix(accent, text, step as f32 / 10.0))
+        .find(|color| wcag_contrast(*color, bg) >= 4.5)
+        .unwrap_or(text)
+}
+
 /// Returns true if the given canvas background color has a WCAG relative luminance > 0.5 (light surface).
 /// Ignores alpha assuming canvas backgrounds are opaque (or composited against default viewport clear).
 pub(crate) fn canvas_is_light(bg: [f32; 4]) -> bool {
@@ -102,7 +112,11 @@ pub fn dropdown_popup_width<'a>(
     min: f32,
 ) -> f32 {
     let max_units = labels
-        .map(|l| l.chars().map(|c| if is_wide(c) { 2.0 } else { 1.0 }).sum::<f32>())
+        .map(|l| {
+            l.chars()
+                .map(|c| if is_wide(c) { 2.0 } else { 1.0 })
+                .sum::<f32>()
+        })
         .fold(0.0f32, f32::max);
     (max_units * font_size * 0.68 + chrome).max(min)
 }

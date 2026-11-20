@@ -43,7 +43,7 @@ pub fn text_atlas() -> &'static Mutex<GlyphAtlas> {
 }
 
 /// Bumped whenever already-baked entries' UVs stop addressing their tile:
-/// `grow_height` rescales every entry's V and `reset` rewinds the packer, but
+/// `reset` rewinds the packer, but
 /// glyph quads built earlier keep the UVs they were laid out with. Those stale
 /// quads sample the wrong tile on screen and miss the export table entirely
 /// (silently dropping text from the PDF — issue #385 all over again, under
@@ -71,10 +71,11 @@ pub fn textfill() -> bool {
 
 /// Set TEXTFILL and drop the cached glyphs so they re-bake filled / hollow.
 /// Callers must re-tessellate text (`bump_geometry`) so quads pick up the
-/// re-baked tiles.
+/// re-baked tiles. Setting the value it already has keeps the atlas.
 pub fn set_textfill(on: bool) {
-    TEXTFILL.store(on, std::sync::atomic::Ordering::Relaxed);
-    reset_font_entries();
+    if TEXTFILL.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
+        reset_font_entries();
+    }
 }
 
 pub fn reset_font_entries() {
@@ -127,7 +128,9 @@ const MAX_TILE_PX: u32 = 512;
 
 /// Largest atlas dimension the packer will grow the texture to, kept within the
 /// common wgpu `max_texture_dimension_2d` limit (8192). The atlas starts at
-/// 1024² and doubles its height on demand up to this bound.
+/// 1024² and doubles its height on demand up to this bound. Atlas V is
+/// normalized against it; `text.wgsl` and `block_text.wgsl` hold the same
+/// value as `ATLAS_V_EXTENT`.
 const MAX_ATLAS_PX: u32 = 8192;
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -146,6 +149,11 @@ pub struct AtlasEntry {
     pub plane_max: [f32; 2],
     /// Glyph advance width (9-unit space).
     pub advance: f32,
+    /// Half-width of the pen band a stroke glyph was baked with (glyph
+    /// units); 0 for filled glyphs and bold ones. The shader draws a stroke
+    /// glyph wider than a pixel as a one-pixel centreline, as stroke fonts
+    /// carry no width of their own.
+    pub pen: f32,
 }
 
 /// A glyph's vector geometry recovered for CPU export (PDF / print), where the
@@ -164,6 +172,12 @@ pub struct GlyphExport {
     pub fill_tris: Vec<[f32; 2]>,
     /// Baked with the 1.7× bold pen; the exporter widens its own pen to match.
     pub bold: bool,
+    /// The character this tile draws (for the PDF text layer / ToUnicode).
+    pub ch: char,
+    /// The TrueType face the filled outline came from, when there is one: the
+    /// PDF exporter embeds that face and draws the glyph as text instead of
+    /// filling `fill_tris`. `None` for stroke glyphs and hollow (TEXTFILL 0) ones.
+    pub source: Option<crate::scene::text::ttf_glyph::GlyphSource>,
 }
 
 /// Pack a glyph quad's `uv_min` corner into a stable hash key for the export
@@ -206,6 +220,7 @@ struct BakedTile {
     plane_min: [f32; 2],
     plane_max: [f32; 2],
     advance: f32,
+    pen: f32,
 }
 
 /// Side of the reserved solid (all-255) block at the atlas corner.
@@ -233,7 +248,7 @@ impl GlyphAtlas {
             // Centre of the solid block, safely inside it under bilinear filtering.
             solid_uv: [
                 (solid as f32 * 0.5) / width as f32,
-                (solid as f32 * 0.5) / height as f32,
+                (solid as f32 * 0.5) / MAX_ATLAS_PX as f32,
             ],
             dirty: true,
         }
@@ -285,7 +300,11 @@ impl GlyphAtlas {
         let entry = face
             .glyph(ch)
             .and_then(|g| bake_glyph(&g, pen_half))
-            .and_then(|tile| self.pack(tile));
+            .and_then(|tile| self.pack(tile))
+            .map(|entry| AtlasEntry {
+                pen: if bold { 0.0 } else { entry.pen },
+                ..entry
+            });
         self.entries.insert(key, entry);
         entry
     }
@@ -309,6 +328,16 @@ impl GlyphAtlas {
                 .entry(family.as_str())
                 .or_insert_with(|| Face::resolve(family));
             let Some(g) = face.glyph(*ch) else { continue };
+            // Only a filled outline is drawn as embedded-font text; a hollow
+            // (TEXTFILL 0) glyph keeps its stroked outline.
+            #[cfg(not(target_arch = "wasm32"))]
+            let source = if fill_on && !g.fill_tris.is_empty() {
+                face.glyph_source(*ch)
+            } else {
+                None
+            };
+            #[cfg(target_arch = "wasm32")]
+            let source = None;
             out.insert(
                 uv_key(entry.uv_min),
                 GlyphExport {
@@ -328,15 +357,16 @@ impl GlyphAtlas {
                     // share the centrelines, so carry the flag and let the exporter
                     // widen its own pen by the same factor.
                     bold: *bold,
+                    ch: *ch,
+                    source,
                 },
             );
         }
         out
     }
 
-    /// Grow the atlas taller (keeping the width, so packed X positions and their
-    /// normalized U stay valid) and rescale every cached entry's V for the new
-    /// height. Returns false once the height hits `MAX_ATLAS_PX` — text-heavy
+    /// Grow the atlas taller, keeping the width. Packed tiles keep their U and
+    /// V: V is normalized against `MAX_ATLAS_PX`, not the height. Returns false once the height hits `MAX_ATLAS_PX` — text-heavy
     /// drawings would otherwise silently drop glyphs once the single page filled
     /// (issue #347). Width is unchanged, so the row-major data just grows with
     /// zeroed rows appended at the bottom.
@@ -344,19 +374,13 @@ impl GlyphAtlas {
         if self.height >= MAX_ATLAS_PX {
             return false;
         }
-        let old_h = self.height;
         let new_h = (self.height * 2).min(MAX_ATLAS_PX);
         self.data.resize((self.width * new_h) as usize, 0);
-        let sy = old_h as f32 / new_h as f32;
-        for entry in self.entries.values_mut().flatten() {
-            entry.uv_min[1] *= sy;
-            entry.uv_max[1] *= sy;
-        }
-        self.solid_uv[1] *= sy;
         self.height = new_h;
         self.dirty = true;
-        // Every already-emitted quad's V now addresses the wrong tile.
-        bump_generation();
+        // V is baked against `MAX_ATLAS_PX` and the text shaders scale it by
+        // the texture's height, so quads already laid out stay valid: no
+        // generation bump, and no second layout of every text (#2761).
         true
     }
 
@@ -389,7 +413,8 @@ impl GlyphAtlas {
         self.shelf_h = self.shelf_h.max(tile.h);
         self.dirty = true;
 
-        let (fw, fh) = (self.width as f32, self.height as f32);
+        // V against the largest height, so growing never moves a tile.
+        let (fw, fh) = (self.width as f32, MAX_ATLAS_PX as f32);
         Some(AtlasEntry {
             // Sample the centers of the edge texels rather than the tile boundaries.
             // This prevents bilinear filtering from bleeding into neighbouring tiles.
@@ -401,6 +426,7 @@ impl GlyphAtlas {
             plane_min: tile.plane_min,
             plane_max: tile.plane_max,
             advance: tile.advance,
+            pen: tile.pen,
         })
     }
 }
@@ -439,10 +465,8 @@ fn bake_glyph(g: &Glyph, pen_half: f32) -> Option<BakedTile> {
     let plane_min = [min_x - SPREAD_UNITS, min_y - SPREAD_UNITS];
     let plane_max = [max_x + SPREAD_UNITS, max_y + SPREAD_UNITS];
 
-    let w = (((plane_max[0] - plane_min[0]) * PX_PER_UNIT).ceil() as u32)
-        .clamp(1, MAX_TILE_PX);
-    let h = (((plane_max[1] - plane_min[1]) * PX_PER_UNIT).ceil() as u32)
-        .clamp(1, MAX_TILE_PX);
+    let w = (((plane_max[0] - plane_min[0]) * PX_PER_UNIT).ceil() as u32).clamp(1, MAX_TILE_PX);
+    let h = (((plane_max[1] - plane_min[1]) * PX_PER_UNIT).ceil() as u32).clamp(1, MAX_TILE_PX);
 
     let mut data = vec![0u8; (w * h) as usize];
     let inv = 1.0 / PX_PER_UNIT;
@@ -475,6 +499,7 @@ fn bake_glyph(g: &Glyph, pen_half: f32) -> Option<BakedTile> {
         plane_min,
         plane_max,
         advance: g.advance,
+        pen: if filled { 0.0 } else { pen_half },
     })
 }
 
@@ -544,10 +569,10 @@ mod tests {
 
     /// Sample the SDF value at a glyph-space point of a baked tile (0..255).
     fn sample(tile: &BakedTile, gx: f32, gy: f32) -> u8 {
-        let px = (((gx - tile.plane_min[0]) * PX_PER_UNIT) as i32)
-            .clamp(0, tile.w as i32 - 1) as u32;
-        let py = (((tile.plane_max[1] - gy) * PX_PER_UNIT) as i32)
-            .clamp(0, tile.h as i32 - 1) as u32;
+        let px =
+            (((gx - tile.plane_min[0]) * PX_PER_UNIT) as i32).clamp(0, tile.w as i32 - 1) as u32;
+        let py =
+            (((tile.plane_max[1] - gy) * PX_PER_UNIT) as i32).clamp(0, tile.h as i32 - 1) as u32;
         tile.data[(py * tile.w + px) as usize]
     }
 
@@ -581,7 +606,10 @@ mod tests {
     fn filled_glyph_inside_is_high_outside_is_low() {
         let tile = bake_glyph(&filled_square(), PEN_HALF_UNITS).expect("square bakes");
         // Deep inside the fill -> well above the 0.5 (128) edge.
-        assert!(sample(&tile, 2.0, 2.0) > 200, "center should read as inside");
+        assert!(
+            sample(&tile, 2.0, 2.0) > 200,
+            "center should read as inside"
+        );
         // Well outside the fill -> below the edge.
         assert!(
             sample(&tile, -1.0, -1.0) < 60,
@@ -593,7 +621,10 @@ mod tests {
     fn stroke_glyph_on_line_is_high_off_line_is_low() {
         let tile = bake_glyph(&diagonal_stroke(), PEN_HALF_UNITS).expect("stroke bakes");
         // On the diagonal -> inside the pen band.
-        assert!(sample(&tile, 2.0, 2.0) > 128, "on-stroke should be inside band");
+        assert!(
+            sample(&tile, 2.0, 2.0) > 128,
+            "on-stroke should be inside band"
+        );
         // Off the diagonal by more than the pen half-width -> outside.
         assert!(
             sample(&tile, 3.0, 0.5) < 128,
@@ -614,8 +645,12 @@ mod tests {
     #[test]
     fn packing_places_tiles_without_overlap() {
         let mut atlas = GlyphAtlas::new(256, 256);
-        let a = atlas.pack(bake_glyph(&filled_square(), PEN_HALF_UNITS).unwrap()).unwrap();
-        let b = atlas.pack(bake_glyph(&diagonal_stroke(), PEN_HALF_UNITS).unwrap()).unwrap();
+        let a = atlas
+            .pack(bake_glyph(&filled_square(), PEN_HALF_UNITS).unwrap())
+            .unwrap();
+        let b = atlas
+            .pack(bake_glyph(&diagonal_stroke(), PEN_HALF_UNITS).unwrap())
+            .unwrap();
         assert!(atlas.is_dirty());
         // UVs are within the atlas.
         for e in [&a, &b] {
@@ -628,12 +663,27 @@ mod tests {
         assert!(!(overlap_u && overlap_v), "tiles overlap in the atlas");
     }
 
+    /// The text shaders scale V by the texture height against the same
+    /// extent the packer normalizes V by.
+    #[test]
+    fn text_shaders_know_the_atlas_v_extent() {
+        let line = format!("const ATLAS_V_EXTENT: f32 = {MAX_ATLAS_PX}.0;");
+        for shader in [
+            include_str!("../../shaders/text.wgsl"),
+            include_str!("../../shaders/block_text.wgsl"),
+        ] {
+            assert!(shader.contains(&line));
+        }
+    }
+
     #[test]
     fn full_atlas_returns_none() {
         // A tiny atlas cannot fit even one padded tile (wider than the atlas —
         // the width the packer does not grow).
         let mut atlas = GlyphAtlas::new(4, 4);
-        assert!(atlas.pack(bake_glyph(&filled_square(), PEN_HALF_UNITS).unwrap()).is_none());
+        assert!(atlas
+            .pack(bake_glyph(&filled_square(), PEN_HALF_UNITS).unwrap())
+            .is_none());
     }
 
     #[test]
@@ -644,16 +694,21 @@ mod tests {
         let mut atlas = GlyphAtlas::new(1024, 1024);
         let start_h = atlas.height();
         let mut packed = 0;
+        let mut first = None;
         for _ in 0..1000 {
             match atlas.pack(bake_glyph(&filled_square(), PEN_HALF_UNITS).unwrap()) {
                 Some(e) => {
-                    // UVs stay normalized after any growth-driven rescale.
                     assert!(e.uv_min[1] >= 0.0 && e.uv_max[1] <= 1.0);
+                    first.get_or_insert(e);
                     packed += 1;
                 }
                 None => break,
             }
         }
+        // V is in rows of the largest atlas: the first tile still addresses
+        // its rows after the growth, so its quads need no new layout (#2761).
+        let first = first.unwrap();
+        assert!(first.uv_max[1] * (MAX_ATLAS_PX as f32) < start_h as f32);
         assert_eq!(packed, 1000, "every tile must fit once the atlas grows");
         assert!(atlas.height() > start_h, "atlas should have grown taller");
         assert!(atlas.height() <= MAX_ATLAS_PX);
@@ -664,7 +719,9 @@ mod tests {
     #[test]
     fn real_lff_glyph_bakes_and_packs() {
         let mut atlas = GlyphAtlas::new(512, 512);
-        let e = atlas.get_or_insert("txt", 'A', false).expect("LFF 'A' bakes");
+        let e = atlas
+            .get_or_insert("txt", 'A', false)
+            .expect("LFF 'A' bakes");
         assert!(atlas.is_dirty());
         assert!(
             e.plane_max[0] > e.plane_min[0] && e.plane_max[1] > e.plane_min[1],
@@ -682,5 +739,103 @@ mod tests {
         let e2 = atlas.get_or_insert("txt", 'A', false).expect("cached");
         assert_eq!(e.uv_min, e2.uv_min);
         assert_eq!(e.uv_max, e2.uv_max);
+    }
+
+    #[test]
+    fn shx_cache_identity_includes_the_drawings_code_page() {
+        let dir = std::env::temp_dir().join(format!("ocs-shx-atlas-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cp1250.shx");
+        std::fs::write(
+            &path,
+            crate::scene::text::shx::tests::synthetic_shapes(&[0x3F, 0xEC]),
+        )
+        .unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let cp1250 = Face::with_code_page(&path, "ANSI_1250");
+        let cp1252 = Face::with_code_page(&path, "ANSI_1252");
+        let mut atlas = GlyphAtlas::new(512, 512);
+        let _ = atlas.get_or_insert(&cp1250, 'ě', false);
+        let _ = atlas.get_or_insert(&cp1252, 'ě', false);
+        assert_eq!(
+            atlas.entries.len(),
+            2,
+            "different pages must not share a tile"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Field value (0..1) at a glyph-space point, filtered the way the GPU
+    /// sampler reads it: bilinear between texel centres, clamped at the edge.
+    fn sample_linear(tile: &BakedTile, gx: f32, gy: f32) -> f32 {
+        let fx = (gx - tile.plane_min[0]) * PX_PER_UNIT - 0.5;
+        let fy = (tile.plane_max[1] - gy) * PX_PER_UNIT - 0.5;
+        let (x0, y0) = (fx.floor(), fy.floor());
+        let (tx, ty) = (fx - x0, fy - y0);
+        let at = |x: f32, y: f32| {
+            let x = (x as i32).clamp(0, tile.w as i32 - 1) as u32;
+            let y = (y as i32).clamp(0, tile.h as i32 - 1) as u32;
+            f32::from(tile.data[(y * tile.w + x) as usize]) / 255.0
+        };
+        let top = at(x0, y0) * (1.0 - tx) + at(x0 + 1.0, y0) * tx;
+        let bottom = at(x0, y0 + 1.0) * (1.0 - tx) + at(x0 + 1.0, y0 + 1.0) * tx;
+        top * (1.0 - ty) + bottom * ty
+    }
+
+    /// The value of `const <name>: f32` in a WGSL source.
+    fn wgsl_const(source: &str, name: &str) -> f32 {
+        let decl = format!("const {name}: f32 = ");
+        let start = source
+            .find(&decl)
+            .unwrap_or_else(|| panic!("the shader declares {name}"))
+            + decl.len();
+        let end = start + source[start..].find(';').expect("the declaration ends");
+        source[start..end].trim().parse().expect("a float literal")
+    }
+
+    // Zoomed in, the text shaders draw a stroke glyph as its centreline read
+    // back from the filtered field. Between texel centres that field puts the
+    // line up to about half a texel off, so a centreline drawn narrower than
+    // that falls apart into dots. Both shaders must keep at least that much.
+    #[test]
+    fn zoomed_in_stroke_centreline_stays_within_the_shader_floor() {
+        let mut worst = 0.0f32;
+        for step in 0..=12 {
+            let angle = step as f32 * std::f32::consts::FRAC_PI_2 / 12.0;
+            let (dx, dy) = (angle.cos(), angle.sin());
+            for phase in 0..10 {
+                // Shift the stroke across a texel so every sub-texel offset is met.
+                let shift = phase as f32 / (10.0 * PX_PER_UNIT);
+                let a = [shift, 0.37 * shift];
+                let b = [a[0] + 4.0 * dx, a[1] + 4.0 * dy];
+                let glyph = Glyph {
+                    strokes: vec![vec![a, b]],
+                    advance: 4.0,
+                    fill_tris: vec![],
+                };
+                let tile = bake_glyph(&glyph, PEN_HALF_UNITS).expect("stroke bakes");
+                for i in 0..=40 {
+                    let t = i as f32 / 40.0;
+                    let (gx, gy) = (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]));
+                    let field = sample_linear(&tile, gx, gy);
+                    let from_centre = tile.pen - (field - 0.5) * 2.0 * SPREAD_UNITS;
+                    worst = worst.max(from_centre.abs());
+                }
+            }
+        }
+        for (name, source) in [
+            ("text.wgsl", include_str!("../../shaders/text.wgsl")),
+            (
+                "block_text.wgsl",
+                include_str!("../../shaders/block_text.wgsl"),
+            ),
+        ] {
+            let floor = wgsl_const(source, "CENTRELINE_FLOOR_UNITS");
+            assert!(
+                floor >= worst && floor < PEN_HALF_UNITS,
+                "{name}: centreline floor {floor} must cover the field's {worst} \
+                 and stay inside the pen band {PEN_HALF_UNITS}"
+            );
+        }
     }
 }

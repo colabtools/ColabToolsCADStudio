@@ -5,11 +5,11 @@
 //! OCS is the selected entity's semantic/property view, while the evaluated
 //! entity geometry continues through the normal render pipeline.
 
-use codec::objects::{
-    AssociativeData, BlockEvalValue, DynamicBlockData, ObjectType,
-    SolidHistoryNodeBase, SolidHistoryOperation,
+use document::objects::{
+    AssociativeData, BlockEvalValue, DynamicBlockData, ObjectType, SolidHistoryNodeBase,
+    SolidHistoryOperation,
 };
-use codec::{CadDocument, EntityType, Handle};
+use document::{Document, EntityType, Handle};
 
 use crate::scene::model::object::{PropSection, PropValue, Property};
 
@@ -25,7 +25,7 @@ pub struct ObjectDataCache {
     render_settings: std::sync::Arc<Vec<Handle>>,
 }
 
-pub fn build_cache(document: &CadDocument) -> ObjectDataCache {
+pub fn build_cache(document: &Document) -> ObjectDataCache {
     let mut dynamic_objects = Vec::new();
     let mut associative_objects = Vec::new();
     let mut ordered_lights = Vec::new();
@@ -39,16 +39,16 @@ pub fn build_cache(document: &CadDocument) -> ObjectDataCache {
             ObjectType::Associative(_) => associative_objects.push(*handle),
             ObjectType::GeoData(_) => geo_objects.push(*handle),
             ObjectType::ClassObject(value) => match &value.data {
-                codec::objects::ClassObjectData::LightList(list) => {
+                document::objects::ClassObjectData::LightList(list) => {
                     ordered_lights.extend(list.lights.iter().map(|entry| entry.handle));
                 }
-                codec::objects::ClassObjectData::Sun(_) => sun_objects.push(*handle),
-                codec::objects::ClassObjectData::RenderEnvironment(_) => {
+                document::objects::ClassObjectData::Sun(_) => sun_objects.push(*handle),
+                document::objects::ClassObjectData::RenderEnvironment(_) => {
                     render_environments.push(*handle);
                 }
-                codec::objects::ClassObjectData::RenderSettings(_)
-                | codec::objects::ClassObjectData::MentalRayRenderSettings(_)
-                | codec::objects::ClassObjectData::RapidRtRenderSettings(_) => {
+                document::objects::ClassObjectData::RenderSettings(_)
+                | document::objects::ClassObjectData::MentalRayRenderSettings(_)
+                | document::objects::ClassObjectData::RapidRtRenderSettings(_) => {
                     render_settings.push(*handle);
                 }
                 _ => {}
@@ -99,6 +99,67 @@ pub fn geo_objects(cache: &ObjectDataCache) -> &[Handle] {
     &cache.geo_objects
 }
 
+/// A GEODATA's coordinate system for the status bar: its name, and the
+/// details its tooltip lists (#2686).
+pub fn geo_system_label(geo: &document::objects::GeoData) -> (String, String) {
+    let name = coordinate_system_name(&geo.coordinate_system_definition)
+        .or_else(|| coordinate_system_name(&geo.coordinate_system_wkt))
+        .unwrap_or_else(|| crate::t!("Unnamed").into_owned());
+    let kind = match geo.coordinate_type {
+        1 => crate::t!("Local grid"),
+        2 => crate::t!("Projected grid"),
+        3 => crate::t!("Geographic"),
+        _ => crate::t!("Unknown"),
+    };
+    let r = geo.reference_point;
+    let d = geo.design_point;
+    let details = format!(
+        "{}\n{}: {name}\n{}: {kind}\n{}: {:.6}, {:.6}\n{}: {:.4}, {:.4}",
+        crate::t!("GIS Coordinates"),
+        crate::t!("Coordinate system"),
+        crate::t!("Type"),
+        crate::t!("Reference point"),
+        r.x,
+        r.y,
+        crate::t!("Design point"),
+        d.x,
+        d.y,
+    );
+    (name, details)
+}
+
+/// The name a coordinate system definition gives itself: the `id` of a
+/// MapGuide XML `...CoordinateSystem` element, else the first quoted name of
+/// a WKT (`PROJCS["name"`, `GEOGCS["name"`).
+fn coordinate_system_name(definition: &str) -> Option<String> {
+    let text = definition.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let quoted = |rest: &str, quote: char| {
+        let rest = rest.strip_prefix(quote)?;
+        let end = rest.find(quote)?;
+        Some(rest[..end].trim().to_string()).filter(|s| !s.is_empty())
+    };
+    if text.starts_with('<') {
+        let mut at = 0;
+        while let Some(found) = text[at..].find("CoordinateSystem") {
+            let start = at + found;
+            let tag_end = text[start..].find('>').map_or(text.len(), |e| start + e);
+            if let Some(id) = text[start..tag_end].find("id=") {
+                let rest = &text[start + id + 3..tag_end];
+                if let Some(name) = quoted(rest, '"').or_else(|| quoted(rest, '\'')) {
+                    return Some(name);
+                }
+            }
+            at = start + "CoordinateSystem".len();
+        }
+        return None;
+    }
+    let open = text.find('[')?;
+    quoted(&text[open + 1..], '"')
+}
+
 pub fn render_environments(cache: &ObjectDataCache) -> &[Handle] {
     &cache.render_environments
 }
@@ -107,11 +168,7 @@ pub fn render_settings(cache: &ObjectDataCache) -> &[Handle] {
     &cache.render_settings
 }
 
-pub fn update_light_entity(
-    cache: &mut ObjectDataCache,
-    handle: Handle,
-    exists: bool,
-) {
+pub fn update_light_entity(cache: &mut ObjectDataCache, handle: Handle, exists: bool) {
     let lights = std::sync::Arc::make_mut(&mut cache.light_entities);
     if exists {
         if !lights.contains(&handle) {
@@ -149,7 +206,7 @@ fn entity_history_handle(entity: &EntityType) -> Option<Handle> {
     .filter(|handle| handle.is_valid())
 }
 
-fn history_operation_name(operation: &SolidHistoryOperation) -> &'static str {
+pub(crate) fn history_operation_name(operation: &SolidHistoryOperation) -> &'static str {
     match operation {
         SolidHistoryOperation::Unknown => "Unknown",
         SolidHistoryOperation::Box(_) => "Box",
@@ -219,19 +276,21 @@ fn history_base_text(base: &SolidHistoryNodeBase) -> String {
     )
 }
 
-fn embedded_name(value: Option<&codec::entities::EmbeddedEntity>) -> &'static str {
+fn embedded_name(value: Option<&document::entities::EmbeddedEntity>) -> &'static str {
     match value {
-        Some(codec::entities::EmbeddedEntity::Point(_)) => "Point",
-        Some(codec::entities::EmbeddedEntity::Line(_)) => "Line",
-        Some(codec::entities::EmbeddedEntity::Arc(_)) => "Arc",
-        Some(codec::entities::EmbeddedEntity::Circle(_)) => "Circle",
-        Some(codec::entities::EmbeddedEntity::Ellipse(_)) => "Ellipse",
-        Some(codec::entities::EmbeddedEntity::Spline(_)) => "Spline",
-        Some(codec::entities::EmbeddedEntity::LwPolyline(_)) => "Polyline",
-        Some(codec::entities::EmbeddedEntity::Region(_)) => "Region",
-        Some(codec::entities::EmbeddedEntity::Ray(_)) => "Ray",
-        Some(codec::entities::EmbeddedEntity::XLine(_)) => "XLine",
-        Some(codec::entities::EmbeddedEntity::Unknown { .. }) => "Unknown",
+        Some(document::entities::EmbeddedEntity::Point(_)) => "Point",
+        Some(document::entities::EmbeddedEntity::Line(_)) => "Line",
+        Some(document::entities::EmbeddedEntity::Arc(_)) => "Arc",
+        Some(document::entities::EmbeddedEntity::Circle(_)) => "Circle",
+        Some(document::entities::EmbeddedEntity::Ellipse(_)) => "Ellipse",
+        Some(document::entities::EmbeddedEntity::Spline(_)) => "Spline",
+        Some(document::entities::EmbeddedEntity::LwPolyline(_)) => "Polyline",
+        // A 2D / 3D polyline profile the modeler keeps as a wire body.
+        Some(document::entities::EmbeddedEntity::Body { .. }) => "Polyline",
+        Some(document::entities::EmbeddedEntity::Region(_)) => "Region",
+        Some(document::entities::EmbeddedEntity::Ray(_)) => "Ray",
+        Some(document::entities::EmbeddedEntity::XLine(_)) => "XLine",
+        Some(document::entities::EmbeddedEntity::Unknown { .. }) => "Unknown",
         None => "None",
     }
 }
@@ -313,7 +372,7 @@ fn history_operation_text(operation: &SolidHistoryOperation) -> String {
             value.base_face
         ),
         SolidHistoryOperation::Sweep(value) | SolidHistoryOperation::Extrusion(value) => format!(
-            "{}; sweep {}; path {}; direction {:.6},{:.6},{:.6}; draft {:.6}; scale {:.6}; twist {:.6}; align {:.6}; bank {}; intersections {}",
+            "{}; sweep {}; path {}; direction {:.6},{:.6},{:.6}; draft {:.6}; scale {:.6}; twist {:.6}; align {:.6}; align start {}; bank {}",
             history_base_text(&value.base),
             embedded_name(value.sweep_entity.as_ref()),
             embedded_name(value.path_entity.as_ref()),
@@ -324,8 +383,8 @@ fn history_operation_text(operation: &SolidHistoryOperation) -> String {
             value.scale_factor,
             value.twist_angle,
             value.align_angle,
-            value.bank,
-            value.check_intersections
+            value.align_start,
+            value.bank
         ),
         SolidHistoryOperation::Loft(value) => format!(
             "{}; cross sections {}; guides {}",
@@ -352,15 +411,14 @@ fn history_operation_text(operation: &SolidHistoryOperation) -> String {
 }
 
 fn solid_history_sections(
-    document: &CadDocument,
+    document: &Document,
     cache: &ObjectDataCache,
     entity: &EntityType,
 ) -> Vec<PropSection> {
     let Some(history_handle) = entity_history_handle(entity) else {
         return Vec::new();
     };
-    let Some(ObjectType::DynamicBlock(history_object)) =
-        document.objects.get(&history_handle)
+    let Some(ObjectType::DynamicBlock(history_object)) = document.objects.get(&history_handle)
     else {
         return vec![PropSection {
             title: "Solid History".to_string(),
@@ -535,6 +593,11 @@ fn dynamic_data_text(data: &DynamicBlockData) -> String {
             value.value_set.increment,
             value.value_set.values.len()
         ),
+        DynamicBlockData::PropertiesTable(value) => format!(
+            "{}; fields {}",
+            value.parameter.parameter.element.name,
+            value.fields.len()
+        ),
         DynamicBlockData::LookupParameter(value) => format!(
             "{}; {} index {}; description {}",
             value.parameter.parameter.element.name,
@@ -623,7 +686,7 @@ fn dynamic_data_text(data: &DynamicBlockData) -> String {
             "{}; dependencies {}; parameters {}; distance multiplier {:.6}; angle {:.6}",
             value.action.element.name,
             value.action.dependencies.len(),
-            value.action.parameter_ids.len(),
+            value.action.action_ids.len(),
             value.offsets.distance_multiplier,
             value.offsets.angle_offset
         ),
@@ -631,14 +694,14 @@ fn dynamic_data_text(data: &DynamicBlockData) -> String {
             "{}; dependencies {}; parameters {}; connections {}",
             value.action.element.name,
             value.action.dependencies.len(),
-            value.action.parameter_ids.len(),
+            value.action.action_ids.len(),
             value.connections.len()
         ),
         DynamicBlockData::RotateAction(value) | DynamicBlockData::ScaleAction(value) => format!(
             "{}; dependencies {}; parameters {}; base {:.6},{:.6},{:.6}; dependent {}",
             value.action.action.element.name,
             value.action.action.dependencies.len(),
-            value.action.action.parameter_ids.len(),
+            value.action.action.action_ids.len(),
             value.action.base_point.x,
             value.action.base_point.y,
             value.action.base_point.z,
@@ -712,82 +775,6 @@ fn dynamic_data_text(data: &DynamicBlockData) -> String {
         | DynamicBlockData::VisibilityGripEntity
         | DynamicBlockData::XYGripEntity => "Semantic entity marker".to_string(),
     }
-}
-
-fn dynamic_block_sections(
-    document: &CadDocument,
-    cache: &ObjectDataCache,
-    handle: Handle,
-) -> Vec<PropSection> {
-    let Some(definition) = document.dynamic_definition_for_insert(handle) else {
-        return Vec::new();
-    };
-    let mut objects = cache
-        .dynamic_objects
-        .iter()
-        .filter_map(|object_handle| match document.objects.get(object_handle) {
-            Some(ObjectType::DynamicBlock(value))
-                if document.owner_chain_reaches(value.owner, definition) =>
-            {
-                Some(value)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let visibility = document.block_visibility_param_for_def(definition);
-    if objects.is_empty() && visibility.is_none() {
-        return Vec::new();
-    }
-    objects.sort_by_key(|object| object.handle.value());
-
-    let mut overview = vec![
-        ro("Definition", handle_text(definition)),
-        ro("Native records", objects.len().to_string()),
-    ];
-    if let Some(parameter) = visibility {
-        overview.push(ro("Visibility", parameter.name.clone()));
-        overview.push(ro(
-            "Visibility states",
-            parameter
-                .states
-                .iter()
-                .map(|state| state.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-        ));
-    }
-
-    let mut sections = vec![PropSection {
-        title: "Dynamic Block".to_string(),
-        props: overview,
-    }];
-    if !objects.is_empty() {
-        sections.push(PropSection {
-            title: "Dynamic Parameters / Actions".to_string(),
-            props: objects
-                .into_iter()
-                .filter(|object| {
-                    !matches!(
-                        object.data,
-                        DynamicBlockData::SolidHistory(_)
-                            | DynamicBlockData::SolidHistoryNode(_)
-                    )
-                })
-                .map(|object| {
-                    let class = if object.dxf_name.is_empty() {
-                        object.cpp_class_name.as_str()
-                    } else {
-                        object.dxf_name.as_str()
-                    };
-                    ro(
-                        format!("{} · {}", handle_text(object.handle), class),
-                        dynamic_data_text(&object.data),
-                    )
-                })
-                .collect(),
-        });
-    }
-    sections
 }
 
 fn associative_data_text(data: &AssociativeData) -> String {
@@ -901,6 +888,7 @@ fn associative_data_name(data: &AssociativeData) -> &'static str {
         AssociativeData::ArrayParameters(_) => "Array Parameters",
         AssociativeData::ArrayActionBody(_) => "Array Action",
         AssociativeData::ArrayModifyActionBody(_) => "Array Modify Action",
+        AssociativeData::SmartCenterActionBody(_) => "Center Mark/Line Action",
         AssociativeData::DimensionAssociation(_) => "Dimension Association",
         AssociativeData::PersSubentManagerStatic(_) => "Static Subentity Manager",
         AssociativeData::ViewRepActionBody(_) => "View Representation Action",
@@ -912,7 +900,7 @@ fn associative_data_name(data: &AssociativeData) -> &'static str {
 }
 
 fn associative_sections(
-    document: &CadDocument,
+    document: &Document,
     cache: &ObjectDataCache,
     handle: Handle,
 ) -> Vec<PropSection> {
@@ -954,15 +942,12 @@ fn associative_sections(
 
 /// Semantic DWG object sections connected to one selected entity.
 pub fn sections(
-    document: &CadDocument,
+    document: &Document,
     cache: &ObjectDataCache,
     handle: Handle,
     entity: &EntityType,
 ) -> Vec<PropSection> {
     let mut sections = solid_history_sections(document, cache, entity);
-    if matches!(entity, EntityType::Insert(_)) {
-        sections.extend(dynamic_block_sections(document, cache, handle));
-    }
     if let EntityType::Table(table) = entity {
         let mut linked = rustc_hash::FxHashSet::default();
         for row in &table.rows {
@@ -1025,10 +1010,8 @@ where
     result
 }
 
-fn class_object_section(
-    data: &codec::objects::ClassObjectData,
-) -> Option<PropSection> {
-    use codec::objects::ClassObjectData;
+fn class_object_section(data: &document::objects::ClassObjectData) -> Option<PropSection> {
+    use document::objects::ClassObjectData;
 
     let section = match data {
         ClassObjectData::Empty => return None,
@@ -1056,6 +1039,34 @@ fn class_object_section(
                     ),
                 ),
                 ro("Indexed Objects", value.indexed_objects.len().to_string()),
+            ],
+        },
+        ClassObjectData::ObjectDataDictionary(value) => PropSection {
+            title: "Object Data Dictionary".to_string(),
+            props: vec![ro(
+                "Entries",
+                bounded_join(
+                    value
+                        .entries
+                        .iter()
+                        .map(|(name, handle)| format!("{name}: {}", handle_text(*handle))),
+                    64,
+                ),
+            )],
+        },
+        ClassObjectData::ObjectDataDescriptor(value) => PropSection {
+            title: "Object Data Descriptor".to_string(),
+            props: vec![
+                ro("Name", value.name.clone()),
+                ro("Kind", value.kind.to_string()),
+                ro("Payload", format!("{} bytes", value.payload.len())),
+            ],
+        },
+        ClassObjectData::ObjectDataRecord(value) => PropSection {
+            title: "Object Data Record".to_string(),
+            props: vec![
+                ro("Table", handle_text(value.table)),
+                ro("Payload", format!("{} bytes", value.payload.len())),
             ],
         },
         ClassObjectData::LayerFilter(value) => PropSection {
@@ -1432,11 +1443,7 @@ fn class_object_section(
                     "Ramps",
                     bounded_join(
                         value.color_ramps.iter().map(|ramp| {
-                            format!(
-                                "v{} [{}]",
-                                ramp.class_version,
-                                ramp.color_schemes.join(", ")
-                            )
+                            format!("{} v{} ({} colours)", ramp.name, ramp.class_version, ramp.colors.len())
                         }),
                         32,
                     ),
@@ -1445,11 +1452,7 @@ fn class_object_section(
                     "Classification Ramps",
                     bounded_join(
                         value.classification_color_ramps.iter().map(|ramp| {
-                            format!(
-                                "v{} [{}]",
-                                ramp.class_version,
-                                ramp.color_schemes.join(", ")
-                            )
+                            format!("{} v{} ({} colours)", ramp.name, ramp.class_version, ramp.colors.len())
                         }),
                         32,
                     ),
@@ -2063,10 +2066,8 @@ fn class_object_section(
     Some(section)
 }
 
-fn semantic_property_text(
-    value: &codec::objects::SemanticPropertyValue,
-) -> String {
-    use codec::objects::SemanticPropertyValue;
+fn semantic_property_text(value: &document::objects::SemanticPropertyValue) -> String {
+    use document::objects::SemanticPropertyValue;
     match value {
         SemanticPropertyValue::Text(value) => preview_text(value, 512),
         SemanticPropertyValue::Bool(value) => value.to_string(),
@@ -2080,10 +2081,8 @@ fn semantic_property_text(
     }
 }
 
-fn auxiliary_object_property(
-    object: &ObjectType,
-) -> Option<Property> {
-    use codec::objects::DataObjectData;
+fn auxiliary_object_property(object: &ObjectType) -> Option<Property> {
+    use document::objects::DataObjectData;
 
     let (label, value) = match object {
         ObjectType::TableContent(table) => (
@@ -2252,8 +2251,8 @@ fn auxiliary_object_property(
 }
 
 /// Drawing-level standard object data prepared on the file-open worker.
-fn build_document_sections(document: &CadDocument) -> Vec<PropSection> {
-    use codec::objects::ClassObjectData;
+fn build_document_sections(document: &Document) -> Vec<PropSection> {
+    use document::objects::ClassObjectData;
 
     let mut sections = vec![PropSection {
         title: "Drawing".to_string(),
@@ -2280,9 +2279,7 @@ fn build_document_sections(document: &CadDocument) -> Vec<PropSection> {
                             "Design Point",
                             format!(
                                 "{:.8}, {:.8}, {:.8}",
-                                value.design_point.x,
-                                value.design_point.y,
-                                value.design_point.z
+                                value.design_point.x, value.design_point.y, value.design_point.z
                             ),
                         ),
                         ro(
@@ -2305,9 +2302,7 @@ fn build_document_sections(document: &CadDocument) -> Vec<PropSection> {
                             "Up",
                             format!(
                                 "{:.8}, {:.8}, {:.8}",
-                                value.up_direction.x,
-                                value.up_direction.y,
-                                value.up_direction.z
+                                value.up_direction.x, value.up_direction.y, value.up_direction.z
                             ),
                         ),
                         ro(
@@ -2385,11 +2380,7 @@ fn build_document_sections(document: &CadDocument) -> Vec<PropSection> {
                                 "Entries",
                                 bounded_join(
                                     list.lights.iter().map(|light| {
-                                        format!(
-                                            "{}={}",
-                                            light.name,
-                                            handle_text(light.handle)
-                                        )
+                                        format!("{}={}", light.name, handle_text(light.handle))
                                     }),
                                     64,
                                 ),
@@ -2409,9 +2400,7 @@ fn build_document_sections(document: &CadDocument) -> Vec<PropSection> {
                                 "Date / Time",
                                 format!(
                                     "Julian {}; {} ms; DST {}",
-                                    sun.julian_day,
-                                    sun.milliseconds,
-                                    sun.is_daylight_savings_on
+                                    sun.julian_day, sun.milliseconds, sun.is_daylight_savings_on
                                 ),
                             ),
                             ro(
@@ -2656,8 +2645,7 @@ fn build_document_sections(document: &CadDocument) -> Vec<PropSection> {
                                 "Display",
                                 format!(
                                     "predefined first {}; high-level info {}",
-                                    global.predefined_presets_first,
-                                    global.high_level_info
+                                    global.predefined_presets_first, global.high_level_info
                                 ),
                             ),
                         ],
@@ -2674,10 +2662,7 @@ fn build_document_sections(document: &CadDocument) -> Vec<PropSection> {
     }
 
     if !document.dgn_ls_definitions.is_empty() {
-        let mut definitions = document
-            .dgn_ls_definitions
-            .values()
-            .collect::<Vec<_>>();
+        let mut definitions = document.dgn_ls_definitions.values().collect::<Vec<_>>();
         definitions.sort_by_key(|definition| definition.handle.value());
         let omitted = definitions.len().saturating_sub(128);
         let mut props = definitions

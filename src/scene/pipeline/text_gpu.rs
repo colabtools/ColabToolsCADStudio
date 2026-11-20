@@ -15,7 +15,9 @@ pub struct TextVertex {
     pub uv: [f32; 2],
     pub color: [f32; 4],
     pub draw_depth: f32,
-} // 52 bytes, no padding holes (all f32)
+    /// Pen half-width of a stroke glyph in atlas glyph units (0 = filled).
+    pub pen: f32,
+} // 56 bytes, no padding holes (all f32)
 
 impl TextVertex {
     pub fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
@@ -45,6 +47,11 @@ impl TextVertex {
                 shader_location: 4,
                 format: wgpu::VertexFormat::Float32,
             },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(TextVertex, pen) as u64,
+                shader_location: 8,
+                format: wgpu::VertexFormat::Float32,
+            },
         ];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<TextVertex>() as u64,
@@ -66,9 +73,21 @@ pub struct BlockTextInstance {
 impl BlockTextInstance {
     pub fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
         const ATTRS: &[wgpu::VertexAttribute] = &[
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(BlockTextInstance, translation) as u64, shader_location: 5, format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(BlockTextInstance, translation_low) as u64, shader_location: 6, format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(BlockTextInstance, draw_depth) as u64, shader_location: 7, format: wgpu::VertexFormat::Float32 },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(BlockTextInstance, translation) as u64,
+                shader_location: 5,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(BlockTextInstance, translation_low) as u64,
+                shader_location: 6,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(BlockTextInstance, draw_depth) as u64,
+                shader_location: 7,
+                format: wgpu::VertexFormat::Float32,
+            },
         ];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Self>() as u64,
@@ -78,16 +97,66 @@ impl BlockTextInstance {
     }
 }
 
+#[derive(Clone)]
 pub struct TextGpu {
     pub vertex_buffer: wgpu::Buffer,
     pub vertex_count: u32,
 }
 
+/// Block text for many block sources in one pair of GPU buffers. Each draw is
+/// one source: the range of its glyph vertices and the range of instances that
+/// place it. A drawing with thousands of text-bearing blocks otherwise paid
+/// two buffer allocations per source on every upload.
+#[derive(Clone)]
 pub struct BlockTextGpu {
     pub vertex_buffer: wgpu::Buffer,
     pub instance_buffer: wgpu::Buffer,
-    pub vertex_count: u32,
-    pub instance_count: u32,
+    pub draws: Vec<(std::ops::Range<u32>, std::ops::Range<u32>)>,
+}
+
+impl BlockTextGpu {
+    /// Bind the shared buffers once and issue one draw per source.
+    pub fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+        for (vertices, instances) in &self.draws {
+            pass.draw(vertices.clone(), instances.clone());
+        }
+    }
+}
+
+/// Glyph vertices and placements gathered for one pair of buffers.
+#[derive(Default)]
+struct BlockTextBatch {
+    vertices: Vec<TextVertex>,
+    instances: Vec<BlockTextInstance>,
+    draws: Vec<(std::ops::Range<u32>, std::ops::Range<u32>)>,
+}
+
+impl BlockTextBatch {
+    fn flush(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, out: &mut Vec<BlockTextGpu>) {
+        if self.draws.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(self);
+        out.push(BlockTextGpu {
+            vertex_buffer: super::gpu_upload::upload_buffer(
+                device,
+                queue,
+                "block_text.vertices",
+                &batch.vertices,
+                wgpu::BufferUsages::VERTEX,
+            ),
+            instance_buffer: super::gpu_upload::upload_buffer(
+                device,
+                queue,
+                "block_text.instances",
+                &batch.instances,
+                wgpu::BufferUsages::VERTEX,
+            ),
+            draws: batch.draws,
+        });
+    }
 }
 
 /// Split an f64 into the double-single (high f32, low residual f32) pair the
@@ -127,6 +196,7 @@ pub fn push_glyph_vertices(
                 uv,
                 color,
                 draw_depth,
+                pen: q.pen,
             }
         };
         let bl = [q.uv_min[0], q.uv_max[1]];
@@ -172,6 +242,7 @@ pub fn push_glyph_vertices_on_plane(
                 uv,
                 color,
                 draw_depth,
+                pen: q.pen,
             }
         };
         let bl = [q.uv_min[0], q.uv_max[1]];
@@ -221,6 +292,13 @@ pub struct TextAtlasGpu {
 }
 
 impl TextAtlasGpu {
+    pub(super) fn counted_gpu_bytes<'a>(
+        &'a self,
+        counter: &mut super::gpu_memory::ResourceCounter<'a>,
+    ) -> u64 {
+        counter.texture(&self._texture)
+    }
+
     /// Device bytes this atlas holds. `R8`, so one byte per texel.
     pub fn gpu_bytes(&self) -> u64 {
         u64::from(self._texture.width()) * u64::from(self._texture.height())
@@ -475,16 +553,25 @@ pub fn upload_block_vertex_refs(
 ) -> Vec<BlockTextGpu> {
     let mut slots = rustc_hash::FxHashMap::default();
     let mut groups: Vec<Vec<&crate::scene::model::wire_model::WireModel>> = Vec::new();
-    for &wire in wires {
-        if tint.is_none() && !wire.display_visible {
-            continue;
-        }
+    // Only a few wires of a large set carry block text, but finding them
+    // touches every wire. Run that scan in parallel; the ordered collect
+    // keeps the grouping below in submission order.
+    let text_wires: Vec<&crate::scene::model::wire_model::WireModel> = {
+        use crate::par::prelude::*;
+        wires
+            .par_iter()
+            .filter(|wire| {
+                (tint.is_some() || wire.display_visible)
+                    && wire.render_instance.is_some()
+                    && !wire.text_verts.is_empty()
+            })
+            .map(|wire| *wire)
+            .collect()
+    };
+    for wire in text_wires {
         let Some(instance) = wire.render_instance else {
             continue;
         };
-        if wire.text_verts.is_empty() {
-            continue;
-        }
         let slot = *slots.entry(instance.source_id).or_insert_with(|| {
             let slot = groups.len();
             groups.push(Vec::new());
@@ -492,7 +579,10 @@ pub fn upload_block_vertex_refs(
         });
         groups[slot].push(wire);
     }
+    let max_vertices = super::gpu_budget::max_elements_grouped::<TextVertex>(device, 6);
+    let max_instances = super::gpu_budget::max_elements::<BlockTextInstance>(device);
     let mut out = Vec::new();
+    let mut batch = BlockTextBatch::default();
     for group in groups {
         let Some(&source) = group.first() else {
             continue;
@@ -514,7 +604,6 @@ pub fn upload_block_vertex_refs(
         } else {
             source.text_verts.as_slice()
         };
-        let vertex_chunks = upload_vertices(device, queue, vertices);
         let instances: Vec<BlockTextInstance> = group
             .iter()
             .filter_map(|wire| {
@@ -537,26 +626,47 @@ pub fn upload_block_vertex_refs(
                 })
             })
             .collect();
-        let max_instances =
-            super::gpu_budget::max_elements::<BlockTextInstance>(device);
-        for chunk in instances.chunks(max_instances) {
-            let instance_buffer = super::gpu_upload::upload_buffer(
-                device,
-                queue,
-                "block_text.instances",
-                chunk,
-                wgpu::BufferUsages::VERTEX,
-            );
-            for text in &vertex_chunks {
-                out.push(BlockTextGpu {
-                    vertex_buffer: text.vertex_buffer.clone(),
-                    instance_buffer: instance_buffer.clone(),
-                    vertex_count: text.vertex_count,
-                    instance_count: chunk.len() as u32,
-                });
-            }
+        if vertices.is_empty() || instances.is_empty() {
+            continue;
         }
+        // A source too large to share a buffer keeps buffers of its own,
+        // split to the budget as before.
+        if vertices.len() > max_vertices || instances.len() > max_instances {
+            batch.flush(device, queue, &mut out);
+            let vertex_chunks = upload_vertices(device, queue, vertices);
+            for chunk in instances.chunks(max_instances) {
+                let instance_buffer = super::gpu_upload::upload_buffer(
+                    device,
+                    queue,
+                    "block_text.instances",
+                    chunk,
+                    wgpu::BufferUsages::VERTEX,
+                );
+                for text in &vertex_chunks {
+                    out.push(BlockTextGpu {
+                        vertex_buffer: text.vertex_buffer.clone(),
+                        instance_buffer: instance_buffer.clone(),
+                        draws: vec![(0..text.vertex_count, 0..chunk.len() as u32)],
+                    });
+                }
+            }
+            continue;
+        }
+        if batch.vertices.len() + vertices.len() > max_vertices
+            || batch.instances.len() + instances.len() > max_instances
+        {
+            batch.flush(device, queue, &mut out);
+        }
+        let first_vertex = batch.vertices.len() as u32;
+        let first_instance = batch.instances.len() as u32;
+        batch.vertices.extend_from_slice(vertices);
+        batch.instances.extend(instances);
+        batch.draws.push((
+            first_vertex..batch.vertices.len() as u32,
+            first_instance..batch.instances.len() as u32,
+        ));
     }
+    batch.flush(device, queue, &mut out);
     out
 }
 
@@ -603,10 +713,18 @@ mod tests {
             corners: [[0.0, 0.0], [8.0, 0.0], [8.0, 9.0], [0.0, 9.0]],
             uv_min: [0.10, 0.20],
             uv_max: [0.30, 0.40],
+            pen: 0.0,
         };
         let mut out = Vec::new();
         // Large origin exercises the double-single precision path.
-        push_glyph_vertices(&mut out, &[q], [1_000_000.0, 2_000_000.0, 0.0], 1.0, [1.0; 4], 0.0);
+        push_glyph_vertices(
+            &mut out,
+            &[q],
+            [1_000_000.0, 2_000_000.0, 0.0],
+            1.0,
+            [1.0; 4],
+            0.0,
+        );
         assert_eq!(out.len(), 6, "two triangles per glyph");
 
         // Vertex 0 = BL corner (0,0) -> world origin, uv = (u_min, v_max).
@@ -626,6 +744,7 @@ mod tests {
             corners: [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
             uv_min: [0.0, 0.0],
             uv_max: [1.0, 1.0],
+            pen: 0.0,
         };
         let mut out = Vec::new();
         push_glyph_vertices(&mut out, &[q], [0.0, 0.0, 0.0], 2.0, [1.0; 4], 0.0);

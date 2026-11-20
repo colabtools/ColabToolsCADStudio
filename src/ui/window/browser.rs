@@ -17,10 +17,11 @@
 
 use crate::app::Message;
 use crate::ui::dock::PanelId;
-use codec::objects::SolidHistoryOperation;
-use codec::{CadDocument, EntityType, Handle};
-use iced::widget::{button, column, container, scrollable, text};
-use iced::{Background, Element, Fill, Theme};
+use crate::ui::kit;
+use document::objects::SolidHistoryOperation;
+use document::{Document, EntityType, Handle};
+use iced::widget::column;
+use iced::Element;
 
 /// The three world planes, with the argument `CREATESKETCH` takes for each.
 const ORIGIN_PLANES: [(&str, &str); 3] = [("XY", "XY"), ("XZ", "XZ"), ("YZ", "YZ")];
@@ -48,63 +49,48 @@ fn operation_label(operation: &SolidHistoryOperation) -> &'static str {
 }
 
 /// Every `Solid3D` in model space, with the label to show for it.
-fn bodies(document: &CadDocument) -> Vec<(Handle, String)> {
+fn bodies(document: &Document) -> Vec<(Handle, String)> {
     document
         .entities()
         .filter(|entity| matches!(entity, EntityType::Solid3D(_)))
         .map(|entity| {
             let handle = entity.common().handle;
-            let label = crate::scene::model::solid_history::primitive_property_operation(
-                document, handle,
-            )
-            .as_ref()
-            .map_or("Solid", operation_label);
+            let label =
+                crate::scene::model::solid_history::primitive_property_operation(document, handle)
+                    .as_ref()
+                    .map_or("Solid", operation_label);
             (handle, format!("{label} {:X}", handle.value()))
         })
         .collect()
 }
 
-fn section_header(label: String) -> Element<'static, Message> {
-    container(text(label).size(11))
-        .width(Fill)
-        .padding([3, 6])
-        .style(|theme: &Theme| container::Style {
-            background: Some(Background::Color(theme.palette().background.weak.color)),
-            ..Default::default()
-        })
-        .into()
-}
-
 /// A clickable row that runs `command`.
 fn entry_row(label: String, command: String) -> Element<'static, Message> {
-    button(text(label).size(12))
+    kit::tree_row(label)
         .on_press(Message::Command(command))
-        .width(Fill)
-        .padding([3, 10])
-        .style(button::subtle)
-        .into()
+        .view()
 }
 
 /// A row that states something rather than doing something.
 fn note_row(label: String) -> Element<'static, Message> {
-    container(text(label).size(11).style(crate::ui::style::common::muted_style))
-        .width(Fill)
-        .padding([3, 10])
-        .into()
+    kit::tree_row(label).muted(true).view()
 }
 
 pub fn view<'a>(
-    document: &'a CadDocument,
+    document: &'a Document,
     open_sketch: Option<&'a str>,
     width: f32,
-    auto_collapse: bool,
+    chrome: crate::ui::dock::Chrome,
 ) -> Element<'a, Message> {
     let title_bar =
-        crate::ui::dock::title_bar(PanelId::Browser, crate::t!("Browser").into_owned(), auto_collapse);
+        crate::ui::dock::title_bar(PanelId::Browser, crate::t!("Browser").into_owned(), chrome);
 
-    let mut tree = column![].spacing(1);
+    let mut tree = column![];
 
-    tree = tree.push(section_header(crate::t!("Origin planes").into_owned()));
+    tree = tree.push(kit::section_bar(
+        crate::t!("Origin planes").into_owned(),
+        Vec::new(),
+    ));
     for (label, argument) in ORIGIN_PLANES {
         tree = tree.push(entry_row(
             label.to_string(),
@@ -112,7 +98,10 @@ pub fn view<'a>(
         ));
     }
 
-    tree = tree.push(section_header(crate::t!("Sketch").into_owned()));
+    tree = tree.push(kit::section_bar(
+        crate::t!("Sketch").into_owned(),
+        Vec::new(),
+    ));
     match open_sketch {
         Some(name) => {
             tree = tree.push(entry_row(name.to_string(), "FINISHSKETCH".to_string()));
@@ -123,7 +112,10 @@ pub fn view<'a>(
     }
 
     let bodies = bodies(document);
-    tree = tree.push(section_header(crate::tf!("Bodies ({})", bodies.len()).into_owned()));
+    tree = tree.push(kit::section_bar(
+        crate::tf!("Bodies ({})", bodies.len()).into_owned(),
+        Vec::new(),
+    ));
     if bodies.is_empty() {
         tree = tree.push(note_row(crate::t!("No solids yet").into_owned()));
     } else {
@@ -134,14 +126,5 @@ pub fn view<'a>(
         }
     }
 
-    let body = scrollable(container(tree).padding(iced::Padding {
-        top: 0.0,
-        right: 8.0,
-        bottom: 6.0,
-        left: 0.0,
-    }))
-    .width(Fill)
-    .height(Fill);
-
-    crate::ui::dock::frame(column![title_bar, body].spacing(6), width)
+    kit::palette(title_bar, kit::scroll_area(tree), width)
 }

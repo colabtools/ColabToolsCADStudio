@@ -1,12 +1,12 @@
-use codec::entities::{HooklineDirection, Leader, LeaderCreationType, LeaderPathType};
-use codec::Entity;
+use document::entities::{HooklineDirection, Leader, LeaderCreationType, LeaderPathType};
+use document::Entity;
 use glam::Vec3;
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
     center_grip, edit_prop as edit, ro_prop as ro, square_grip, stepper_prop as stepper,
 };
 use crate::entities::traits::RenderConvertible;
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::model::wire_model::TangentGeom;
@@ -47,8 +47,8 @@ fn draws_hookline(leader: &Leader) -> bool {
 fn to_render(leader: &Leader) -> RenderEntity {
     let verts = &leader.vertices;
     let nan = [f64::NAN; 3];
-    let p3 = |v: &codec::types::Vector3| -> [f64; 3] { [v.x, v.y, v.z] };
-    let p3f = |v: &codec::types::Vector3| -> [f32; 3] { [v.x as f32, v.y as f32, v.z as f32] };
+    let p3 = |v: &document::types::Vector3| -> [f64; 3] { [v.x, v.y, v.z] };
+    let p3f = |v: &document::types::Vector3| -> [f32; 3] { [v.x as f32, v.y as f32, v.z as f32] };
 
     let mut points: Vec<[f64; 3]> = Vec::new();
     let mut tangents: Vec<TangentGeom> = Vec::new();
@@ -169,16 +169,12 @@ fn apply_grip(leader: &mut Leader, grip_id: usize, apply: GripApply) {
                 let old_end = leader.vertices[n - 1];
 
                 let delta = match apply {
-                    GripApply::Absolute(p) => codec::types::Vector3::new(
-                        p.x as f64 - old_elbow.x,
-                        p.y as f64 - old_elbow.y,
-                        p.z as f64 - old_elbow.z,
+                    GripApply::Absolute(p) => document::types::Vector3::new(
+                        p.x - old_elbow.x,
+                        p.y - old_elbow.y,
+                        p.z - old_elbow.z,
                     ),
-                    GripApply::Translate(d) => codec::types::Vector3::new(
-                        d.x as f64,
-                        d.y as f64,
-                        d.z as f64,
-                    ),
+                    GripApply::Translate(d) => document::types::Vector3::new(d.x, d.y, d.z),
                 };
 
                 leader.vertices[n - 2].x = old_elbow.x + delta.x;
@@ -199,10 +195,10 @@ fn apply_grip(leader: &mut Leader, grip_id: usize, apply: GripApply) {
 
                 match apply {
                     GripApply::Absolute(p) => {
-                        leader.vertices[n - 1].x = p.x as f64;
+                        leader.vertices[n - 1].x = p.x;
                     }
                     GripApply::Translate(d) => {
-                        leader.vertices[n - 1].x += d.x as f64;
+                        leader.vertices[n - 1].x += d.x;
                     }
                 }
 
@@ -215,23 +211,19 @@ fn apply_grip(leader: &mut Leader, grip_id: usize, apply: GripApply) {
         if let Some(v) = leader.vertices.get_mut(grip_id) {
             match apply {
                 GripApply::Absolute(p) => {
-                    v.x = p.x as f64;
-                    v.y = p.y as f64;
-                    v.z = p.z as f64;
+                    v.x = p.x;
+                    v.y = p.y;
+                    v.z = p.z;
                 }
                 GripApply::Translate(d) => {
-                    v.x += d.x as f64;
-                    v.y += d.y as f64;
-                    v.z += d.z as f64;
+                    v.x += d.x;
+                    v.y += d.y;
+                    v.z += d.z;
                 }
             }
         }
     } else if let GripApply::Translate(d) = apply {
-        leader.translate(codec::types::Vector3::new(
-            d.x as f64,
-            d.y as f64,
-            d.z as f64,
-        ));
+        leader.translate(document::types::Vector3::new(d.x, d.y, d.z));
     }
 }
 
@@ -273,7 +265,11 @@ fn properties(leader: &Leader) -> Vec<PropSection> {
     };
 
     // Geometry exposes one editable vertex at a time.
-    let mut geometry = vec![stepper(t!("Current Vertex").as_ref(), "current_vertex", vertex_label)];
+    let mut geometry = vec![stepper(
+        t!("Current Vertex").as_ref(),
+        "current_vertex",
+        vertex_label,
+    )];
     if let Some(v) = leader.vertices.get(vi) {
         geometry.push(edit(t!("Vertex X").as_ref(), "vertex_x", v.x));
         geometry.push(edit(t!("Vertex Y").as_ref(), "vertex_y", v.y));
@@ -317,7 +313,11 @@ fn properties(leader: &Leader) -> Vec<PropSection> {
         ro(t!("Text offset").as_ref(), "text_offset", String::new()),
         ro(t!("Text pos vert").as_ref(), "text_pos_vert", String::new()),
     ];
-    let fit = vec![ro(t!("Dim scale overall").as_ref(), "dim_scale_overall", String::new())];
+    let fit = vec![ro(
+        t!("Dim scale overall").as_ref(),
+        "dim_scale_overall",
+        String::new(),
+    )];
 
     vec![
         PropSection {
@@ -494,17 +494,25 @@ fn apply_transform(leader: &mut Leader, t: &EntityTransform) {
         for v in &mut entity.vertices {
             crate::scene::view::transform::reflect_xy_point(&mut v.x, &mut v.y, p1, p2);
         }
+        // Offsets from the last vertex reflect as directions.
+        let axis = p2 - p1;
         crate::scene::view::transform::reflect_xy_point(
             &mut entity.block_offset.x,
             &mut entity.block_offset.y,
-            p1,
-            p2,
+            glam::DVec3::ZERO,
+            axis,
         );
         crate::scene::view::transform::reflect_xy_point(
             &mut entity.annotation_offset.x,
             &mut entity.annotation_offset.y,
-            p1,
-            p2,
+            glam::DVec3::ZERO,
+            axis,
+        );
+        crate::scene::view::transform::reflect_xy_point(
+            &mut entity.horizontal_direction.x,
+            &mut entity.horizontal_direction.y,
+            glam::DVec3::ZERO,
+            axis,
         );
     });
 }
@@ -512,7 +520,7 @@ fn apply_transform(leader: &mut Leader, t: &EntityTransform) {
 // ── Trait impls ────────────────────────────────────────────────────────────
 
 impl RenderConvertible for Leader {
-    fn to_render(&self, _document: &codec::CadDocument) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         if self.vertices.is_empty() {
             return None;
         }
@@ -559,7 +567,11 @@ impl crate::entities::traits::Grippable for Leader {
             }]
         }
     }
-    fn apply_grip_menu(&mut self, grip_id: usize, action: crate::scene::model::object::GripMenuAction) {
+    fn apply_grip_menu(
+        &mut self,
+        grip_id: usize,
+        action: crate::scene::model::object::GripMenuAction,
+    ) {
         use crate::scene::model::object::GripMenuAction as A;
         let n = self.vertices.len();
         match action {
@@ -570,7 +582,7 @@ impl crate::entities::traits::Grippable for Leader {
                 }
                 let v0 = &self.vertices[grip_id];
                 let v1 = &self.vertices[i1];
-                let mid = codec::types::Vector3::new(
+                let mid = document::types::Vector3::new(
                     (v0.x + v1.x) * 0.5,
                     (v0.y + v1.y) * 0.5,
                     (v0.z + v1.z) * 0.5,
@@ -608,8 +620,8 @@ impl crate::entities::traits::Transformable for Leader {
 pub trait LeaderTess {
     fn tessellate(
         &self,
-        document: &codec::CadDocument,
-        handle: codec::Handle,
+        document: &document::Document,
+        handle: document::Handle,
         selected: bool,
         entity_color: [f32; 4],
         line_weight_px: f32,
@@ -620,15 +632,17 @@ pub trait LeaderTess {
 impl LeaderTess for Leader {
     fn tessellate(
         &self,
-        document: &codec::CadDocument,
-        handle: codec::Handle,
+        document: &document::Document,
+        handle: document::Handle,
         selected: bool,
         entity_color: [f32; 4],
         line_weight_px: f32,
         anno_scale: f32,
     ) -> crate::scene::model::wire_model::WireModel {
-        use crate::scene::convert::tessellate::{append_arrow, arrow_from_block, ArrowKind, DimGeom};
         use crate::entities::dim_override as dov;
+        use crate::scene::convert::tessellate::{
+            append_arrow, arrow_from_block, ArrowKind, DimGeom,
+        };
         use crate::scene::model::wire_model::WireModel;
         let xd = &self.common.extended_data;
         // Dim-line colour: a per-object ACAD_DSTYLE override (code 176, an ACI
@@ -649,9 +663,11 @@ impl LeaderTess for Leader {
                     .map(|s| s.dimclrd)
             });
             match dim_clr {
-                Some(idx) if idx != 0 && idx != 256 => crate::scene::convert::tess_util::aci_to_rgba(
-                    &codec::types::Color::from_index(idx),
-                ),
+                Some(idx) if idx != 0 && idx != 256 => {
+                    crate::scene::convert::tess_util::aci_to_rgba(
+                        &document::types::Color::from_index(idx),
+                    )
+                }
                 _ => entity_color,
             }
         };
@@ -659,12 +675,12 @@ impl LeaderTess for Leader {
         // ByBlock / Default and no override keep the resolved weight passed in.
         let line_weight_px = match dov::int(xd, dov::DIMLWD) {
             Some(lwd) if lwd >= 0 => crate::scene::view::render::lineweight_to_px(
-                &codec::types::LineWeight::from_value(lwd),
+                &document::types::LineWeight::from_value(lwd),
             ),
             _ => line_weight_px,
         };
         let name = handle.value().to_string();
-        let p3 = |v: &codec::types::Vector3| -> [f32; 3] {
+        let p3 = |v: &document::types::Vector3| -> [f32; 3] {
             [(v.x) as f32, (v.y) as f32, (v.z) as f32]
         };
 
@@ -674,8 +690,6 @@ impl LeaderTess for Leader {
             return WireModel {
                 bg_adapt: None,
                 point_marker: None,
-                taper_widths: Vec::new(),
-                pattern_stations: Vec::new(),
                 world_width: 0.0,
                 depth_override: None,
                 display_visible: true,
@@ -683,28 +697,34 @@ impl LeaderTess for Leader {
                 plot_visible: true,
                 fill_is_3d: false,
                 fill_is_2d_solid: false,
+                solid_normal: None,
                 render_instance: None,
-                pick_tris: Vec::new(),
-                pick_tris_low: Vec::new(),
-            dash_from_start: false,
-            dash_align_end: None,
-            text_verts: Vec::new(),
+                dash_from_start: false,
                 name,
-                points: vec![],
-                points_low: Vec::new(),
                 color,
                 selected,
                 aci: 0,
                 pattern_length: 0.0,
                 pattern: [0.0; 8],
                 line_weight_px,
-                snap_pts: vec![],
-                tangent_geoms: vec![],
-                key_vertices: vec![],
                 aabb: WireModel::UNBOUNDED_AABB,
                 plinegen: true,
-                fill_tris: vec![],
-                fill_tris_low: Vec::new(),
+                geom: std::sync::Arc::new(crate::scene::WireGeom {
+                    taper_widths: Vec::new(),
+                    pattern_stations: Vec::new(),
+                    pick_tris: Vec::new(),
+                    pick_tris_low: Vec::new(),
+                    text_verts: Vec::new(),
+                    points: vec![],
+                    points_low: Vec::new(),
+                    snap_pts: vec![],
+                    tangent_geoms: vec![],
+                    key_vertices: vec![],
+                    fill_tris: vec![],
+                    fill_tris_low: Vec::new(),
+                    ..crate::scene::WireGeom::default()
+                }),
+                ..Default::default()
             };
         }
 
@@ -809,8 +829,7 @@ impl LeaderTess for Leader {
                 .unwrap_or(anno_scale as f64);
             // Hook length: DIMASZ, like the arrowhead, when a style resolves;
             // the legacy text-height heuristic otherwise.
-            let mut land_len = match dov::real(xd, dov::DIMASZ)
-                .or_else(|| style.map(|s| s.dimasz))
+            let mut land_len = match dov::real(xd, dov::DIMASZ).or_else(|| style.map(|s| s.dimasz))
             {
                 Some(a) => a * dim_scale,
                 None => self.text_height * 1.5 * anno_scale as f64,
@@ -823,7 +842,7 @@ impl LeaderTess for Leader {
                 .unwrap_or(0);
             if dimtad != 0 {
                 let mt = match document.get_entity(self.annotation_handle) {
-                    Some(codec::entities::EntityType::MText(mt)) => {
+                    Some(document::entities::EntityType::MText(mt)) => {
                         Some((mt.extents_width, mt.insertion_point.x))
                     }
                     _ => None,
@@ -850,14 +869,11 @@ impl LeaderTess for Leader {
         // Split absolute f64 into the render/eye double-single so the GPU keeps
         // full precision at UTM coordinates (empty low bufs = absolute f32).
         let (points, points_low) = crate::scene::convert::tessellate::points_to_ds(points);
-        let (fill_tris, fill_tris_low) =
-            crate::scene::convert::tessellate::points_to_ds(fill_tris);
+        let (fill_tris, fill_tris_low) = crate::scene::convert::tessellate::points_to_ds(fill_tris);
 
         WireModel {
             bg_adapt: None,
             point_marker: None,
-            taper_widths: Vec::new(),
-            pattern_stations: Vec::new(),
             world_width: 0.0,
             depth_override: None,
             display_visible: true,
@@ -865,28 +881,34 @@ impl LeaderTess for Leader {
             plot_visible: true,
             fill_is_3d: false,
             fill_is_2d_solid: false,
+            solid_normal: None,
             render_instance: None,
-            pick_tris: Vec::new(),
-            pick_tris_low: Vec::new(),
             dash_from_start: false,
-            dash_align_end: None,
-            text_verts: Vec::new(),
             name,
-            points,
-            points_low,
             color,
             selected,
             aci: 0,
             pattern_length: 0.0,
             pattern: [0.0; 8],
             line_weight_px,
-            snap_pts: vec![],
-            tangent_geoms: tangents,
-            key_vertices,
             aabb: WireModel::UNBOUNDED_AABB,
             plinegen: true,
-            fill_tris,
-            fill_tris_low,
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                taper_widths: Vec::new(),
+                pattern_stations: Vec::new(),
+                pick_tris: Vec::new(),
+                pick_tris_low: Vec::new(),
+                text_verts: Vec::new(),
+                points,
+                points_low,
+                snap_pts: vec![],
+                tangent_geoms: tangents,
+                key_vertices,
+                fill_tris,
+                fill_tris_low,
+                ..crate::scene::WireGeom::default()
+            }),
+            ..Default::default()
         }
     }
 }

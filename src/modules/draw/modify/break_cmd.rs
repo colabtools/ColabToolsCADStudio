@@ -8,13 +8,13 @@
 //   BREAK @ (at-sign as second point) → Break at a single point (splits without gap).
 
 use crate::modules::draw::modify::spline_ops::{spline_cut, spline_nearest_t, spline_range};
-use codec::entities::{
+use crate::t;
+use document::entities::{
     Arc as ArcEnt, Ellipse as EllipseEnt, Line as LineEnt, LwPolyline, Spline as SplineEnt,
 };
-use codec::types::Vector3;
-use codec::{EntityType, Handle};
+use document::types::Vector3;
+use document::{EntityType, Handle};
 use glam::DVec3;
-use crate::t;
 
 use crate::command::{CadCommand, CmdResult};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
@@ -88,12 +88,12 @@ fn break_line(line: &LineEnt, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
     result
 }
 
-fn picked_spans(curve: &kernel::space::PlanarCurve, p1: DVec3, p2: DVec3) -> Option<Vec<[f64; 2]>> {
+fn picked_spans(curve: &ocs_geom::space::PlanarCurve, p1: DVec3, p2: DVec3) -> Option<Vec<[f64; 2]>> {
     let first = curve.plane.project(p1.to_array())?;
     let second = curve.plane.project(p2.to_array())?;
-    let a = kernel::geom2d::closest_point(&curve.curve, first).t;
-    let b = kernel::geom2d::closest_point(&curve.curve, second).t;
-    kernel::geom2d::break_spans(&curve.curve, a, b, kernel::geom2d::Tolerance::new(1e-9))
+    let a = ocs_geom::geom2d::closest_point(&curve.curve, first).t;
+    let b = ocs_geom::geom2d::closest_point(&curve.curve, second).t;
+    ocs_geom::geom2d::break_spans(&curve.curve, a, b, ocs_geom::geom2d::Tolerance::new(1e-9))
 }
 
 fn break_arc(arc: &ArcEnt, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
@@ -101,42 +101,60 @@ fn break_arc(arc: &ArcEnt, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
     let Some(spans) = picked_spans(&curve, p1, p2) else {
         return vec![EntityType::Arc(arc.clone())];
     };
-    let kernel::geom2d::Curve::Arc(geometry) = &curve.curve else { unreachable!() };
-    spans.into_iter().map(|[from, to]| {
-        let mut result = arc.clone();
-        result.common.handle = Handle::NULL;
-        result.start_angle = (geometry.start_angle + from * geometry.sweep()).rem_euclid(std::f64::consts::TAU);
-        result.end_angle = (geometry.start_angle + to * geometry.sweep()).rem_euclid(std::f64::consts::TAU);
-        EntityType::Arc(result)
-    }).collect()
+    let ocs_geom::geom2d::Curve::Arc(geometry) = &curve.curve else {
+        unreachable!()
+    };
+    spans
+        .into_iter()
+        .map(|[from, to]| {
+            let mut result = arc.clone();
+            result.common.handle = Handle::NULL;
+            result.start_angle =
+                (geometry.start_angle + from * geometry.sweep()).rem_euclid(std::f64::consts::TAU);
+            result.end_angle =
+                (geometry.start_angle + to * geometry.sweep()).rem_euclid(std::f64::consts::TAU);
+            EntityType::Arc(result)
+        })
+        .collect()
 }
 
-fn break_circle(circle: &codec::entities::Circle, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
+fn break_circle(circle: &document::entities::Circle, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
     let curve = crate::entities::curve::circle_curve(circle);
     let Some(spans) = picked_spans(&curve, p1, p2) else {
         return vec![EntityType::Circle(circle.clone())];
     };
-    spans.into_iter().map(|[from, to]| {
-        let mut arc = ArcEnt::new();
-        arc.common = circle.common.clone();
-        arc.common.handle = Handle::NULL;
-        arc.center = circle.center;
-        arc.radius = circle.radius;
-        arc.thickness = circle.thickness;
-        arc.normal = circle.normal;
-        arc.start_angle = from * std::f64::consts::TAU;
-        arc.end_angle = (to * std::f64::consts::TAU).rem_euclid(std::f64::consts::TAU);
-        EntityType::Arc(arc)
-    }).collect()
+    spans
+        .into_iter()
+        .map(|[from, to]| {
+            let mut arc = ArcEnt::new();
+            arc.common = circle.common.clone();
+            arc.common.handle = Handle::NULL;
+            arc.center = circle.center;
+            arc.radius = circle.radius;
+            arc.thickness = circle.thickness;
+            arc.normal = circle.normal;
+            arc.start_angle = from * std::f64::consts::TAU;
+            arc.end_angle = (to * std::f64::consts::TAU).rem_euclid(std::f64::consts::TAU);
+            EntityType::Arc(arc)
+        })
+        .collect()
 }
 fn break_lwpolyline(p: &LwPolyline, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
     let unchanged = || vec![EntityType::LwPolyline(p.clone())];
-    let Some(curve) = crate::entities::curve::lwpolyline_curve(p) else { return unchanged(); };
-    let Some(spans) = picked_spans(&curve, p1, p2) else { return unchanged(); };
-    let kernel::geom2d::Curve::Polyline(geometry) = &curve.curve else { unreachable!() };
+    let Some(curve) = crate::entities::curve::lwpolyline_curve(p) else {
+        return unchanged();
+    };
+    let Some(spans) = picked_spans(&curve, p1, p2) else {
+        return unchanged();
+    };
+    let ocs_geom::geom2d::Curve::Polyline(geometry) = &curve.curve else {
+        unreachable!()
+    };
     let mut result = Vec::with_capacity(spans.len());
     for [from, to] in spans {
-        let Some(range) = geometry.ranged(from, to) else { return unchanged(); };
+        let Some(range) = geometry.ranged(from, to) else {
+            return unchanged();
+        };
         let mut fragment = p.clone();
         fragment.common.handle = Handle::NULL;
         fragment.is_closed = false;
@@ -148,8 +166,10 @@ fn break_lwpolyline(p: &LwPolyline, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
             let last = index == range.segments.len();
             let source = if last && segment.to == 1.0 {
                 (segment.source_index + 1) % p.vertices.len()
-            } else { segment.source_index };
-            let mut output = p.vertices[source].clone();
+            } else {
+                segment.source_index
+            };
+            let mut output = p.vertices[source];
             output.location.x = vertex.position[0];
             output.location.y = vertex.position[1];
             if !last || segment.to != 1.0 {
@@ -157,7 +177,11 @@ fn break_lwpolyline(p: &LwPolyline, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
                 let widths = segment.interpolate(original.start_width, original.end_width);
                 output.start_width = widths[0];
                 output.end_width = widths[1];
-                output.bulge = if last { range.polyline.vertices[index - 1].bulge } else { vertex.bulge };
+                output.bulge = if last {
+                    range.polyline.vertices[index - 1].bulge
+                } else {
+                    vertex.bulge
+                };
             }
             fragment.vertices.push(output);
         }
@@ -172,14 +196,19 @@ fn break_ellipse(ell: &EllipseEnt, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
     let Some(spans) = picked_spans(&curve, p1, p2) else {
         return vec![EntityType::Ellipse(ell.clone())];
     };
-    let kernel::geom2d::Curve::Ellipse(geometry) = &curve.curve else { unreachable!() };
-    spans.into_iter().map(|[from, to]| {
-        let mut result = ell.clone();
-        result.common.handle = Handle::NULL;
-        result.start_parameter = geometry.start_parameter + from * geometry.sweep();
-        result.end_parameter = geometry.start_parameter + to * geometry.sweep();
-        EntityType::Ellipse(result)
-    }).collect()
+    let ocs_geom::geom2d::Curve::Ellipse(geometry) = &curve.curve else {
+        unreachable!()
+    };
+    spans
+        .into_iter()
+        .map(|[from, to]| {
+            let mut result = ell.clone();
+            result.common.handle = Handle::NULL;
+            result.start_parameter = geometry.start_parameter + from * geometry.sweep();
+            result.end_parameter = geometry.start_parameter + to * geometry.sweep();
+            EntityType::Ellipse(result)
+        })
+        .collect()
 }
 fn world_to_dxf(v: DVec3) -> DVec3 {
     // World = DXF (identity).
@@ -243,6 +272,12 @@ pub struct BreakInteractiveCommand {
     p1: Option<DVec3>,
 }
 
+impl Default for BreakInteractiveCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BreakInteractiveCommand {
     pub fn new() -> Self {
         Self {
@@ -271,6 +306,10 @@ impl CadCommand for BreakInteractiveCommand {
         self.target.is_none()
     }
 
+    fn typed_point_picks_entity(&self) -> bool {
+        true
+    }
+
     fn options(&self) -> Vec<crate::command::CmdOption> {
         if self.target.is_some() && self.p1.is_some() {
             vec![crate::command::CmdOption::new("First point", "F")]
@@ -287,7 +326,9 @@ impl CadCommand for BreakInteractiveCommand {
                 Some(CmdResult::NeedPoint)
             }
             "@" => self.p1.map(|point| CmdResult::BreakEntity {
-                handle, p1: point, p2: point,
+                handle,
+                p1: point,
+                p2: point,
             }),
             _ => None,
         }
@@ -295,7 +336,7 @@ impl CadCommand for BreakInteractiveCommand {
 
     fn on_entity_pick(&mut self, handle: Handle, pt: DVec3) -> CmdResult {
         if handle.is_null() {
-            return CmdResult::NeedPoint;
+            return CmdResult::ReportMeasurement(t!("No object found").into_owned());
         }
         self.target = Some(handle);
         self.p1 = Some(pt);
@@ -332,6 +373,12 @@ pub struct BreakAtPointCommand {
     target: Option<Handle>,
 }
 
+impl Default for BreakAtPointCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BreakAtPointCommand {
     pub fn new() -> Self {
         Self { target: None }
@@ -355,9 +402,13 @@ impl CadCommand for BreakAtPointCommand {
         self.target.is_none()
     }
 
+    fn typed_point_picks_entity(&self) -> bool {
+        true
+    }
+
     fn on_entity_pick(&mut self, handle: Handle, _pt: DVec3) -> CmdResult {
         if handle.is_null() {
-            return CmdResult::NeedPoint;
+            return CmdResult::ReportMeasurement(t!("No object found").into_owned());
         }
         self.target = Some(handle);
         CmdResult::NeedPoint
@@ -379,16 +430,17 @@ impl CadCommand for BreakAtPointCommand {
     }
 }
 
-
 // ── Autocomplete registry ─────────────────────────────────
-inventory::submit!(crate::command::CommandRegistration { names: &["BREAKATPOINT"] });  // BreakAtPointCommand
-inventory::submit!(crate::command::CommandRegistration { names: &["BREAK"] });  // BreakInteractiveCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["BREAKATPOINT"]
+}); // BreakAtPointCommand
+inventory::submit!(crate::command::CommandRegistration { names: &["BREAK"] }); // BreakInteractiveCommand
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::LwVertex;
-    use codec::types::Vector2;
+    use document::entities::LwVertex;
+    use document::types::Vector2;
 
     #[test]
     fn first_option_replaces_the_selection_point_and_at_reuses_it() {
@@ -399,10 +451,16 @@ mod tests {
             CmdResult::NeedPoint
         ));
         assert_eq!(command.options().len(), 1);
-        assert!(matches!(command.on_text_input("F"), Some(CmdResult::NeedPoint)));
+        assert!(matches!(
+            command.on_text_input("F"),
+            Some(CmdResult::NeedPoint)
+        ));
 
         let replacement = DVec3::new(3.0, 4.0, 0.0);
-        assert!(matches!(command.on_point(replacement), CmdResult::NeedPoint));
+        assert!(matches!(
+            command.on_point(replacement),
+            CmdResult::NeedPoint
+        ));
         assert!(matches!(
             command.on_text_input("@"),
             Some(CmdResult::BreakEntity { handle: result, p1, p2 })
@@ -426,8 +484,12 @@ mod tests {
 
         let fragments = break_lwpolyline(&polyline, first, second);
         assert_eq!(fragments.len(), 2);
-        let EntityType::LwPolyline(before) = &fragments[0] else { panic!("expected polyline") };
-        let EntityType::LwPolyline(after) = &fragments[1] else { panic!("expected polyline") };
+        let EntityType::LwPolyline(before) = &fragments[0] else {
+            panic!("expected polyline")
+        };
+        let EntityType::LwPolyline(after) = &fragments[1] else {
+            panic!("expected polyline")
+        };
         assert_eq!(before.normal, polyline.normal);
         assert_eq!(before.elevation, polyline.elevation);
         assert!((before.vertices[0].start_width - 2.0).abs() < 1e-12);

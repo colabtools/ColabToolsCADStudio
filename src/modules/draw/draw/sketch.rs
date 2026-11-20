@@ -1,10 +1,10 @@
 // Freehand sketch tool.
 
-use codec::entities::{Line, LwPolyline, LwVertex, Spline};
-use codec::types::{Vector2, Vector3};
-use codec::EntityType;
-use kernel::geom2d::NurbsCurve;
+use document::entities::{Line, LwPolyline, LwVertex, Spline};
+use document::types::{Vector2, Vector3};
+use document::EntityType;
 use glam::DVec3;
+use ocs_geom::geom2d::NurbsCurve;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, WorkingPlane};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
@@ -202,8 +202,7 @@ impl SketchCommand {
             .collect();
         let elevation = local.first()?.z;
         let points: Vec<[f64; 2]> = local.iter().map(|point| [point.x, point.y]).collect();
-        NurbsCurve::fit_polyline(&points, self.fit_distance())
-            .map(|curve| (curve, elevation))
+        NurbsCurve::fit_polyline(&points, self.fit_distance()).map(|curve| (curve, elevation))
     }
 
     fn fit_distance(&self) -> f64 {
@@ -236,9 +235,7 @@ impl SketchCommand {
                     .iter()
                     .map(|point| LwVertex::new(Vector2::new(point.x, point.y)))
                     .collect();
-                vec![self
-                    .plane
-                    .place_entity(EntityType::LwPolyline(polyline))]
+                vec![self.plane.place_entity(EntityType::LwPolyline(polyline))]
             }
             SketchType::Spline => {
                 let Some((curve, elevation)) = self.fit_curve(points) else {
@@ -324,7 +321,12 @@ impl SketchCommand {
             combined.extend(display.into_iter().map(|point| [point.x, point.y, point.z]));
         }
         (combined.len() >= 2).then(|| {
-            WireModel::solid_f64("sketch_preview".to_string(), combined, WireModel::CYAN, false)
+            WireModel::solid_f64(
+                "sketch_preview".to_string(),
+                combined,
+                WireModel::CYAN,
+                false,
+            )
         })
     }
 
@@ -347,7 +349,14 @@ impl SketchCommand {
         }
         options.extend([
             CmdOption::new("Record", "RECORD"),
-            CmdOption::new(if self.erasing { "Stop erasing" } else { "Erase" }, "ERASE"),
+            CmdOption::new(
+                if self.erasing {
+                    "Stop erasing"
+                } else {
+                    "Erase"
+                },
+                "ERASE",
+            ),
             CmdOption::new("Connect", "CONNECT"),
             CmdOption::new("Exit", "EXIT"),
             CmdOption::new("Quit", "QUIT"),
@@ -554,6 +563,12 @@ impl CadCommand for SketchCommand {
                 Some(result)
             }
         }
+    }
+
+    fn samples_motion(&self) -> bool {
+        // Only while the pen is actually recording: between strokes the
+        // preview is a function of the current point like any other command's.
+        self.stage == InputStage::Drawing && (self.pen_down || self.erasing)
     }
 
     fn on_mouse_move(&mut self, point: DVec3) -> Option<WireModel> {

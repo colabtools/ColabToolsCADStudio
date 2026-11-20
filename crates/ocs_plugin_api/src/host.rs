@@ -1,6 +1,6 @@
 //! Runtime host surface (`host` feature).
 //!
-//! [`HostApi`] is the `opencadcodec`-typed adapter a plugin uses at *dispatch* time
+//! [`HostApi`] is the `document`-typed adapter a plugin uses at *dispatch* time
 //! — document access, entity creation, XDATA, undo, and the command line. It is
 //! the stable counterpart to the dependency-free manifest/ribbon contract: a
 //! plugin's `dispatch` receives `&mut dyn HostApi` rather than the host's
@@ -16,19 +16,22 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::manifest::PluginManifest;
+use crate::manifest::{EntityClasses, PluginManifest};
 use crate::ribbon::CadModule;
 
-// Re-export the opencadcodec crate and the types that appear in the HostApi trait
-// so out-of-tree plugins can use them without adding their own opencadcodec
+// Re-export the document crate and the types that appear in the HostApi trait
+// so out-of-tree plugins can use them without adding their own document
 // dependency (which would risk an ABI-mismatching version).
-pub use codec;
-pub use codec::objects::{
+pub use document;
+pub use document as acadrust;
+// The name plugins used before the crate was renamed to document.
+pub use document as codec;
+pub use document::objects::{
     DictionaryCloningFlags, KnownXRecordKind, ProxyObjectReference, ProxyReferenceKind, XRecord,
     XRecordEntry, XRecordSection, XRecordValue, XRecordValueType,
 };
-pub use codec::xdata::{ExtendedDataRecord, XDataValue};
-pub use codec::{CadDocument, EntityType, Handle};
+pub use document::xdata::{ExtendedDataRecord, XDataValue};
+pub use document::{Document, EntityType, Handle};
 
 use crate::ipc::protocol::{PluginRequest, PluginResponse};
 
@@ -36,6 +39,16 @@ use crate::ipc::protocol::{PluginRequest, PluginResponse};
 /// Out-of-process V4 plugins implement this; in-process hosts may return `None`.
 pub trait PluginRequestSender: Send + Sync {
     fn request(&self, req: PluginRequest) -> Result<PluginResponse, PluginRequestError>;
+}
+
+/// One page of [`HostApi::query_entities`] (API v14).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntityPage {
+    pub entities: Vec<EntityType>,
+    /// Matches in the whole drawing, across all pages.
+    pub count: u64,
+    /// The `offset` of the next page; `None` on the last one.
+    pub next_offset: Option<u64>,
 }
 
 /// Error returned when a plugin worker thread cannot issue a host request.
@@ -65,15 +78,37 @@ pub enum LogLevel {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SolidPrimitive {
     /// Axis-aligned box from its center and full extents.
-    Box { center: [f64; 3], size: [f64; 3] },
+    Box {
+        center: [f64; 3],
+        size: [f64; 3],
+    },
     /// Right triangular prism from its minimum corner and extents.
-    Wedge { origin: [f64; 3], size: [f64; 3] },
+    Wedge {
+        origin: [f64; 3],
+        size: [f64; 3],
+    },
     /// Cylinder standing on the plane through `center`.
-    Cylinder { center: [f64; 3], radius: f64, height: f64 },
-    Sphere { center: [f64; 3], radius: f64 },
-    Torus { center: [f64; 3], major: f64, minor: f64 },
+    Cylinder {
+        center: [f64; 3],
+        radius: f64,
+        height: f64,
+    },
+    Sphere {
+        center: [f64; 3],
+        radius: f64,
+    },
+    Torus {
+        center: [f64; 3],
+        major: f64,
+        minor: f64,
+    },
     /// Regular pyramid with `sides` base edges.
-    Pyramid { center: [f64; 3], radius: f64, height: f64, sides: u32 },
+    Pyramid {
+        center: [f64; 3],
+        radius: f64,
+        height: f64,
+        sides: u32,
+    },
 }
 
 /// How two solids combine.
@@ -83,6 +118,39 @@ pub enum SolidBoolean {
     /// Remove the second solid from the first.
     Subtract,
     Intersect,
+}
+
+/// One pick of a [`PluginConstraint`]: the entity (or the point, for a
+/// free pick), the world point near the pick, and whether the whole curve
+/// (not a specific point on it) is meant. Resolution follows the interactive
+/// COINCIDENT/TANGENT pick logic (API v13, additive).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginConstraintPick {
+    #[serde(default)]
+    pub handle: Option<Handle>,
+    pub point: [f64; 3],
+    #[serde(default)]
+    pub whole_curve: bool,
+}
+
+/// A parametric constraint created through [`HostApi::constraint_create`]
+/// (API v13, additive): the same constraint machinery the interactive
+/// COINCIDENT (`GCCOINCIDENT`) and TANGENT (`TCONSTRAINT`) commands drive,
+/// reached directly — no command line, no prompt echo, one undo step under
+/// the entity-write contract (inside a plugin-opened `push_undo` scope the
+/// constraint joins that scope).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PluginConstraint {
+    /// A coincident constraint between the two picks.
+    Coincident {
+        first: PluginConstraintPick,
+        second: PluginConstraintPick,
+    },
+    /// A tangency constraint between the two picks.
+    Tangent {
+        first: PluginConstraintPick,
+        second: PluginConstraintPick,
+    },
 }
 
 /// One step of driving an OCS command from a script (API v7, additive). The
@@ -109,6 +177,13 @@ pub enum CommandRequest {
     Enter,
     /// Cancel the running command and close anything it left open.
     Cancel,
+    /// API v13 (additive): run a whole command line like [`Run`](Self::Run),
+    /// but with the COMMAND-LINE ECHO SUPPRESSED for the machine replay — no
+    /// prompts, no echo of internal machinery ("COINCIDENT Select first
+    /// point...", "SETVAR Bezeichnung der Variablen:"...). For plugin re-bond
+    /// and rebuild replays whose noise the user must not see; errors still
+    /// surface. The replay's undo composition is unchanged.
+    RunQuiet { line: String },
 }
 
 /// Where a command stands after a [`CommandRequest`].
@@ -159,12 +234,20 @@ pub enum TableOperation {
     /// Create a dimension style, optionally copying an existing one first.
     /// `properties` is a JSON object of DimStyle fields (see the Python docs);
     /// handles and xref fields are managed by the host and refused.
-    DimStyleCreate { name: String, copy_from: Option<String>, properties: String },
+    DimStyleCreate {
+        name: String,
+        copy_from: Option<String>,
+        properties: String,
+    },
     /// Change only the DimStyle fields the JSON object `properties` names.
     DimStyleModify { name: String, properties: String },
     /// Rename a text or dimension style; references to it follow. `Standard`
     /// is never renamed and a case-only change is refused.
-    StyleRename { kind: TableStyleKind, from: String, to: String },
+    StyleRename {
+        kind: TableStyleKind,
+        from: String,
+        to: String,
+    },
     /// Delete a text or dimension style that is neither current nor in use.
     /// `Standard` is never deleted.
     StyleDelete { kind: TableStyleKind, name: String },
@@ -200,9 +283,17 @@ pub enum TableOperation {
     /// Create a simple linetype. `pattern` is signed lengths in drawing units:
     /// positive is a dash, negative a gap, zero a dot (2-12 elements with at
     /// least one dash or dot and one gap). Returns the linetype's handle.
-    LinetypeCreate { name: String, description: String, pattern: Vec<f64> },
+    LinetypeCreate {
+        name: String,
+        description: String,
+        pattern: Vec<f64>,
+    },
     /// Change a simple linetype's description or pattern in place.
-    LinetypeModify { name: String, description: Option<String>, pattern: Option<Vec<f64>> },
+    LinetypeModify {
+        name: String,
+        description: Option<String>,
+        pattern: Option<Vec<f64>>,
+    },
     /// Rename a linetype; layers and entities that use it follow.
     LinetypeRename { from: String, to: String },
     /// Delete a linetype that no layer, entity, dimension style or the current
@@ -225,6 +316,16 @@ pub enum TableOperation {
         rotation: Option<u16>,
         scale: Option<[f64; 2]>,
     },
+    /// Put the paper-space layout tabs in this order (API v23). `names` lists
+    /// every paper-space layout once, in the new order; `Model` stays first
+    /// and is not listed. One undo step.
+    LayoutSetTabOrder { names: Vec<String> },
+    /// Set the drawing's custom properties (the Custom tab of DWGPROPS) (API
+    /// v26). Each `(name, value)` pair replaces the value of the property with
+    /// that name (matched trimmed, ignoring case) or is appended; properties
+    /// not listed are kept. Names must be non-empty and distinct. One undo
+    /// step; nothing is recorded when every value is already there.
+    CustomPropertiesSet { properties: Vec<(String, String)> },
 }
 
 /// The style tables `TableOperation` can rename, delete or make current.
@@ -257,7 +358,10 @@ pub struct TextStyleConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SolidOperation {
     /// Build a new solid on `layer` (layer `0` when `None`).
-    Create { primitive: SolidPrimitive, layer: Option<String> },
+    Create {
+        primitive: SolidPrimitive,
+        layer: Option<String>,
+    },
     /// Apply a rigid transform, given as a column-major 4x4 matrix, to an
     /// existing solid. Scaling and shear are refused.
     Transform { handle: Handle, matrix: [f64; 16] },
@@ -265,12 +369,25 @@ pub enum SolidOperation {
     /// ellipse, closed polyline or spline, ...). The new region goes on
     /// `layer`, or on the source's layer when `None`; `delete_source` erases
     /// the profile afterwards, as the REGION command does.
-    RegionFromProfile { source: Handle, layer: Option<String>, delete_source: bool },
+    RegionFromProfile {
+        source: Handle,
+        layer: Option<String>,
+        delete_source: bool,
+    },
     /// Build a plane surface from one closed planar profile entity.
-    SurfaceFromProfile { source: Handle, layer: Option<String>, delete_source: bool },
+    SurfaceFromProfile {
+        source: Handle,
+        layer: Option<String>,
+        delete_source: bool,
+    },
     /// Extrude a planar profile along `direction`: a solid when the profile is
     /// closed, a surface when it is open.
-    Extrude { source: Handle, direction: [f64; 3], layer: Option<String>, delete_source: bool },
+    Extrude {
+        source: Handle,
+        direction: [f64; 3],
+        layer: Option<String>,
+        delete_source: bool,
+    },
     /// Combine two solids into a new one. Both operands are consumed unless
     /// `keep_operands`; the result goes on `layer` or the first operand's
     /// layer. The kernel refuses some cases (coincident faces, cuts it has no
@@ -280,7 +397,12 @@ pub enum SolidOperation {
     /// `origin`, `width` drawing units wide, keeping the picture's aspect.
     /// PNG, JPEG and BMP are stored as read; other formats are re-encoded as
     /// PNG. The frame goes on `layer` (layer `0` when `None`).
-    EmbedPicture { path: String, origin: [f64; 3], width: f64, layer: Option<String> },
+    EmbedPicture {
+        path: String,
+        origin: [f64; 3],
+        width: f64,
+        layer: Option<String>,
+    },
     Boolean {
         first: Handle,
         second: Handle,
@@ -302,21 +424,101 @@ pub enum HostSettingValue {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum HostNotification {
-    InputLine { line: String },
+    InputLine {
+        line: String,
+    },
     Cancel,
-    DocumentChanged { version: u64 },
-    SelectionChanged { handles: Vec<Handle> },
+    DocumentChanged {
+        version: u64,
+    },
+    SelectionChanged {
+        handles: Vec<Handle>,
+    },
     Raw(Vec<u8>),
     /// V4 snapshot changed for a specific tab. Discriminant 5.
-    DocumentChangedV4 { tab_id: u64, version: u64 },
+    DocumentChangedV4 {
+        tab_id: u64,
+        version: u64,
+    },
     /// V4 tab closed notification. Discriminant 6.
-    DocumentTabClosed { tab_id: u64 },
+    DocumentTabClosed {
+        tab_id: u64,
+    },
     /// V4 selection changed for a specific tab. Discriminant 7.
-    SelectionChangedV4 { tab_id: u64, handles: Vec<Handle> },
+    SelectionChangedV4 {
+        tab_id: u64,
+        handles: Vec<Handle>,
+    },
     /// V7 active interactive-command state for a tab. Discriminant 8.
-    CommandStateChanged { tab_id: u64, command: Option<String> },
+    CommandStateChanged {
+        tab_id: u64,
+        command: Option<String>,
+    },
     /// V7 drawing epoch, broadcast even without an open shared view. Discriminant 9.
-    DrawingChanged { tab_id: u64, epoch: u64 },
+    DrawingChanged {
+        tab_id: u64,
+        epoch: u64,
+    },
+    /// V9 a document became resident in a tab: a whole document replaced the
+    /// tab's previous content — opened from file, created from a template, or
+    /// loaded by an automation/system open. The counterpart of
+    /// [`HostNotification::DocumentTabClosed`]: with both, a plugin can keep
+    /// per-document state (e.g. runtime designations) in sync from load to
+    /// close. Discriminant 10.
+    DocumentOpened {
+        tab_id: u64,
+    },
+    /// V13 a document boundary settled, carrying the DIRTY REGION — the
+    /// identity set of what changed since the previous boundary: the touched
+    /// entity handles, and the (entity, app-name) pairs of touched XRecords.
+    /// Sent alongside [`HostNotification::DocumentChanged`] at every boundary;
+    /// boundary work can then be O(changed) instead of O(store). Older
+    /// plugins decode it through the `Unknown` passthrough. Discriminant 11.
+    DocumentChangedRegions {
+        tab_id: u64,
+        version: u64,
+        entities: Vec<Handle>,
+        records: Vec<(Handle, String)>,
+    },
+    /// V7 panel control event (button click, value change). Discriminant 12.
+    PanelAction {
+        panel_id: String,
+        control_id: String,
+        action: String,
+        value: Option<crate::dialog::DialogValue>,
+    },
+    /// V15 quad cursor menu pick on a plugin-declared panel: the host runs
+    /// the item's `quadplugin:` dispatch (which resolves the target's
+    /// handles and type keys at pick time) and routes the pick to the OWNING
+    /// plugin only — the quad is not an active command, so this rides the
+    /// notification channel like [`HostNotification::PanelAction`] (v7) and
+    /// the discipline is the custom-grip one (v11): the runner only calls
+    /// the callback for plugins whose `ocs_plugin_api_version` reports 15 or
+    /// newer. The plugin fetches more context at action time via
+    /// `selection()` / `entities_batch()` — no streaming. Discriminant 13.
+    QuadAction {
+        panel_id: String,
+        control_id: String,
+        handles: Vec<Handle>,
+        type_keys: Vec<String>,
+        pick_point: [f64; 3],
+    },
+    /// V22 digest of a tab's active selection, sent INSTEAD OF the legacy
+    /// handle-list selection notifications (`SelectionChangedV4` /
+    /// `SelectionChanged`) to plugins whose exported
+    /// `ocs_plugin_api_version` reports 22 or newer (the host routes
+    /// per plugin, so no variant is duplicated). `revision` increases
+    /// monotonically per tab whenever the selection fingerprint actually
+    /// changes — the same dedup gate the legacy variants use — and `count`
+    /// is the exact selection size, so the notification is O(1) even for
+    /// selections of tens of thousands of entities. A plugin fetches
+    /// handles lazily via [`HostApi::selection`] only when it needs them.
+    /// Discriminant 14.
+    SelectionChangedDigest {
+        tab_id: u64,
+        revision: u64,
+        count: u64,
+    },
     /// Fallback for notification variants added in future minor revisions.
     /// Carries the raw bincode payload so an older peer can ignore it without
     /// failing deserialization.
@@ -329,57 +531,97 @@ impl Serialize for HostNotification {
         match self {
             HostNotification::InputLine { line } => {
                 bytes.push(0);
-                bincode::serialize_into(&mut bytes, line)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, line).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::Cancel => bytes.push(1),
             HostNotification::DocumentChanged { version } => {
                 bytes.push(2);
-                bincode::serialize_into(&mut bytes, version)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, version).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::SelectionChanged { handles } => {
                 bytes.push(3);
-                bincode::serialize_into(&mut bytes, handles)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, handles).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::Raw(data) => {
                 bytes.push(4);
-                bincode::serialize_into(&mut bytes, data)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, data).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::DocumentChangedV4 { tab_id, version } => {
                 bytes.push(5);
-                bincode::serialize_into(&mut bytes, tab_id)
-                    .map_err(serde::ser::Error::custom)?;
-                bincode::serialize_into(&mut bytes, version)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, version).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::DocumentTabClosed { tab_id } => {
                 bytes.push(6);
-                bincode::serialize_into(&mut bytes, tab_id)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::SelectionChangedV4 { tab_id, handles } => {
                 bytes.push(7);
-                bincode::serialize_into(&mut bytes, tab_id)
-                    .map_err(serde::ser::Error::custom)?;
-                bincode::serialize_into(&mut bytes, handles)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, handles).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::CommandStateChanged { tab_id, command } => {
                 bytes.push(8);
-                bincode::serialize_into(&mut bytes, tab_id)
-                    .map_err(serde::ser::Error::custom)?;
-                bincode::serialize_into(&mut bytes, command)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, command).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::DrawingChanged { tab_id, epoch } => {
                 bytes.push(9);
-                bincode::serialize_into(&mut bytes, tab_id)
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, epoch).map_err(serde::ser::Error::custom)?;
+            }
+            HostNotification::DocumentOpened { tab_id } => {
+                bytes.push(10);
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
+            }
+            HostNotification::DocumentChangedRegions {
+                tab_id,
+                version,
+                entities,
+                records,
+            } => {
+                bytes.push(11);
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, version).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, entities).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, records).map_err(serde::ser::Error::custom)?;
+            }
+            HostNotification::PanelAction {
+                panel_id,
+                control_id,
+                action,
+                value,
+            } => {
+                bytes.push(12);
+                bincode::serialize_into(&mut bytes, panel_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, control_id)
                     .map_err(serde::ser::Error::custom)?;
-                bincode::serialize_into(&mut bytes, epoch)
+                bincode::serialize_into(&mut bytes, action).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, value).map_err(serde::ser::Error::custom)?;
+            }
+            HostNotification::QuadAction {
+                panel_id,
+                control_id,
+                handles,
+                type_keys,
+                pick_point,
+            } => {
+                bytes.push(13);
+                bincode::serialize_into(&mut bytes, panel_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, control_id)
                     .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, handles).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, type_keys)
+                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, pick_point)
+                    .map_err(serde::ser::Error::custom)?;
+            }
+            HostNotification::SelectionChangedDigest { tab_id, revision, count } => {
+                bytes.push(14);
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, revision)
+                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, count).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::Unknown(raw) => bytes.extend_from_slice(raw),
         }
@@ -424,6 +666,65 @@ impl<'de> Deserialize<'de> for HostNotification {
             9 => bincode::deserialize(rest)
                 .map(|(tab_id, epoch)| HostNotification::DrawingChanged { tab_id, epoch })
                 .map_err(serde::de::Error::custom),
+            10 => bincode::deserialize(rest)
+                .map(|tab_id| HostNotification::DocumentOpened { tab_id })
+                .map_err(serde::de::Error::custom),
+            11 => {
+                let (tab_id, version, entities, records): (
+                    u64,
+                    u64,
+                    Vec<Handle>,
+                    Vec<(Handle, String)>,
+                ) = bincode::deserialize(rest).map_err(serde::de::Error::custom)?;
+                Ok(HostNotification::DocumentChangedRegions {
+                    tab_id,
+                    version,
+                    entities,
+                    records,
+                })
+            }
+            12 => {
+                let mut cursor = std::io::Cursor::new(rest);
+                let panel_id: String =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                let control_id: String =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                let action: String =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                let value: Option<crate::dialog::DialogValue> =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                Ok(HostNotification::PanelAction {
+                    panel_id,
+                    control_id,
+                    action,
+                    value,
+                })
+            }
+            13 => {
+                let mut cursor = std::io::Cursor::new(rest);
+                let panel_id: String =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                let control_id: String =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                let handles: Vec<Handle> =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                let type_keys: Vec<String> =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                let pick_point: [f64; 3] =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                Ok(HostNotification::QuadAction {
+                    panel_id,
+                    control_id,
+                    handles,
+                    type_keys,
+                    pick_point,
+                })
+            }
+            14 => bincode::deserialize(rest)
+                .map(|(tab_id, revision, count)| {
+                    HostNotification::SelectionChangedDigest { tab_id, revision, count }
+                })
+                .map_err(serde::de::Error::custom),
             _ => Ok(HostNotification::Unknown(bytes)),
         }
     }
@@ -434,14 +735,36 @@ impl<'de> Deserialize<'de> for HostNotification {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum PluginNotification {
-    Output { text: String },
-    Error { text: String },
-    Prompt { text: String },
-    Progress { percent: u8 },
-    Log { level: LogLevel, text: String },
+    Output {
+        text: String,
+    },
+    Error {
+        text: String,
+    },
+    Prompt {
+        text: String,
+    },
+    Progress {
+        percent: u8,
+    },
+    Log {
+        level: LogLevel,
+        text: String,
+    },
     Raw(Vec<u8>),
     /// V4 REPL status update. Discriminant 6.
-    ReplStatus { status: String, message: String },
+    ReplStatus {
+        status: String,
+        message: String,
+    },
+    /// V13 the runner's notification subscription is live: its main loop
+    /// entered and is draining host notifications. The host defers
+    /// boot-window broadcasts per process until this ack arrives (and flushes
+    /// them then), so a fresh boot's notifications can never race the
+    /// runner's startup — the notification-attach determinism the dispatch
+    /// table already has. Older hosts decode it through the `Unknown`
+    /// passthrough. Discriminant 7.
+    ChannelReady,
     /// Fallback for notification variants added in future minor revisions.
     /// Carries the raw bincode payload so an older peer can ignore it without
     /// failing deserialization.
@@ -454,43 +777,35 @@ impl Serialize for PluginNotification {
         match self {
             PluginNotification::Output { text } => {
                 bytes.push(0);
-                bincode::serialize_into(&mut bytes, text)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, text).map_err(serde::ser::Error::custom)?;
             }
             PluginNotification::Error { text } => {
                 bytes.push(1);
-                bincode::serialize_into(&mut bytes, text)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, text).map_err(serde::ser::Error::custom)?;
             }
             PluginNotification::Prompt { text } => {
                 bytes.push(2);
-                bincode::serialize_into(&mut bytes, text)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, text).map_err(serde::ser::Error::custom)?;
             }
             PluginNotification::Progress { percent } => {
                 bytes.push(3);
-                bincode::serialize_into(&mut bytes, percent)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, percent).map_err(serde::ser::Error::custom)?;
             }
             PluginNotification::Log { level, text } => {
                 bytes.push(4);
-                bincode::serialize_into(&mut bytes, level)
-                    .map_err(serde::ser::Error::custom)?;
-                bincode::serialize_into(&mut bytes, text)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, level).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, text).map_err(serde::ser::Error::custom)?;
             }
             PluginNotification::Raw(data) => {
                 bytes.push(5);
-                bincode::serialize_into(&mut bytes, data)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, data).map_err(serde::ser::Error::custom)?;
             }
             PluginNotification::ReplStatus { status, message } => {
                 bytes.push(6);
-                bincode::serialize_into(&mut bytes, status)
-                    .map_err(serde::ser::Error::custom)?;
-                bincode::serialize_into(&mut bytes, message)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, status).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, message).map_err(serde::ser::Error::custom)?;
             }
+            PluginNotification::ChannelReady => bytes.push(7),
             PluginNotification::Unknown(raw) => bytes.extend_from_slice(raw),
         }
         bytes.serialize(serializer)
@@ -519,8 +834,8 @@ impl<'de> Deserialize<'de> for PluginNotification {
                 .map(|percent| PluginNotification::Progress { percent })
                 .map_err(serde::de::Error::custom),
             4 => {
-                let (level, text): (LogLevel, String) = bincode::deserialize(rest)
-                    .map_err(serde::de::Error::custom)?;
+                let (level, text): (LogLevel, String) =
+                    bincode::deserialize(rest).map_err(serde::de::Error::custom)?;
                 Ok(PluginNotification::Log { level, text })
             }
             5 => bincode::deserialize(rest)
@@ -529,6 +844,7 @@ impl<'de> Deserialize<'de> for PluginNotification {
             6 => bincode::deserialize(rest)
                 .map(|(status, message)| PluginNotification::ReplStatus { status, message })
                 .map_err(serde::de::Error::custom),
+            7 => Ok(PluginNotification::ChannelReady),
             _ => Ok(PluginNotification::Unknown(bytes)),
         }
     }
@@ -572,6 +888,116 @@ pub trait BuiltinPlugin: Send + Sync {
     /// Added in API v5. The runner only calls this for plugins that report API
     /// major 5 or newer.
     fn on_load(&mut self, _host: &mut dyn HostApi) {}
+
+    /// Entity-class display declarations (API v10): the XDATA
+    /// class-identity keys the plugin stamps on entities, mapped to the
+    /// display labels the host shows while this plugin is loaded (e.g. the
+    /// Properties panel title becomes `"Linear Element (Line)"`). Display-only
+    /// — the labels never round-trip the drawing and never govern behavior;
+    /// entities carry only the stable identity keys in their XDATA.
+    ///
+    /// The default (`None`) declares no entity classes. The runner only calls
+    /// this for plugins whose exported `ocs_plugin_api_version` symbol reports
+    /// API major 10 or newer, so older cdylibs are never touched past their
+    /// vtable.
+    fn entity_classes(&self) -> Option<&'static EntityClasses> {
+        None
+    }
+
+    /// A drag event for one of this plugin's declared custom grips (API v11).
+    ///
+    /// The host calls this for the begin/move/settle/cancel phases of a drag
+    /// on a grip this plugin declared — and only for this plugin. `host` is a
+    /// full [`HostApi`] session: from inside the settle callback the plugin
+    /// can read the document/records and write — including opening its own
+    /// [`HostApi::push_undo`] scope — as the settle's only write window.
+    /// The settled drag totals exactly the plugin's one labeled undo step;
+    /// the host records none of its own.
+    ///
+    /// The returned [`CustomGripResponse::preview`] replaces the plugin's
+    /// live preview wire set; it is the only feedback the host shows during
+    /// the drag — the host draws no ghost and moves nothing. Cancel means
+    /// drop preview state with zero writes.
+    ///
+    /// The host guards this call: a panicking handler is contained and
+    /// reported, never fatal. The runner only calls this for plugins whose
+    /// exported `ocs_plugin_api_version` symbol reports API major 11 or
+    /// newer, so older cdylibs are never touched past their vtable.
+    fn on_custom_grip_event(
+        &mut self,
+        _host: &mut dyn HostApi,
+        _event: CustomGripEvent,
+    ) -> CustomGripResponse {
+        CustomGripResponse::default()
+    }
+
+    /// A quad cursor menu pick on one of this plugin's registered quad panels
+    /// (API v15). Delivered only to the OWNING plugin: the host intercepts
+    /// the `quadplugin:<plugin_id>:<panel_id>:<control_id>` dispatch and
+    /// routes it here (the pick head of the v7 PanelAction story, quad
+    /// thereof). `handles` / `type_keys` are the quad target's selection at
+    /// dispatch time (the host aligned hover-to-selection semantics before
+    /// delivering), `pick_point` is context-only (the host supplies a
+    /// best-effort world point; `[0.0; 3]` when none).
+    ///
+    /// `host` is a full [`HostApi`] session — reads and writes follow the
+    /// same laws as the custom-grip settle (v11): the plugin opens its own
+    /// [`HostApi::push_undo`] scope for writes.
+    ///
+    /// The host guards this call: a panicking handler is contained and
+    /// reported, never fatal. The runner only calls this for plugins whose
+    /// exported `ocs_plugin_api_version` symbol reports API major 15 or
+    /// newer, so older cdylibs are never touched past their vtable. The
+    /// default does nothing (old builtin plugins keep compiling).
+    fn on_quad_action(
+        &mut self,
+        _host: &mut dyn HostApi,
+        _panel_id: &str,
+        _control_id: &str,
+        _handles: &[Handle],
+        _type_keys: &[&str],
+        _pick_point: [f64; 3],
+    ) {
+    }
+
+    /// The typed operations this plugin offers to AI clients over the
+    /// automation bridge (API v25). The host lists them with the plugin and
+    /// calls one through [`Self::call_tool`]. The default offers none.
+    ///
+    /// The runner only calls this for plugins whose exported
+    /// `ocs_plugin_api_version` symbol reports API major 25 or newer.
+    fn tools(&self) -> Vec<PluginTool> {
+        Vec::new()
+    }
+
+    /// Run one of [`Self::tools`] (API v25). `arguments` is the JSON object
+    /// the client sent, already checked against the tool's `input_schema`;
+    /// the result is a JSON value as text, an `Err` a message for the client.
+    ///
+    /// `host` is the active tab's full [`HostApi`]: the host wraps the whole
+    /// call in one undo step named after the tool, so every write the call
+    /// makes undoes together. The host guards this call: a panic is contained
+    /// and reported as an error.
+    fn call_tool(
+        &mut self,
+        _host: &mut dyn HostApi,
+        name: &str,
+        _arguments: &str,
+    ) -> Result<String, String> {
+        Err(format!("unknown tool '{name}'"))
+    }
+}
+
+/// One operation a plugin offers to AI clients (API v25): see
+/// [`BuiltinPlugin::tools`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginTool {
+    /// Unique within the plugin; `[a-z0-9_]`, as clients address it.
+    pub name: String,
+    /// What the tool does and when to use it, written for the AI client.
+    pub description: String,
+    /// JSON Schema of the `arguments` object, as JSON text.
+    pub input_schema: String,
 }
 
 /// A point-driven interactive command a plugin starts via
@@ -609,6 +1035,75 @@ pub trait InteractiveCommand: Send {
     fn on_cursor_move(&mut self, _pt: [f64; 3]) -> Vec<PreviewWire> {
         Vec::new()
     }
+
+    /// When `true`, the host enters selection-gathering mode (as for `ssget`).
+    /// The user can pick objects or use window/crossing drag selection.
+    /// Handled selections trigger [`on_selection_complete`](Self::on_selection_complete).
+    fn is_selection_gathering(&self) -> bool {
+        false
+    }
+
+    /// When `true` (and `is_selection_gathering` is true), the host permits
+    /// window and crossing box drag selections to be completed.
+    fn accepts_drag_selection(&self) -> bool {
+        false
+    }
+
+    /// Called after a selection action completes while `is_selection_gathering` is true.
+    /// `handles` is the full set of currently selected entities.
+    fn on_selection_complete(&mut self, _handles: Vec<Handle>) -> CommandStep {
+        CommandStep::NeedPoint
+    }
+
+    /// Returns `true` when selection should reject entities on locked layers (e.g. ssget ":L").
+    fn selection_rejects_locked_layers(&self) -> bool {
+        false
+    }
+
+    /// An optional declarative modal dialog to display while this interactive command is active.
+    fn modal_dialog(&self) -> Option<crate::dialog::DialogDef> {
+        None
+    }
+
+    /// User submitted or cancelled the modal dialog.
+    fn on_dialog_response(&mut self, _response: crate::dialog::DialogResponse) -> CommandStep {
+        CommandStep::Done
+    }
+
+    /// Pending panel updates buffered during interactive command execution (API v7, additive).
+    fn take_pending_panel_updates(
+        &mut self,
+    ) -> Vec<(
+        String,
+        std::collections::HashMap<String, crate::dialog::DialogValue>,
+    )> {
+        Vec::new()
+    }
+
+    /// An interaction event (button click, choice select, file picked, etc.)
+    /// occurred inside an open modal dialog.
+    fn on_dialog_action(
+        &mut self,
+        _event: crate::dialog::DialogEvent,
+    ) -> crate::dialog::DialogActionResponse {
+        crate::dialog::DialogActionResponse::None
+    }
+
+    /// Mid-command Ctrl+Z (API v24). A command that collects several inputs
+    /// can take the undo itself — drop its last point and return the next
+    /// step, usually [`CommandStep::NeedPoint`], with `prompt` and
+    /// `on_cursor_move` following the shortened state — the way the host's
+    /// own multi-point commands pop their last vertex. `None` (the default)
+    /// leaves Ctrl+Z to the document undo.
+    ///
+    /// Only plugins whose manifest declares API v24 or newer are asked, and
+    /// the runner calls this slot only for plugins built against v24 or
+    /// newer, so older plugins keep the document undo. Out of process the
+    /// call carries no `HostApi`: it changes the command's own state and
+    /// answers with a step.
+    fn on_undo_step(&mut self) -> Option<CommandStep> {
+        None
+    }
 }
 
 /// A preview wire rendered in real-time during interactive commands.
@@ -641,7 +1136,10 @@ pub enum PreviewWire {
 impl PreviewWire {
     /// Create a polyline preview wire with default host cyan color.
     pub fn new(points: Vec<[f64; 3]>) -> Self {
-        Self::Polyline { points, color: None }
+        Self::Polyline {
+            points,
+            color: None,
+        }
     }
 
     /// Optional RGBA color (0.0 to 1.0) specified for this preview wire.
@@ -702,6 +1200,159 @@ impl From<Vec<[f64; 3]>> for PreviewWire {
     }
 }
 
+// ── Plugin grip surface (API v11, additive) ────────────────────────────────
+//
+// Three surfaces, one rule: plugin DECLARED, plugin OWNED. The host renders,
+// hit-tests and drags custom grips, but it never interprets them — every
+// semantic decision lives in the declaring plugin. The host applies no entity
+// mutation, constraint or record of its own when a custom grip settles; the
+// plugin learns of the drag through live [`CustomGripEvent`] frames, shows a
+// preview through the existing [`PreviewWire`] channel, and applies the settle
+// with its own HostApi writes inside its own [`HostApi::push_undo`] scope.
+
+/// One built-in grip of an entity as enumerated by
+/// [`HostApi::entity_grips`](HostApi::entity_grips) (API v11).
+///
+/// The shape and field semantics mirror the automation `grips` read: `grip_id`
+/// ist the entity-local grip index, `point` the grip's world position, and
+/// `moves_entity` true for translate grips (the same flag the interactive
+/// viewport uses to whole-entity moves).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GripInfo {
+    pub grip_id: usize,
+    pub point: [f64; 3],
+    #[serde(default)]
+    pub moves_entity: bool,
+    /// Debug name of the grip shape (e.g. `"Square"`).
+    pub shape: String,
+    /// Drag constraint direction, when the built-in grip declares one.
+    #[serde(default)]
+    pub axis: Option<[f64; 3]>,
+}
+
+/// Marker shape a plugin requests for a custom grip point (API v11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PluginGripShape {
+    #[default]
+    Square,
+    Circle,
+    Triangle,
+}
+
+/// A plugin-declared custom grip point (API v11).
+///
+/// The whole batch passed to
+/// [`set_plugin_grips`](HostApi::set_plugin_grips) REPLACES the declaring
+/// plugin's previous set; an empty batch clears it. Declaration is
+/// session-only display state: it is never written to the drawing file, and
+/// the plugin re-declares after its own notification boundaries
+/// (pull model — [`on_notification`](BuiltinPlugin::on_notification)).
+///
+/// `point` is an ABSOLUTE world point. The host never moves, offsets or
+/// auto-follows it when the `anchor` entity moves; an anchor exists for
+/// ownership scoping and hit-test legibility only. `axis`, when present,
+/// hard-constrains interactive drags to that direction line through the
+/// point; the drag events carry the projected point on the line.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginGrip {
+    pub grip_id: u64,
+    #[serde(default)]
+    pub anchor: Option<Handle>,
+    pub point: [f64; 3],
+    #[serde(default)]
+    pub axis: Option<[f64; 3]>,
+    /// API v21: constrain every custom-grip event to the original world-XY
+    /// plane. `false` preserves the legacy camera-target-plane behavior.
+    #[serde(default)]
+    pub xy_plane: bool,
+    #[serde(default)]
+    pub shape: PluginGripShape,
+}
+
+/// Drag phase of a [`CustomGripEvent`] (API v11).
+///
+/// Move events are coalesced (at most one is in flight to the plugin;
+/// superseded cursor positions are dropped); the settle and cancel phases
+/// are never coalesced or dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CustomGripPhase {
+    Begin,
+    Move,
+    Settle,
+    Cancel,
+}
+
+/// One drag event delivered to the owning plugin (API v11).
+///
+/// `point` is the CURRENT drag point: the projected cursor point with a
+/// hard-constrained axis, the point on the constraint line. The settle event
+/// carries the final point; cancel lets the plugin drop preview state with
+/// zero writes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomGripEvent {
+    pub grip_id: u64,
+    pub phase: CustomGripPhase,
+    pub point: [f64; 3],
+    #[serde(default)]
+    pub anchor: Option<Handle>,
+}
+
+/// The plugin's answer to a [`CustomGripEvent`] (API v11, additive).
+///
+/// `preview` REPLACES the plugin's live preview wire set; analytical arcs
+/// and circles render GPU-smooth. The plugin's preview is the only
+/// host-invented live feedback — the host draws no ghost of its own and
+/// moves nothing on its own during the drag.
+///
+/// `live_entities` (API v12, additive) is the plugin-directed LIVE-GEOMETRY
+/// channel — the plugin-owned twin of what a built-in grip drag shows: the
+/// CURRENT geometry of every affected entity (`(handle, entity)` pairs,
+/// computed by the plugin from the drag point, exactly what the settle will
+/// commit). The host applies them during the drag through the same
+/// visual-only dynamic phase its own grip drags use — the elements visibly
+/// move, ZERO history steps are recorded mid-drag, the whole visual state is
+/// discarded byte-identically on cancel, and the settle RESTORES the
+/// originals before the plugin's authoritative writes land in its own one
+/// undo scope. The host still interprets nothing: the plugin computes and
+/// returns every affected entity's live geometry per move. A response
+/// carrying only `preview` behaves exactly as before — the drawing stays
+/// static except for the preview wires. The payload is capped at
+/// [`MAX_PLUGIN_LIVE_ENTITIES`] per response; a larger set answers with a
+/// refused delivery (headline in the error queue), never a freeze.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CustomGripResponse {
+    #[serde(default)]
+    pub preview: Vec<PreviewWire>,
+    #[serde(default)]
+    pub live_entities: Vec<(Handle, EntityType)>,
+    /// A descriptor-backed live design for the dragged instance (API v14,
+    /// additive). Some on the Begin answer tells the host to derive the live
+    /// preview ITSELF from this design for the rest of the drag â€” re-evaluated
+    /// locally per coalesced cursor move, no further Move frames crossing the
+    /// IPC â€” instead of the plugin streaming preview/live-entity geometry per
+    /// move. The plugin's settle callback stays the only write window (its
+    /// own labeled undo step; records first, then the re-stage). Older hosts
+    /// deserialize the field to None and keep the v12 semantics untouched;
+    /// None keeps every current response behaving exactly as before.
+    #[serde(default)]
+    pub descriptor: Option<PluginDisplayDescriptor>,
+    /// (API v14, additive) THE per-move re-derivation tolerance of a
+    /// descriptor-backed drag — the same tolerance the plugin staged its
+    /// instance with: it bounds the drag's chord fits AND the per-move
+    /// seam continuity reads (one declared accuracy). `Some` must accompany the Begin answer's `descriptor`
+    /// (the host never invents a frame budget: a descriptor without a finite
+    /// positive tolerance leaves the v12 streaming semantics untouched, with
+    /// one headline in the error queue). Older hosts deserialize the field
+    /// to None.
+    #[serde(default)]
+    pub descriptor_tolerance: Option<f64>,
+}
+
+/// Per-response cap on live-geometry entities (API v12): the drag stays
+/// rubber-band smooth; wider chains should batch by kind (the plugin decides
+/// what must move) or co-design a lighter frame with the host.
+pub const MAX_PLUGIN_LIVE_ENTITIES: usize = 256;
+
 /// The outcome of an [`InteractiveCommand`] step.
 #[derive(Debug)]
 #[cfg_attr(feature = "host", derive(serde::Serialize, serde::Deserialize))]
@@ -724,6 +1375,8 @@ pub enum CommandStep {
     CommitMany(Vec<EntityType>),
     /// Commit multiple entities to the document and end the command.
     CommitManyAndEnd(Vec<EntityType>),
+    /// End the command and dispatch a command string to the host command line.
+    Dispatch(String),
 }
 
 /// Export a `BuiltinPlugin` from a `cdylib` so the host can load it at runtime.
@@ -742,6 +1395,32 @@ macro_rules! export_plugin {
         #[no_mangle]
         pub extern "C" fn ocs_plugin_api_version() -> u32 {
             $crate::API_VERSION
+        }
+
+        /// The whole runner, run by this plugin's own build so no Rust type
+        /// crosses the library boundary (API v14 and later). `socket` is the
+        /// host's socket name; returns the process exit code.
+        #[no_mangle]
+        pub extern "C" fn ocs_plugin_run(socket: *const ::std::os::raw::c_char) -> i32 {
+            if socket.is_null() {
+                return 2;
+            }
+            let socket = unsafe { ::std::ffi::CStr::from_ptr(socket) }
+                .to_string_lossy()
+                .into_owned();
+            match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                let plugin: ::std::boxed::Box<dyn $crate::host::BuiltinPlugin> =
+                    ::std::boxed::Box::new($ctor);
+                $crate::runner::run_with_plugin(&socket, $crate::API_VERSION, plugin)
+                    .map_err(|e| e.to_string())
+            })) {
+                ::std::result::Result::Ok(::std::result::Result::Ok(())) => 0,
+                ::std::result::Result::Ok(::std::result::Result::Err(e)) => {
+                    eprintln!("[plugin] {e}");
+                    1
+                }
+                ::std::result::Result::Err(_) => 2,
+            }
         }
 
         #[no_mangle]
@@ -769,7 +1448,7 @@ pub trait HostApi {
     fn tab_index(&self) -> usize;
 
     // ── Document ────────────────────────────────────────────────────────────
-    fn document(&self) -> &CadDocument;
+    fn document(&self) -> &Document;
     /// Mutable access to the active document.
     ///
     /// For an **out-of-process** plugin this borrows a *local snapshot*: edits
@@ -778,7 +1457,7 @@ pub trait HostApi {
     /// use [`add_entity`](Self::add_entity), [`update_entity`](Self::update_entity)
     /// and [`remove_entity`](Self::remove_entity), which are committed to the
     /// host document over IPC.
-    fn document_mut(&mut self) -> &mut CadDocument;
+    fn document_mut(&mut self) -> &mut Document;
 
     /// Add an entity to the active document, returning its handle.
     fn add_entity(&mut self, entity: EntityType) -> Handle;
@@ -818,6 +1497,28 @@ pub trait HostApi {
 
     // ── Undo / dirty ────────────────────────────────────────────────────────
     fn push_undo(&mut self, label: &str);
+    /// Open one undo step that spans several messages (API v14): every edit
+    /// until [`HostApi::end_undo_group`] joins it, including writes a worker
+    /// thread sends through [`HostApi::plugin_request_sender`], and
+    /// `push_undo` inside it opens nothing new. The step also closes when the
+    /// user runs a command of their own. The default is [`HostApi::push_undo`].
+    fn begin_undo_group(&mut self, label: &str) {
+        self.push_undo(label);
+    }
+    /// Close the step [`HostApi::begin_undo_group`] opened.
+    fn end_undo_group(&mut self) {}
+
+    /// The entities matching `query`, one page at a time (API v14). `query`
+    /// is the JSON of the control API's `query` operation, e.g.
+    /// `{"layer":"*-OPENBARE_RUIMTE_*","type":"Mesh","xdata_app":"OPENINFRA",
+    /// "bounds":[x0,y0,x1,y1],"offset":0,"limit":500}`: `layer` takes `*` and
+    /// `?`, `where` filters properties by JSON Pointer, and `limit` is at
+    /// most 10000. One message carries at most 64 MiB either way, so batch
+    /// writes and size pages to stay under it.
+    fn query_entities(&mut self, query: &str) -> Result<EntityPage, String> {
+        let _ = query;
+        Err("query_entities is not supported by this host".to_owned())
+    }
     fn set_dirty(&mut self);
 
     // ── Command line ────────────────────────────────────────────────────────
@@ -833,11 +1534,12 @@ pub trait HostApi {
     fn plugin_state_any(&self, plugin_id: &str) -> Option<&(dyn Any + Send + Sync)>;
     fn plugin_state_any_mut(&mut self, plugin_id: &str) -> Option<&mut (dyn Any + Send + Sync)>;
     /// Get the state for `plugin_id`, inserting `init()`'s result if absent.
+    /// Returns `None` when this host cannot store state (e.g. out-of-process).
     fn ensure_plugin_state_any(
         &mut self,
         plugin_id: &'static str,
         init: &mut dyn FnMut() -> Box<dyn Any + Send + Sync>,
-    ) -> &mut (dyn Any + Send + Sync);
+    ) -> Option<&mut (dyn Any + Send + Sync)>;
 
     // ── DocumentReader (added in API v3; appended at the end to keep vtable
     // indices stable for API v2 plugins) ─────────────────────────────────────
@@ -868,9 +1570,7 @@ pub trait HostApi {
     /// Returns the optional `command_id` used to correlate the notification
     /// with a running command, and the notification payload. Long-running
     /// plugins should call this periodically to drain the bounded queue.
-    fn try_recv_notification(
-        &mut self,
-    ) -> Option<(Option<u64>, HostNotification)> {
+    fn try_recv_notification(&mut self) -> Option<(Option<u64>, HostNotification)> {
         None
     }
 
@@ -921,6 +1621,12 @@ pub trait HostApi {
 
     /// Read a named host setting without invoking the command dispatcher.
     /// Names are case-insensitive. Hosts may support only a subset.
+    ///
+    /// The desktop host reads `CLAYER`, `CTAB`, `CTEXTSTYLE`, `CELTYPE` and
+    /// `SNAPANG`, and the drawing's numeric and point variables (`INSUNITS`,
+    /// `MEASUREMENT`, `LUNITS`, `LUPREC`, `LTSCALE`, `PDMODE`, `PDSIZE`,
+    /// `EXTMIN`, `EXTMAX`, `LIMMIN`, `LIMMAX`, `INSBASE`, ...). A point comes
+    /// back as text, `"x,y,z"`.
     fn system_variable(&self, _name: &str) -> Option<HostSettingValue> {
         None
     }
@@ -948,7 +1654,9 @@ pub trait HostApi {
     }
 
     /// Current ordered selection in this session's tab (API v7).
-    fn selection(&self) -> Vec<Handle> { Vec::new() }
+    fn selection(&self) -> Vec<Handle> {
+        Vec::new()
+    }
 
     /// Replace this tab's selection with exactly these handles, in order.
     /// Missing or duplicate handles reject the request (API v7).
@@ -1010,20 +1718,966 @@ pub trait HostApi {
         let _ = cmd;
         false
     }
+
+    // ── XRecord objects (added in API v8; appended at the end to keep vtable
+    // indices stable for older plugins) ────────────────────────────────────────
+
+    /// Create an XRecord named `name` under the dictionary addressed by
+    /// `dictionary_path`, storing `entries` (API v8, additive).
+    ///
+    /// The path is walked from the drawing's named-object dictionary root: an
+    /// empty path addresses the root itself, and missing intermediate
+    /// dictionaries are created, so the first call seeds a plugin's namespace.
+    /// Every refusal (empty or invalid names, a path fragment that names a
+    /// non-dictionary object, a name already in use — comparison is
+    /// case-insensitive like dictionary lookups) happens **before** any change,
+    /// so a failure leaves the drawing untouched. The record is registered in
+    /// its dictionary and owned by it; the returned handle stays stable across
+    /// updates.
+    ///
+    /// Undo composition — the entity-write contract: a mutation performed
+    /// inside a plugin-opened [`HostApi::push_undo`] scope joins that scope,
+    /// so an operation composed of several writes (entities and XRecords) is
+    /// a single undo step under the plugin's own label. With no scope open
+    /// the change is one undo step of its own. Refusals record no undo step.
+    fn create_xrecord(
+        &mut self,
+        _dictionary_path: &[&str],
+        _name: &str,
+        _entries: Vec<XRecordEntry>,
+    ) -> Result<Handle, String> {
+        Err("XRecord creation is not supported by this host".to_owned())
+    }
+
+    /// Read the entries of an existing XRecord by name (API v8, additive).
+    ///
+    /// Resolves `dictionary_path` under the named-object dictionary root and
+    /// returns the record's entries verbatim. Fails when the path, the name or
+    /// the record is missing, or when the name addresses a different object
+    /// kind.
+    fn read_xrecord(
+        &self,
+        _dictionary_path: &[&str],
+        _name: &str,
+    ) -> Result<Vec<XRecordEntry>, String> {
+        Err("XRecord reads are not supported by this host".to_owned())
+    }
+
+    /// Atomically replace the entries of an existing XRecord (API v8,
+    /// additive). Returns the record's handle.
+    ///
+    /// Neither the path nor its dictionaries are created: an update must never
+    /// create anything silently. Identity (handle, owning dictionary) stays;
+    /// the entries and their DWG handle-reference stream are replaced and the
+    /// record's verbatim raw payloads are dropped, so subsequent saves emit the
+    /// new content. A refusal leaves the drawing untouched. Undo composition —
+    /// the entity-write contract: a mutation inside a plugin-opened
+    /// [`HostApi::push_undo`] scope joins that scope; with no scope open it is
+    /// one undo step of its own, whose undo restores the previous entries
+    /// byte-exactly. Refusals record no undo step.
+    fn update_xrecord(
+        &mut self,
+        _dictionary_path: &[&str],
+        _name: &str,
+        _entries: Vec<XRecordEntry>,
+    ) -> Result<Handle, String> {
+        Err("XRecord updates are not supported by this host".to_owned())
+    }
+
+    /// Delete the XRecord named `name` and its dictionary entry (API v8,
+    /// additive). Returns the removed record, so audits keep the prior
+    /// content. A refusal leaves the drawing untouched. Undo composition — the
+    /// entity-write contract: a mutation inside a plugin-opened
+    /// [`HostApi::push_undo`] scope joins that scope; with no scope open it is
+    /// one undo step of its own. Refusals record no undo step.
+    fn delete_xrecord(
+        &mut self,
+        _dictionary_path: &[&str],
+        _name: &str,
+    ) -> Result<XRecord, String> {
+        Err("XRecord deletes are not supported by this host".to_owned())
+    }
+
+    /// List the XRecord names under the dictionary addressed by
+    /// `dictionary_path` (API v8, additive).
+    ///
+    /// Returns only the dictionary keys that address XRecord objects, in the
+    /// dictionary's own order, so consumers can audit and export without
+    /// knowing names in advance. Fails when the path does not address a
+    /// dictionary.
+    fn list_xrecords(&self, _dictionary_path: &[&str]) -> Result<Vec<String>, String> {
+        Err("XRecord listing is not supported by this host".to_owned())
+    }
+
+    // ── Reference-only designation (added in API v9; appended at the end to
+    // keep vtable indices stable for older plugins) ──────────────────────────
+
+    /// Mark (or unmark) an entity as reference-only (API v9, additive).
+    ///
+    /// A reference-only entity is plugin-owned display geometry: it renders
+    /// normally, but the built-in edit paths treat it like an entity on a
+    /// locked layer — it is neither grip-editable nor click-pickable (a click
+    /// passes through to the editable entity underneath), window and box
+    /// selections skip it, and user-driven writes refuse it. The owning
+    /// plugin keeps full write access through this API: `update_entity`,
+    /// [`update_entities_transaction`](HostApi::update_entities_transaction),
+    /// `remove_entity` and the XDATA record methods keep working, so derived
+    /// display geometry can be refreshed in place.
+    ///
+    /// The designation is a scene-scoped, in-memory set keyed by entity
+    /// handle: it is not written to the saved DWG/DXF (the host stores no
+    /// state of its own in the file), it lives and dies with the drawing tab,
+    /// and a reloaded drawing starts undesignated — the owning plugin
+    /// re-marks its entities when
+    /// [`on_notification`](BuiltinPlugin::on_notification) delivers
+    /// [`HostNotification::DocumentOpened`], making the in-memory designation
+    /// fully equivalent to a persisted one for its use case.
+    ///
+    /// Fails when the entity does not exist or is on a locked layer (the same
+    /// policy as the XDATA record methods). A call that would not change the
+    /// current designation succeeds without recording an undo step — and
+    /// without publishing a document change, so idempotent re-marks cannot
+    /// loop with the notification dispatch.
+    ///
+    /// Undo composition — the entity-write contract: a change performed
+    /// inside a plugin-opened [`HostApi::push_undo`] scope joins that scope,
+    /// so an operation composed of several writes is a single undo step under
+    /// the plugin's own label. With no scope open the change is one undo step
+    /// of its own. Refusals record no undo step.
+    fn set_reference_only(&mut self, _handle: Handle, _reference_only: bool) -> Result<(), String> {
+        Err("The reference-only designation is not supported by this host".to_owned())
+    }
+
+    // ── Plugin grip surface (added in API v11; appended at the end to keep
+    // vtable indices stable for older plugins) ─────────────────────────────
+
+    /// Enumerate an entity's built-in grips (API v11, additive).
+    ///
+    /// Generic over every entity type: the answer is whatever the entity's
+    /// own grip producers define (an arc answers center / endpoints / its
+    /// mid-arc radius grip, a spline its control points, and so on), with
+    /// the same shape and field semantics the automation `grips` read and
+    /// the interactive viewport expose. Reference-only entities and entities
+    /// on locked layers answer an empty list — the same answer the viewport
+    /// would give. Fails when the handle does not address an entity.
+    fn entity_grips(&self, _handle: Handle) -> Result<Vec<GripInfo>, String> {
+        Err("Grip reads are not supported by this host".to_owned())
+    }
+
+    /// Perform the grip edit an interactive drag would perform (API v11,
+    /// additive).
+    ///
+    /// Drives exactly the machinery of the viewport drag: the entity-typed
+    /// grip modes, snaps and ortho/polar off for the move, one undo step
+    /// labeled like the interactive grip step, byte-exact restore on undo.
+    /// Refusal parity: fails for unknown handles/grip ids, reference-only
+    /// entities and locked layers.
+    fn grip_drag(&mut self, _handle: Handle, _grip_id: usize, _to: [f64; 3]) -> Result<(), String> {
+        Err("Programmatic grip drags are not supported by this host".to_owned())
+    }
+
+    /// Declare (or clear) the calling plugin's custom grip points (API v11,
+    /// additive, V4 transport only).
+    ///
+    /// The batch REPLACES the plugin's previous set; an empty batch clears
+    /// it. The host renders the points, hit-tests them with priority over
+    /// click-through (reference-only) geometry, and routes drags on them
+    /// back to the plugin as [`CustomGripEvent`]s — the host interprets
+    /// nothing. Declaration is session display state: nothing of it is
+    /// persisted in the drawing file, and the set dies with the plugin's
+    /// process. Only the declaring plugin ever receives its grips' events.
+    ///
+    /// `plugin_id` is fixed by the host transport: over the plugin IPC the
+    /// host attaches the serving process's own manifest id and refuses
+    /// mismatches, so a plugin cannot declare grips in another plugin's
+    /// name.
+    fn set_plugin_grips(
+        &mut self,
+        _plugin_id: &str,
+        _grips: Vec<PluginGrip>,
+    ) -> Result<(), String> {
+        Err("Plugin grip points are not supported by this host".to_owned())
+    }
+
+    /// Read specific entities by handle (API v12, additive).
+    ///
+    /// Cheap per-entity reads for refresh passes — the answer is the LIVE
+    /// document's current entity per handle (`None` for an unknown handle).
+    /// Use these instead of re-taking a document snapshot after writes: the
+    /// session snapshot is invalidated by every write, so read-after-write
+    /// loops through it re-clone the full document each time (the per-boundary
+    /// quadratic). Fails only when the tab does not exist.
+    fn entities_batch(&self, _handles: &[Handle]) -> Result<Vec<Option<EntityType>>, String> {
+        Err("Per-entity batch reads are not supported by this host".to_owned())
+    }
+
+    /// Create a parametric constraint directly (API v13, additive).
+    ///
+    /// The same constraint machinery the interactive COINCIDENT/TANGENT
+    /// commands drive, reached without the command line: no prompts, no echo,
+    /// the solver runs exactly as interactively. Undo composition follows the
+    /// entity-write contract — inside a plugin-opened `push_undo` scope the
+    /// constraint joins that scope (a re-bond composed of writes + constraints
+    /// is the plugin's single labeled step); with no scope open it is one
+    /// step of its own. A refusal records no undo step.
+    fn constraint_create(&mut self, _constraint: PluginConstraint) -> Result<(), String> {
+        Err("Constraint creation is not supported by this host".to_owned())
+    }
+
+    /// Read several XRecords in ONE round trip (API v13, additive).
+    ///
+    /// The batched twin of [`read_xrecord`](Self::read_xrecord): one frame
+    /// answers every entry (`Err` per missing path/name instead of failing
+    /// the whole batch). The consumer's store walk collapses from
+    /// list + one-read-per-record to one frame.
+    fn read_xrecords(
+        &self,
+        _reads: &[XRecordRead],
+    ) -> Result<Vec<Result<Vec<XRecordEntry>, String>>, String> {
+        Err("Batched XRecord reads are not supported by this host".to_owned())
+    }
+
+    /// Atomically replace the entries of several XRecords in ONE round trip
+    /// (API v13, additive). Each entry applies the single-update contract
+    /// (identity kept, verbatim raw payloads dropped, refusals change
+    /// nothing); the whole batch shares the entity-write undo contract —
+    /// inside a plugin-opened `push_undo` scope the batch joins that scope as
+    /// the plugin's single labeled step.
+    fn update_xrecords(
+        &mut self,
+        _updates: &[XRecordUpdate],
+    ) -> Result<Vec<Result<Handle, String>>, String> {
+        Err("Batched XRecord updates are not supported by this host".to_owned())
+    }
+
+    /// List the XRecord names under a dictionary path WITH their entries in
+    /// ONE answer (API v13, additive): most consumers' whole discovery walk
+    /// (list, then one read per record) becomes a single frame.
+    fn list_xrecords_with_entries(
+        &self,
+        _dictionary_path: &[&str],
+    ) -> Result<Vec<(String, Vec<XRecordEntry>)>, String> {
+        Err("XRecord listing with entries is not supported by this host".to_owned())
+    }
+
+    /// Turn a declared parametric alignment chain into reference-only display
+    /// geometry (API v14, additive).
+    ///
+    /// The chain carries the record layer's truth — curve definitions
+    /// (length, driving-quantity ramp, cross-slope data) plus the continuity
+    /// fields (start point/direction) — and the host owns the evaluation: a
+    /// generic Gaussian-Q kernel plus the closed forms a ramp class admits.
+    /// Staged carriers: an exact standard entity where one exists GENERICALLY
+    /// (a constant-zero plan ramp stages a line, any other constant plan
+    /// ramp an arc; a profile ramp that is an at-most-quadratic polynomial
+    /// in the run stages an exact clamped Hermite spline of degree up to 3,
+    /// a constant profile slope a line) and bounded LwPolyline chords within
+    /// `tolerance` otherwise — the same `tolerance` bounds the seam
+    /// audit's continuity reads (one declared accuracy per chain) —
+    /// (table ramps and every other law — measured,
+    /// refined chords, never a guessed shape). Chains are audited
+    /// seam-to-seam BEFORE anything is staged
+    /// (refused with the audited pair named on mismatch), and a chain that
+    /// would need more display entities than
+    /// [`MAX_PLUGIN_LIVE_ENTITIES`](self::MAX_PLUGIN_LIVE_ENTITIES) publishes
+    /// nothing.
+    ///
+    /// Undo composition follows the entity-write contract: inside a
+    /// plugin-opened `push_undo` scope the staged set joins that scope; with
+    /// no scope open it is one step of its own; a refusal records no step.
+    /// Staged entities are marked reference-only (plugin-owned display
+    /// data). The designation is scene state: like every designation it is
+    /// not persisted in the file, so the marking plugin re-applies it on
+    /// reopen.
+    fn stage_parametric_chain(
+        &mut self,
+        _reference_name: &str,
+        _chain: &ParametricChain,
+        _tolerance: f64,
+    ) -> Result<Vec<Handle>, String> {
+        Err("Parametric chain staging is not supported by this host".to_owned())
+    }
+
+    /// Evaluate a declared parametric chain at chain position `s` (API v14,
+    /// additive): the same engine the staging builds from, exposed for
+    /// placement and basis-curve reads. Pure evaluation — no document state,
+    /// no undo, no publish. `s` is measured along the chain's declared
+    /// segment lengths from the chain start; outside the chain it answers
+    /// `None`.
+    fn sample_parametric(
+        &self,
+        _chain: &ParametricChain,
+        _s: f64,
+    ) -> Result<Option<ParametricSample>, String> {
+        Err("Parametric chain sampling is not supported by this host".to_owned())
+    }
+
+    /// Register a plugin-scoped entity class (API v14, additive).
+    ///
+    /// The declaration is session state, exactly like the grip sets: the
+    /// drawing file keeps only what the instances stamp (XDATA identity keys,
+    /// entity-bound records) plus the plugin's own record-layer XRecords —
+    /// never the class registry itself; the plugin re-declares on load and
+    /// after its own notification boundaries. Re-registering `class_id` with
+    /// an EQUAL schema (same `schema_version` and grip ids/parameter names)
+    /// is idempotent; any mismatch refuses without touching the live class —
+    /// a parameter-set change is a RE-STAGE of the instances, not a hot
+    /// schema swap.
+    ///
+    /// The grip schema is the class-scoped surface of the v11 grip rule: it
+    /// names the parameters the class's grips drive (ids must match the
+    /// plugin's later [`HostApi::set_plugin_grips`] declarations for these
+    /// instances). The host stores it for instance validation; grip
+    /// interpretation stays the plugin's per the v11 law.
+    fn register_plugin_class(
+        &mut self,
+        _plugin_id: &str,
+        _class: &PluginClassDeclaration,
+    ) -> Result<(), String> {
+        Err("Plugin class registration is not supported by this host".to_owned())
+    }
+
+    /// Stage one instance of a session-registered plugin class (API v14,
+    /// additive).
+    ///
+    /// The generalized form of [`HostApi::stage_parametric_chain`]: the
+    /// instance carries only identity — class id, schema version, layer,
+    /// record linkage — and a HOST-EVALUATED display descriptor
+    /// ([`PluginDisplayDescriptor`]; the v14 parametric engine is the first
+    /// host-known kind, so a `ParametricChain` design stages through exactly
+    /// the audited-seam/cap/refusal/undo contract of chain staging). The
+    /// staged set is reference-only (the designation machinery transfers
+    /// verbatim), stamped with the class identity key, and the instance's
+    /// record linkage (`design_record`) rides the record layer as usual: the
+    /// definition lives in records, host and file never grow a new runtime.
+    /// Refusals precede any change and record no undo step; otherwise one
+    /// batched add, one geometry bump, one publish — one step of its own
+    /// unless a plugin `push_undo` scope is open, which it joins.
+    fn stage_plugin_class_instance(
+        &mut self,
+        _plugin_id: &str,
+        _instance: &PluginClassInstance,
+    ) -> Result<Vec<Handle>, String> {
+        Err("Plugin class instance staging is not supported by this host".to_owned())
+    }
+
+    /// Read a class instance's declared parameter rows (API v14, additive —
+    /// the read half of the session's properties pair, carried by
+    /// `PluginRequest::PluginClassInstanceProperties` /
+    /// `PluginResponse::PluginClassInstancePropertiesResult`). The identity
+    /// stamp (the entity's XDATA class key) resolves the session-registered
+    /// class, the design-record linkage resolves under the named-object
+    /// dictionary, and every declared parameter reads its (name, value)
+    /// entry pair. Values print exactly what the record row carries — the
+    /// host never invents units or semantics for a name or kind it does not
+    /// declare. Strict on purpose: a missing entity, a broken linkage or a
+    /// stale schema refuses — the caller re-stages.
+    fn plugin_class_instance_properties(
+        &self,
+        _handle: Handle,
+    ) -> Result<Vec<PluginClassParameterRow>, String> {
+        Err("Plugin class instance properties are not supported by this host".to_owned())
+    }
+
+    /// Display a declarative modal form dialog and wait for user submission
+    /// or cancellation (API v7, additive).
+    fn show_dialog(&mut self, _dialog: crate::dialog::DialogDef) -> crate::dialog::DialogResponse {
+        crate::dialog::DialogResponse::Cancelled
+    }
+
+    /// Register a persistent dockable side panel / palette (API v7, additive).
+    fn register_panel(&mut self, _panel: crate::dialog::PanelDef) -> bool {
+        false
+    }
+
+    /// Update control values in a persistent dockable side panel or an active
+    /// modal dialog (API v7, additive).
+    fn update_panel(
+        &mut self,
+        _panel_id: &str,
+        _values: std::collections::HashMap<String, crate::dialog::DialogValue>,
+    ) -> bool {
+        false
+    }
+
+    /// Toggle visibility or show/hide a persistent dockable side panel (API v7, additive).
+    fn toggle_panel(&mut self, _panel_id: &str, _show: Option<bool>) -> bool {
+        false
+    }
+
+    /// Register declarative quad cursor menu panels for the calling plugin
+    /// (API v15, additive; mirrors [`HostApi::register_panel`]).
+    ///
+    /// `plugin_id` is the identity of the caller (v15 quad panels are
+    /// owner-tracked: one plugin's registration can never replace or remove
+    /// another plugin's panel, and the server fixes the id from the
+    /// transport). Registration is per-panel and replace-if-same-owner.
+    /// Returns one outcome per panel (request order); the host documents the
+    /// refusal reasons itself (per-plugin caps, duplicate control ids, an id
+    /// owned by a different plugin).
+    ///
+    /// The default (hosts that predate v15) refuses every panel.
+    fn register_quad_panels(
+        &mut self,
+        _plugin_id: &str,
+        panels: &[crate::dialog::QuadPanelDef],
+    ) -> Vec<bool> {
+        vec![false; panels.len()]
+    }
+
+    /// Remove the calling plugin's quad panels (API v15, additive). The
+    /// ownership law runs both ways: `plugin_id` is the caller's identity
+    /// (mirroring [`HostApi::register_quad_panels`]; over the plugin IPC the
+    /// server fixes it from the transport) and a `panel_ids` entry another
+    /// plugin owns is refused, not removed. Returns one outcome per id
+    /// (request order). The default refuses every id (the lengths of the
+    /// default answers mirror the request, so a plugin can rely on the
+    /// shape).
+    fn unregister_quad_panels(&mut self, _plugin_id: &str, panel_ids: &[&str]) -> Vec<bool> {
+        vec![false; panel_ids.len()]
+    }
+
+    /// Validate a declared parametric chain without staging it (additive).
+    ///
+    /// Capable hosts run the same structural, seam, cap and chord-refinement
+    /// audit as staging, discarding the resulting display entities. This is a
+    /// pure read: no document, undo, publish, dirty or cache state changes.
+    fn validate_parametric_chain(
+        &self,
+        _chain: &ParametricChain,
+        _tolerance: f64,
+    ) -> Result<(), String> {
+        Err("Parametric chain validation is not supported by this host".to_owned())
+    }
+
+    /// Display a declarative modal form dialog associated with a specific
+    /// owning plugin ID. Defaults to [`HostApi::show_dialog`].
+    fn show_dialog_for_plugin(
+        &mut self,
+        _plugin_id: &str,
+        dialog: crate::dialog::DialogDef,
+    ) -> crate::dialog::DialogResponse {
+        self.show_dialog(dialog)
+    }
+
+    /// Read the current form contents of a registered persistent panel (API v18,
+    /// additive).
+    ///
+    /// This is only a read snapshot during ordinary document-bound command dispatch:
+    /// it submits nothing, writes neither UI nor document state, and records no undo
+    /// step. The returned [`crate::dialog::PanelSnapshot`] is UI input, not document
+    /// authority or a document revision. An asynchronous
+    /// [`HostNotification::PanelAction`] is not a write window and carries no write
+    /// authority; it may only ask the plugin to enter ordinary command dispatch.
+    ///
+    /// Before any write based on a snapshot, the plugin must reject every snapshot
+    /// whose `errors` is non-empty, re-read the authoritative document records, and
+    /// validate that the intended target still exists and is suitable. Only then may
+    /// it perform the write under the ordinary undo contract. The default refuses the
+    /// read so hosts without panel read-back support fail closed.
+    fn panel_snapshot(&self, _panel_id: &str) -> Result<crate::dialog::PanelSnapshot, String> {
+        Err("Panel snapshots are not supported by this host".to_owned())
+    }
+
+    // ---- Panel identity (api 18, additive defaults; appended at the ABI tail). ----
+    //
+    // These methods receive identity from the host's authenticated transport,
+    // not from a PanelDef or a caller-chosen command argument. Direct HostApi
+    // implementers retain their legacy registration/update behavior. An IPC
+    // server must call the `_for_plugin` variants with its transport identity.
+    // No asynchronous notification acquires HostApi through these methods.
+
+    /// Register a panel with host-authenticated ownership. The default keeps
+    /// the legacy direct-host behavior; identity-aware hosts override it.
+    fn register_panel_for_plugin(
+        &mut self,
+        _plugin_id: &str,
+        panel: crate::dialog::PanelDef,
+    ) -> bool {
+        self.register_panel(panel)
+    }
+
+    /// Update only a panel owned by the authenticated caller.
+    fn update_panel_for_plugin(
+        &mut self,
+        _plugin_id: &str,
+        panel_id: &str,
+        values: std::collections::HashMap<String, crate::dialog::DialogValue>,
+    ) -> bool {
+        self.update_panel(panel_id, values)
+    }
+
+    /// Toggle only a panel owned by the authenticated caller.
+    fn toggle_panel_for_plugin(
+        &mut self,
+        _plugin_id: &str,
+        panel_id: &str,
+        show: Option<bool>,
+    ) -> bool {
+        self.toggle_panel(panel_id, show)
+    }
+
+    /// Read a panel after the host has authenticated its transport owner.
+    /// The returned tab is the current document-bound session's tab, not a
+    /// caller-provided target. Old hosts fail closed instead of returning an
+    /// unowned or fabricated snapshot.
+    fn panel_snapshot_for_plugin(
+        &self,
+        _plugin_id: &str,
+        _panel_id: &str,
+    ) -> Result<crate::dialog::PanelSnapshot, String> {
+        Err("Authenticated panel snapshots are not supported by this host".to_owned())
+    }
+
+    /// Create or update the drawing's geographic location (API v22,
+    /// additive): the model-space GEODATA object and its
+    /// `ACAD_GEOGRAPHICDATA` extension-dictionary entry, so other CAD
+    /// programs open the drawing georeferenced. Returns the object's handle.
+    /// A refusal (unknown CRS, non-finite point, zero north) changes nothing.
+    /// Undo composition follows [`HostApi::delete_xrecord`].
+    fn set_geo_location(&mut self, _location: &GeoLocation) -> Result<Handle, String> {
+        Err("Geographic location writes are not supported by this host".to_owned())
+    }
+
+    /// Remove the drawing's geographic location (API v22, additive). Returns
+    /// `false` when the drawing had none (no undo step is recorded then).
+    fn remove_geo_location(&mut self) -> Result<bool, String> {
+        Err("Geographic location writes are not supported by this host".to_owned())
+    }
+}
+
+/// **Parametric-chain staging types (api 14, the v2 generic shapes).**
+///
+/// The declared-data contract for alignment chains the host stages from
+/// ramps declared as DATA. The wire carries the record layer's declared
+/// truth only — curve definitions and continuity — and the host owns the
+/// evaluation (curve integrals), the seam audit and the reference-only
+/// display staging. There is NO host-side species vocabulary: which
+/// quantity a ramp drives per plane, which laws the record model restates
+/// with which ramp payloads, and what a segment's ends must be are the
+/// declaring plugin's own semantics; the host refuses only what it can
+/// state generically (see [`CurveSegmentDef`]). The IFC 4.3 alignment
+/// libraries that reuse this contract live in plugins (e.g. the civil-ifc
+/// crate), not in this host.
+///
+/// Staged carriers: constant plan ramps as `Line`/`Arc` (exact), profile
+/// slope ramps that are at-most-quadratic polynomials in the run as exact
+/// clamped Hermite splines of degree up to 3 (const slopes as lines), and
+/// everything else as measured-deviation LwPolyline chords within the
+/// declared tolerance. A HELIX entity is never produced: the codec's
+/// Helix is a 3D constant-pitch space spiral, and a plan ramp curve is a
+/// 2D law — staging one for the other would be mathematically wrong.
+///
+/// The plane a parametric chain lives in. A chain is single-plane: the
+/// driving quantity reads as the plan curvature in the plan plane and as
+/// the profile slope in the profile plane (the record model's two sheets).
+///
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParametricPlane {
+    /// Plan view: world (x, y) coordinates in the drawing's model plane,
+    /// bearings in radians CCW from +x (±2π-legal, normalized by the host).
+    Plan,
+    /// Profile sheet: (station, elevation) coordinates — x = the distance
+    /// along the horizontal alignment, y = height, exactly the
+    /// IfcAlignmentVerticalSegment frame. No rotation applies.
+    Profile,
+}
+
+/// One declared segment of a parametric chain (api 14, the v2 shape).
+///
+/// Only continuity and the law ride the wire: the curve definition plus the
+/// start point and direction. There is no species enum and no per-species
+/// quantity vocabulary (gradients, radii, curvature-end fields, bank/cant
+/// fields): the driving ramp IS the law, declared as data, and every
+/// record-model reading of those names stays in the declaring plugin. The
+/// host evaluates the generic contract only (see [`CurveSegmentDef`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParametricSegment {
+    /// The curve definition: length, the driving ramp, the cross-slope data.
+    pub def: CurveSegmentDef,
+    /// Start point: plan = world (x, y); profile = (station, elevation).
+    pub start_point: [f64; 2],
+    /// Declared start direction, radians, ±2π-legal. Plan: bearing. Profile:
+    /// the slope angle as the record declares it (the slope itself is the
+    /// driving ramp's own data; this field is the continuity read the seam
+    /// audit and joins consult).
+    pub start_direction: f64,
+}
+
+/// The declared chain (API v14, additive): the record layer's truth, turned
+/// into display geometry by the host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParametricChain {
+    /// The plane the chain lives in.
+    pub plane: ParametricPlane,
+    /// The declared segments, start to end (at least one; each length must
+    /// be greater than zero — a zero-length terminator is a plugin's
+    /// staging detail, not a host contract, and refuses).
+    pub segments: Vec<ParametricSegment>,
+    /// Layer name for the staged display entities (the consumer's own
+    /// display convention). Empty = the host's default layer.
+    pub layer: String,
+}
+
+/// One evaluated point of a parametric chain (API v14, additive).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ParametricSample {
+    /// Plane coordinates of the point (plan = world (x, y); profile =
+    /// (station, elevation)).
+    pub point: [f64; 2],
+    /// Unit tangent in plane coordinates (plan = (cos θ, sin θ); profile =
+    /// (1, gradient) / |(1, gradient)|).
+    pub direction: [f64; 2],
+}
+
+/// **Generic curve-definition types (api 14; the v2 in-place reshaping).**
+///
+/// The host knows NO species: a curve is a driving-quantity ramp declared as
+/// DATA over the unit station parameter, evaluated by the host's generic
+/// integrator, audited at the declaring instance's own tolerance (the
+/// seams' continuity bound — one declared accuracy for welds and chords),
+/// and staged with
+/// generic carriers (exact Hermite for the polynomial class, measured-
+/// deviation chords otherwise). Species semantics (which quantity drives,
+/// which ramps restate which law, what a segment's ends must be) are the
+/// declaring plugin's own checks — the host refuses only what it can state
+/// generically. These ARE the v14 envelope's shapes: the envelope was
+/// reshaped IN PLACE before release (api_version stays 14) because no
+/// deployed plugins pre-date the reshaping.
+///
+/// A curve ramp: the driving quantity's values over one unit parameter
+/// (not `Copy`: the sampled arm carries a table; clone freely — staging
+/// copies payloads once, the per-move tier borrows).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Ramp {
+    /// An at-most-cubic polynomial ramp, coefficients ascending
+    /// (`value(xi) = Σ coeffs[i]·xi^i`); the exact class: the ramp AND its
+    /// integral are closed forms, and exact carriers derive generically.
+    Polynomial {
+        /// Coefficients in use (0..=3; higher entries ignored).
+        degree: u8,
+        /// Ascending coefficients, `coeffs[i]·xi^i`.
+        coeffs: [f64; 4],
+    },
+    /// A piecewise-linear ramp: `count` active knots ascending in xi over
+    /// [0, 1]; the integral accumulates per-interval quadratics. The same
+    /// 6-slot layout the declared vocabulary shipped.
+    Piecewise {
+        /// Active knots (0 < count <= 6; the rest are padding).
+        count: u32,
+        /// The (xi, value) knots, ascending in xi.
+        knots: [(f64, f64); 6],
+    },
+    /// A uniformly sampled table: `n` values at xi = i/(n-1); looked up
+    /// O(log n) with a linear tail; the host precomputes the stage-time
+    /// cumulative integrals so drag-time re-integration is O(log n) +
+    /// a small exacting tail (the performance-critical drag tier).
+    Sampled {
+        /// Table length (1..=4096).
+        n: u32,
+        /// The values, uniform in xi.
+        values: Vec<f64>,
+    },
+}
+
+/// One generically-defined segment: continuity state exactly as the
+/// segment struct carries it, plus the ramp payload in place of the
+/// species vocabulary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CurveSegmentDef {
+    /// The record-model length (plan = arc length; profile = horizontal run).
+    pub length: f64,
+    /// The driving-quantity ramp over the unit parameter.
+    pub ramp: Ramp,
+    /// The secondary-quantity ramp as unnamed data (the cross-slope term a
+    /// plugin's cant layout carries; the host integrates it for the
+    /// record's secondary rows but slides NOTHING about the plane curve).
+    pub cross_slope: Option<Ramp>,
+}
+
+/// What a plugin grip re-anchors, in record-model terms only (the generic
+/// replacement for per-species drive semantics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnchorLaw {
+    /// Drag the end point in the sheet (the plan piers).
+    EndStationToXY,
+    /// Re-anchor the end elevation.
+    EndElevation,
+    /// Re-anchor the end slope (grade).
+    EndGrade,
+    /// Scale the ramp's end value of the driving quantity.
+    EndCurvatureScale,
+    /// Re-run the segment's length.
+    Length,
+}
+
+/// **Plugin class-object staging types (API v14, additive).**
+///
+/// The generalization of the parametric staging contract: a plugin-declared
+/// entity CLASS whose instances carry only identity (class id, schema
+/// version, layer, record linkage) while the DEFINITION stays in the record
+/// layer (XRecords — the file's only source of truth) and the display is
+/// HOST-EVALUATED from a design descriptor. Alignment chains are exactly the
+/// `ParametricChain` descriptor kind: a class instance whose design is a
+/// chain stages through [`HostApi::stage_parametric_chain`]'s audited-seam,
+/// cap, refusal, undo and reference-only discipline verbatim. Older hosts
+/// simply answer the class methods with the standard degradation error.
+///
+/// The class declaration itself is session state like the v11 grip sets —
+/// never written to the drawing file; instances stamp only XDATA identity
+/// keys and record linkages, so a file without the plugin still renders its
+/// staged (standard-entity) display and reads its records, it just has no
+/// re-marking, re-staging or grip semantics until the plugin loads again.
+///
+/// A plugin-declared entity class (API v14).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginClassDeclaration {
+    /// Stable identity key the host stamps on instances (XDATA class key —
+    /// same key the plugin declares as its v10 `entity_classes` identity for
+    /// presentation purposes; the host stamps it on HOST-staged instances so
+    /// instance sets survive and re-associate across sessions).
+    pub class_id: String,
+    /// Monotone schema version of the class's parameter set (the record
+    /// layer's truth). An instance refuses to stage against a live class
+    /// whose version differs — the consumer re-declares and re-stages
+    /// instead, keeping the records authoritative.
+    pub schema_version: u32,
+    /// The class's grip schema (ids and the parameter names they drive,
+    /// matching the plugin's later `set_plugin_grips` declarations for its
+    /// instances). The host uses it for instance validation; grip
+    /// interpretation stays the declaring plugin's per the v11 law.
+    pub grip_schema: Vec<PluginGripSchemaEntry>,
+    /// The class's parameter schema (API v14, additive; serde default keeps
+    /// earlier declarations readable): WHAT the parameters are — names, value
+    /// kinds, and which rows host surfaces (the properties panel) may write.
+    /// Declaring parameters turns the record layer's truth into named
+    /// properties; the values themselves stay on the instance's design
+    /// record row. Names must be unique and non-empty (registering refuses
+    /// otherwise).
+    #[serde(default)]
+    pub parameters: Vec<PluginClassParameter>,
+}
+
+/// One grip in a class's schema (API v14): which parameter of the class
+/// schema this grip drives. Drag semantics remain the declaring plugin's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginGripSchemaEntry {
+    /// Grip id â€” links a schema row to the plugin's `set_plugin_grips`
+    /// declaration (the drag's `CustomGripEvent::grip_id`).
+    pub grip_id: u64,
+    /// Parameter name in the class's record layer this grip drives
+    /// (e.g. `"peak_gradient"`).
+    pub param_name: String,
+    /// (API v14, additive) The design point this grip re-anchors in a
+    /// descriptor-backed drag: when the drag's Begin answer hands the host
+    /// a live descriptor design, the host re-derives that design per
+    /// coalesced cursor move through THIS declared rule instead of
+    /// streaming Move frames. `None` (the serde default: earlier
+    /// declarations and streaming-only grips) keeps the v11/v12 semantics
+    /// untouched.
+    #[serde(default)]
+    pub drives: Option<PluginGripAnchor>,
+}
+
+/// The design point a descriptor-backed grip re-anchors (api 14; the v2
+/// anchor-law shape — the v14 envelope was reshaped in place before
+/// release, so the earlier empty drive struct never shipped). The cursor's
+/// move REPLACES that point of the declared design: the segment's named
+/// end follows the cursor per the declared anchor law, the driving ramp
+/// re-derives per its own integral law (one generic arm-consistent
+/// re-anchor — no per-species host code), the joints re-declare downstream
+/// from the engine's own sampling, and the chain's own audit gates every
+/// move's design. The host serves only what it can state generically: the
+/// profile plane's end-side anchor laws. A drive outside that set (the
+/// plan plane, the START side, a segment index out of the descriptor's
+/// range) keeps the v12 streaming path, with one headline in the error
+/// queue naming the constraint. Future drives append as NEW serde-default
+/// fields on this struct (never new positions inside it) so older hosts
+/// deserialize them harmlessly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginGripAnchor {
+    /// Zero-based index into the descriptor chain's segments.
+    pub segment: u32,
+    /// Whether the grip re-anchors that segment's START point; `false`
+    /// names the segment's end. The host serves the END side only (an
+    /// END-point drag fully re-derives the section through its own ramp
+    /// law); a declared START side keeps the streaming path until a host
+    /// release serves it.
+    pub at_start: bool,
+    /// The record-model quantity this grip re-anchors.
+    pub anchor: AnchorLaw,
+}
+
+/// One declared class parameter (API v14, additive): a name, a value kind,
+/// and an editability. The schema lets host surfaces render a class
+/// instance's parameters without the plugin's source: the value lives on
+/// the instance's design record row (the record layer stays the only
+/// truth); the declaration only says what kinds exist and which rows the
+/// host's property surfaces may write. The host never invents parameter
+/// semantics for a name or kind it does not know.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginClassParameter {
+    /// The parameter's name as the record row and host surfaces address it.
+    pub name: String,
+    /// The value kind the record row carries.
+    pub value_kind: PluginClassParameterKind,
+    /// Whether host property surfaces may write this row. A write composes
+    /// as one undo step through the session's XRecord update path, and the
+    /// declaring plugin re-stages from the record's dirty notification.
+    /// Read-only rows render but never write.
+    pub editable: bool,
+}
+
+/// The value kind of one declared class parameter (API v14, additive).
+/// Kinds append at the END only (the wire encodes a variant by its
+/// position).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginClassParameterKind {
+    /// A floating-point quantity; the record row carries an XRecord double
+    /// (an integral reading casts to one).
+    Real,
+    /// A count; the record row carries an XRecord integer.
+    Integer,
+    /// Free text; the record row carries an XRecord string.
+    Text,
+}
+
+/// One read row of a class instance's declared parameters (API v14,
+/// additive; the wire carrier of
+/// [`HostApi::plugin_class_instance_properties`]). The value is exactly
+/// what the record row carries — only the declared kind's own reading,
+/// never a unit or semantic conversion; `None` = the record does not
+/// carry this parameter's pair yet (the row renders the declaration).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginClassParameterRow {
+    /// The parameter's declared name.
+    pub name: String,
+    /// The declared kind the row prints under.
+    pub value_kind: PluginClassParameterKind,
+    /// Whether host property surfaces may write this row.
+    pub editable: bool,
+    /// The record row's own printed value; `None` when absent.
+    pub value: Option<String>,
+}
+
+fn deserialize_selectable_custom<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // bincode 1 reports UnexpectedEof instead of a missing sequence element
+    // for a v17 payload ending immediately before this trailing field.
+    bool::deserialize(deserializer).or(Ok(false))
+}
+
+/// One staged instance of a registered plugin class (API v14): identity plus
+/// a host-evaluated design descriptor. Records carry the truth; the host
+/// never re-interprets anything the plugin does not declare here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginClassInstance {
+    /// Must equal a class registered in this session (else the staging
+    /// refuses before any change).
+    pub class_id: String,
+    /// The schema version the instance was authored against (refuses on
+    /// mismatch with the live declaration).
+    pub schema_version: u32,
+    /// The host-evaluated display design.
+    pub design: PluginDisplayDescriptor,
+    /// The instance's own tolerance (chain designs: BOTH readings — the
+    /// carrier tolerance of the table-law ramps' chords AND the seam
+    /// continuity bound of the chain's audited welds: the point seam
+    /// reads it as meters, the plan's bearing seam as radians, the
+    /// profile's slope seam as the gradient family). The declared
+    /// accuracy is the record model's own declaration, one number.
+    #[serde(default)]
+    pub tolerance: f64,
+    /// Layer for the staged display set; empty = the host's default layer.
+    pub layer: String,
+    /// NOD-side record name holding this instance's parameter truth (the
+    /// handles-to-records linkage the plugin maintains).
+    #[serde(default)]
+    pub design_record: String,
+    /// Keep this staged display set selectable for plugin custom grips/panels,
+    /// while suppressing native vertex editing and native property updates.
+    ///
+    /// API v18 additive. Absent v17 payloads decode as `false`, preserving the
+    /// legacy reference-only staging behavior byte-for-byte.
+    #[serde(default, deserialize_with = "deserialize_selectable_custom")]
+    pub selectable_custom: bool,
+}
+
+/// Host-evaluated display descriptor kinds (API v14, additive).
+///
+/// Kinds append at the END only (the wire encodes a variant by its
+/// position); the first host-known kind is the v14 parametric engine for
+/// alignment chains. A kind the host does not know refuses the staging at
+/// the contract — never approximated, never silently dropped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PluginDisplayDescriptor {
+    /// The v14 parametric engine is the host-known evaluator (the same wire
+    /// grammar [`HostApi::stage_parametric_chain`] takes).
+    ParametricChain(ParametricChain),
+    // New descriptor kinds go after the existing ones: inserting one earlier
+    // would make a plugin built against the previous API send its kind and
+    // have the host read it as something else.
+}
+
+impl PluginDisplayDescriptor {
+    /// (API v14, additive) A stable diagnostic label for the error queue and
+    /// the logs. Later kinds append their arm here (the law: kinds append at
+    /// the END only).
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            Self::ParametricChain(_) => "ParametricChain",
+        }
+    }
+}
+
+/// The drawing's geographic location (API v22, additive): what
+/// [`HostApi::set_geo_location`] writes into the model-space GEODATA object.
+///
+/// Drawing units, the up direction and the scale method follow the drawing
+/// (INSUNITS) when the object is first created; an existing object keeps them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeoLocation {
+    /// `EPSG:<code>`, a WKT definition, or a MapGuide XML definition with an
+    /// EPSG alias. Geographic CRSs make the object geographic (type 3),
+    /// projected ones a projected grid (type 2).
+    pub coordinate_system: String,
+    /// The point in drawing coordinates that is placed at `reference_point`.
+    pub design_point: [f64; 3],
+    /// The same point in CRS coordinates (easting/northing, or lon/lat).
+    pub reference_point: [f64; 3],
+    /// North in drawing XY; `[0.0, 1.0]` is drawing +Y.
+    pub north_direction: [f64; 2],
+}
+
+/// One XRecord addressed by dictionary path + name (API v13, additive).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct XRecordRead {
+    pub dictionary_path: Vec<String>,
+    pub name: String,
+}
+
+/// One XRecord update in a batch (API v13, additive).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct XRecordUpdate {
+    pub dictionary_path: Vec<String>,
+    pub name: String,
+    pub entries: Vec<XRecordEntry>,
 }
 
 /// Configuration properties for creating or modifying a layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct LayerConfig {
     pub name: String,
-    pub color: Option<codec::types::Color>,
+    pub color: Option<document::types::Color>,
     pub linetype: Option<String>,
-    pub lineweight: Option<codec::types::LineWeight>,
+    pub lineweight: Option<document::types::LineWeight>,
     pub off: Option<bool>,
     pub frozen: Option<bool>,
     pub locked: Option<bool>,
     pub plottable: Option<bool>,
-    pub transparency: Option<codec::types::Transparency>,
+    pub transparency: Option<document::types::Transparency>,
     pub description: Option<String>,
 }
 
@@ -1068,7 +2722,7 @@ pub trait DocumentReader {
     /// Total number of entities in the document.
     fn entity_count(&self) -> usize;
 
-    /// Iterate over all entities without allocating a full `CadDocument`.
+    /// Iterate over all entities without allocating a full `Document`.
     fn for_each_entity(&self, f: &mut dyn FnMut(ReaderEntity<'_>));
 
     /// Look up a layer name by handle.
@@ -1096,8 +2750,8 @@ impl ReaderEntityKind {
     }
 }
 
-/// In-process `DocumentReader` implementation that wraps a borrowed `CadDocument`.
-pub struct CadDocumentReader<'a>(pub &'a CadDocument);
+/// In-process `DocumentReader` implementation that wraps a borrowed `Document`.
+pub struct CadDocumentReader<'a>(pub &'a Document);
 
 impl<'a> DocumentReader for CadDocumentReader<'a> {
     fn entity_count(&self) -> usize {
@@ -1159,17 +2813,20 @@ pub fn plugin_state_mut<'a, T: Any + Send + Sync>(
 }
 
 /// Typed get-or-insert of per-tab plugin state stored under `plugin_id`.
+///
+/// Returns `None` when this host cannot hold state (out-of-process plugins)
+/// or when existing state under `plugin_id` has a different type.
 pub fn ensure_plugin_state<'a, T: Any + Send + Sync>(
     host: &'a mut dyn HostApi,
     plugin_id: &'static str,
     init: impl FnOnce() -> T,
-) -> &'a mut T {
+) -> Option<&'a mut T> {
     let mut init = Some(init);
-    let any = host.ensure_plugin_state_any(plugin_id, &mut || {
-        Box::new((init.take().expect("init called once"))())
+    let any = host.ensure_plugin_state_any(plugin_id, &mut || match init.take() {
+        Some(make) => Box::new(make()),
+        None => Box::new(()),
     });
-    any.downcast_mut::<T>()
-        .expect("plugin state type mismatch for plugin_id")
+    any?.downcast_mut::<T>()
 }
 
 #[cfg(feature = "host")]

@@ -9,8 +9,12 @@
 //! carries both `on_press` (select) and `on_double_click` (rename) itself.
 
 use crate::app::{Message, StyleKind};
+use crate::ui::style::style_manager::StyleRow;
 use iced::widget::{container, mouse_area, row, text, text_input};
 use iced::{Background, Element, Fill, Theme};
+
+const LOCK: &[u8] = include_bytes!("../../../assets/icons/ui/lock.svg");
+const ANNOTATIVE: &[u8] = include_bytes!("../../../assets/icons/ui/annotative.svg");
 
 /// Shared id for the inline rename field, so the rename-start handler can focus
 /// it the moment the row turns editable.
@@ -20,7 +24,9 @@ pub fn rename_input_id() -> iced::widget::Id {
 
 /// One row of the style list. Renders an editable `text_input` when `name` is
 /// the style being renamed (`rename_active`), otherwise a selectable row whose
-/// double click starts the rename. The current style gets a green ✓.
+/// double click starts the rename. The current style gets a green ✓, a
+/// referenced style a lock and a dimmed name; `info` adds the usage count.
+#[allow(clippy::too_many_arguments)]
 pub fn item<'a>(
     name: &str,
     is_current: bool,
@@ -30,6 +36,8 @@ pub fn item<'a>(
     rename_active: Option<&str>,
     rename_buf: &'a str,
     can_rename: bool,
+    info: Option<StyleRow>,
+    on_right: Option<Message>,
 ) -> Element<'a, Message> {
     if rename_active == Some(name) {
         text_input("", rename_buf)
@@ -41,28 +49,88 @@ pub fn item<'a>(
             .width(Fill)
             .into()
     } else {
+        let locked = info.is_some_and(|info| info.locked);
         // Fixed-width ✓ column keeps every name left-aligned whether or not the
         // row is current.
-        let check = crate::ui::icons::themed_check_cell(is_current);
-        let label = row![check, text(name.to_string()).size(11)]
-            .align_y(iced::Center);
+        let mark: Element<'a, Message> = if locked {
+            container(crate::ui::icons::themed_secondary(LOCK, 11.0))
+                .width(16)
+                .into()
+        } else {
+            crate::ui::icons::themed_check_cell(is_current)
+        };
+        // One line: a long name ends in "…" (the whole name is the row's
+        // hint) and never pushes the count out of the row.
+        let name_text = text(name.to_string())
+            .size(11)
+            .width(Fill)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .ellipsis(iced::widget::text::Ellipsis::End);
+        let name_text = if locked && !is_selected {
+            name_text.style(crate::ui::style::common::muted_style)
+        } else {
+            name_text
+        };
+        let mut label = row![mark].spacing(4).align_y(iced::Center);
+        // An annotative style carries the annotative mark before its name.
+        if info.is_some_and(|info| info.annotative) {
+            label = label.push(crate::ui::icons::tinted(ANNOTATIVE, 11.0, |theme: &Theme| {
+                theme.palette().primary.base.color
+            }));
+        }
+        let mut label = label.push(name_text);
+        if let Some(info) = info {
+            let count = text(info.count.to_string())
+                .size(10)
+                .width(COUNT_W)
+                .align_x(iced::widget::text::Alignment::Right);
+            label = label.push(if is_selected {
+                count
+            } else {
+                count.style(move |theme: &Theme| text::Style {
+                    color: Some(
+                        theme
+                            .palette()
+                            .background
+                            .base
+                            .text
+                            .scale_alpha(if info.count == 0 { 0.4 } else { 0.65 }),
+                    ),
+                })
+            });
+        }
         let cell = container(label)
             .padding([4, 8])
             .width(Fill)
             .style(move |theme: &Theme| {
                 let pair = theme.palette().primary.strong;
                 container::Style {
-                background: is_selected.then_some(Background::Color(pair.color)),
-                text_color: is_selected.then_some(pair.text),
-                ..Default::default()
+                    background: is_selected.then_some(Background::Color(pair.color)),
+                    text_color: is_selected.then_some(pair.text),
+                    ..Default::default()
                 }
             });
-        let area = mouse_area(cell).on_press(on_select);
-        if can_rename {
+        let mut area = mouse_area(cell).on_press(on_select);
+        if let Some(message) = on_right {
+            area = area.on_right_press(message);
+        }
+        let area: Element<'a, Message> = if can_rename {
             area.on_double_click(Message::StyleRenameStart(kind, name.to_string()))
                 .into()
         } else {
             area.into()
-        }
+        };
+        iced::widget::tooltip(
+            area,
+            container(text(name.to_string()).size(11))
+                .padding(6)
+                .style(container::rounded_box),
+            iced::widget::tooltip::Position::Right,
+        )
+        .delay(std::time::Duration::from_millis(600))
+        .into()
     }
 }
+
+/// The count column: room for five digits, right-aligned.
+const COUNT_W: f32 = 34.0;

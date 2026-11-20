@@ -68,6 +68,16 @@ expression, not statements). Phases 1.2 (read), 1.3 (2D write) and part of
 | Function | Returns |
 |----------|---------|
 | `ocs.selection()` | List of the selected entities' handles (`int`), as of the last selection change — see note below. |
+| `ocs.get_entity_color(handle)` | Color of one top-level entity in the records-schema shape: `None` if the handle is absent, else `{"kind": "ByLayer"}`, `{"kind": "Index", "value": n}` or `{"kind": "Rgb", "value": {"r","g","b"}}`. |
+| `ocs.entity_kind(handle)` | The entity's variant name (`"Hatch"`, `"Solid"`, `"Line"`, …; `"Other"` for rarer kinds), or `None` if absent. The subset is documented in the source; `record_schema` is the exhaustive catalogue. |
+| `ocs.entities_on_layer(layer)` | Handles of the top-level entities currently on that layer (layer names compare case-insensitively). |
+| `ocs.get_entity_layer(handle)` | The carrying layer name of one top-level entity, or `None` if absent. |
+| `ocs.set_entity_color(handle, color)` | Rewrite one top-level entity's color. `color` is an `int` ACI index (1..=255), an `(r, g, b)` triple, or `"ByLayer"`. Raises when the entity does not exist. |
+| `ocs.set_entity_colors(updates, label)` | Batched: `[{"handle": …, "color": …}, …]` in **one undo step and one transaction**. Raises on the first missing handle. Reads happen against the dispatch snapshot — filter no-ops yourself before batching. |
+| `ocs.set_entity_layers(updates, label)` | Batched layer moves — the `set_entity_colors` twin for `/common/layer`. Same shape/one-undo-step contract; raises on a layer the drawing does not carry. |
+| `ocs.ensure_layer(name, color)` | Create the layer record when missing (with `color`), or rewrite its color. Idempotent. |
+| `ocs.freeze_layer(name, frozen)` | Set one layer record's freeze flag alone (missing layers stay absent). |
+| `ocs.thaw_layer(name)` | Un-freeze and un-lock one layer record alone. |
 | `ocs.get(handle)` | Dict of `{handle, kind, layer, point}` for that entity, or `None` if it doesn't exist. `point` is `{x, y, z}` or `None` for non-point entities. |
 | `ocs.get_text(handle)` | For single-line TEXT, returns its active alignment point, OCS normal, rotation, direction, and height; otherwise `None`. Reads the host's full document snapshot. |
 | `ocs.text_entities()` | Lists top-level TEXT/MTEXT entities as `{handle, kind, value}` dictionaries from the active document. |
@@ -181,7 +191,7 @@ positive, and `dimtxsty` must name an existing text style. `Standard` is never
 renamed or deleted; a style that is current or still referenced is never deleted;
 a case-only rename is refused. Style operations act on the active document.
 
-Known persistence limits (opencadcodec, see `docs/cadcodec-reader-gaps.md`; the first two are fixed in
+Known persistence limits (codec, see `docs/cadcodec-reader-gaps.md`; the first two are fixed in
 an open upstream pull request but OCS has not yet adopted it): a DXF
 save drops the backward/upside-down flags of a text style and does not restore a
 dimension style's `dimtxsty` name (the handle link survives); DWG keeps both.
@@ -211,7 +221,7 @@ anonymous or externally referenced blocks, and a case-only rename. Deleting also
 removes the definition's contents. Records list user blocks only (`handle`,
 `name`, `description`, `explodable`, `scale_uniformly`, `base_point`,
 `insert_count`, `entities` as `{handle, kind}`). A DXF save drops the block
-description (opencadcodec); DWG keeps it.
+description (codec); DWG keeps it.
 
 **Block contents.** Add to a definition with `create_entity(kind, block="Part",
 ...)`. It is validated exactly like a model-space entity and the host sets the

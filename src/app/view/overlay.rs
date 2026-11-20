@@ -1,4 +1,14 @@
 use super::super::Message;
+mod mtext_menu;
+#[cfg(test)]
+mod mtext_tests;
+mod mtext_toolbar;
+use crate::t;
+use crate::ui::popup::context_menu::{
+    ContextMenu, MenuIcon, MenuItem, MenuRow, MENU_PAD_TOP, MENU_ROW_H,
+};
+use crate::ui::popup::quad_menu::{QuadMsg, QuadPanel, QuadUi};
+use crate::ui::style::{chrome, kit_metrics as km, text as ui_text};
 use iced::advanced::layout;
 use iced::advanced::mouse;
 use iced::advanced::overlay;
@@ -9,9 +19,9 @@ use iced::widget::{
     button, checkbox, column, container, mouse_area, row, scrollable, stack, text, text_input,
     Space,
 };
-use iced::{Background, Border, Color, Element, Event, Fill, Length, Rectangle, Size, Theme, Vector};
-use crate::t;
-use crate::ui::popup::context_menu::{ContextMenu, MenuIcon, MenuItem, MenuRow, MENU_PAD_TOP, MENU_ROW_H};
+use iced::{
+    Background, Border, Color, Element, Event, Fill, Length, Rectangle, Size, Theme, Vector,
+};
 
 pub(super) fn position_canvas_overlay<'a>(
     anchor: iced::Point,
@@ -36,63 +46,59 @@ pub(super) fn text_inline_overlay(
     ed: &super::super::text_inline::TextInlineState,
     canvas: (f32, f32),
 ) -> Element<'_, Message> {
+    // The box grows with the text's on-screen size, up to the canvas width.
+    let (cw, ch) = canvas;
+    let field_w = (240.0 * ed.font_px / 13.0).min((cw - 20.0).max(240.0));
     let field = text_input(t!("Text").as_ref(), &ed.value)
         .id(iced::widget::Id::new(TEXT_INLINE_ID))
         .on_input(Message::TextInlineInput)
         .on_submit(Message::TextInlineOk)
         .padding(6)
-        .size(13)
-        .width(iced::Length::Fixed(240.0));
+        .size(ed.font_px)
+        .width(iced::Length::Fixed(field_w));
 
     let panel = container(field)
         .style(move |theme: &Theme| {
             let palette = theme.palette();
             container::Style {
-            background: Some(Background::Color(palette.background.weak.color)),
-            border: Border {
-                color: palette.background.neutral.color,
-                width: 1.0,
-                radius: 5.0.into(),
-            },
-            ..Default::default()
+                background: Some(Background::Color(palette.background.weak.color)),
+                border: Border {
+                    color: palette.background.neutral.color,
+                    width: 1.0,
+                    radius: 5.0.into(),
+                },
+                ..Default::default()
             }
         })
         .padding(4);
 
     // Keep the box on-screen so its field stays clickable at the edges.
-    const PANEL_W: f32 = 240.0 + 20.0;
-    const PANEL_H: f32 = 46.0;
-    let (cw, ch) = canvas;
+    let panel_w = field_w + 20.0;
+    let panel_h = ed.font_px * 1.3 + 29.0;
     let anchor = iced::Point::new(
-        (ed.screen_anchor.x - 6.0).clamp(0.0, (cw - PANEL_W).max(0.0)),
-        (ed.screen_anchor.y - 18.0).clamp(0.0, (ch - PANEL_H).max(0.0)),
+        (ed.screen_anchor.x - 6.0).clamp(0.0, (cw - panel_w).max(0.0)),
+        (ed.screen_anchor.y - panel_h * 0.4).clamp(0.0, (ch - panel_h).max(0.0)),
     );
     position_canvas_overlay(anchor, panel.into())
 }
 
-// Stroke-font families bundled with the renderer; see scene/lff.rs.
-const MTEXT_FONTS: [&str; 10] = [
-    "[Style default]",
-    "Standard",
-    "ISO",
-    "Simplex",
-    "RomanS",
-    "RomanD",
-    "ItalicC",
-    "ScriptS",
-    "GothGBT",
-    "RomanC",
-];
 /// (label, ACI). 256 = ByLayer.
 /// Canvas program that renders the tessellated MText strokes inside the
 /// editor's own preview area (never on the drawing). Strokes lie in the
 /// world XY plane; the program fits + vertically flips them into the box.
 pub(in crate::app) const MTEXT_PREVIEW_PAD: f32 = 12.0;
 pub(in crate::app) const MTEXT_PREVIEW_EM_PX: f32 = 15.0;
+/// MTEXTFIXED 2: a text whose height shows under this many pixels is edited
+/// at [`MTEXT_READABLE_PX`] instead; larger text keeps its drawing size.
+pub(in crate::app) const MTEXT_READABLE_BELOW_PX: f32 = 5.5;
+pub(in crate::app) const MTEXT_READABLE_PX: f32 = 12.0;
 // Used only until the shared modal sensor reports the first real layout width.
 const MTEXT_EDITOR_FALLBACK_WIDTH: f32 = 660.0;
 pub(in crate::app) const MTEXT_EDITOR_WRITING_WIDTH: f32 =
     MTEXT_EDITOR_FALLBACK_WIDTH - 2.0 * MTEXT_PREVIEW_PAD;
+/// The editor never shrinks below its two toolbar rows and a few lines of
+/// text; a smaller window still caps it.
+const MTEXT_EDITOR_MIN_SIZE: Size = Size::new(900.0, 370.0);
 
 struct MTextPreview {
     /// Disconnected polylines as (x, y) world points + colour (NaN-split done).
@@ -110,18 +116,129 @@ struct MTextPreview {
     miny: f32,
     scale: f32,
     content_h: f32,
-    /// On-screen width of the MText wrapping rectangle.
-    wrap_width_px: f32,
+    /// The box-width ruler above the text; absent on a turned preview.
+    ruler: Option<BoxRuler>,
+    /// The text's rotation (cos, sin). Strokes and glyph boxes are laid out
+    /// upright; the preview turns them only when drawing, and turns pointer
+    /// positions back, so caret and selection stay in the layout frame.
+    rotation: (f32, f32),
+    cell: Option<super::super::table_cell_edit::CellCanvas>,
+    inplace: bool,
+    translucent: bool,
+    /// The misspelled words, underlined (visible ranges).
+    marks: Vec<(usize, usize)>,
+    /// The fields' text (visible ranges), shaded gray under FIELDDISPLAY.
+    fields: Vec<(usize, usize)>,
+    /// The selection's fill (None: the theme's).
+    highlight: Option<Color>,
+    /// The in-place box is filled (Show Background).
+    background: bool,
+}
+
+/// Height of the box-width ruler band at the top of the preview.
+pub(in crate::app) const MTEXT_RULER_H: f32 = 18.0;
+/// How near (px) to the handle a press grabs it.
+const RULER_GRAB_PX: f32 = 7.0;
+
+/// The text box along the ruler, in layout units, and its draggable edge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BoxRuler {
+    left: f32,
+    right: f32,
+    /// Width change per unit the handle moves: 1 left-attached (right edge),
+    /// 2 centred (both edges), -1 right-attached (the left edge moves).
+    growth: f32,
+}
+
+impl BoxRuler {
+    fn handle(&self) -> f32 {
+        if self.growth < 0.0 {
+            self.left
+        } else {
+            self.right
+        }
+    }
+}
+
+/// The full height of the text line a glyph box sits on: the box spans the
+/// cap height only, so descenders, accents and the line gap are added, and
+/// a line never reaches into its neighbour's band.
+fn line_band(
+    boxes: &[crate::entities::text_support::GlyphBox],
+    b: &crate::entities::text_support::GlyphBox,
+) -> (f32, f32) {
+    let h = (b.ymax - b.ymin).max(f32::EPSILON);
+    let mut low = b.ymin - 0.35 * h;
+    let mut high = b.ymax + 0.2 * h;
+    for other in boxes {
+        if other.ymax <= b.ymin {
+            low = low.max((other.ymax + b.ymin) * 0.5);
+        } else if other.ymin >= b.ymax {
+            high = high.min((other.ymin + b.ymax) * 0.5);
+        }
+    }
+    (low, high)
+}
+
+/// Rotate a layout-frame point by the text's rotation.
+fn turn((cos, sin): (f32, f32), x: f32, y: f32) -> (f32, f32) {
+    (x * cos - y * sin, x * sin + y * cos)
 }
 
 impl MTextPreview {
+    /// Screen point of a layout-frame point: turned by the rotation, drawn
+    /// at the real size, Y flipped (world up → screen down).
+    fn to_screen(&self, x: f32, y: f32) -> iced::Point {
+        let (x, y) = turn(self.rotation, x, y);
+        if let Some(cell) = self.cell {
+            return cell.project(x, y);
+        }
+        iced::Point::new(
+            MTEXT_PREVIEW_PAD + (x - self.minx) * self.scale,
+            self.content_h - (MTEXT_PREVIEW_PAD + (y - self.miny) * self.scale),
+        )
+    }
+
+    /// Whether a point (bounds-local px) grabs the ruler handle.
+    fn on_handle(&self, p: iced::Point) -> bool {
+        if self.inplace {
+            if let (Some(cell), Some(ruler)) = (self.cell, self.ruler) {
+                let handle = if ruler.growth < 0.0 {
+                    cell.corners[0]
+                } else {
+                    cell.corners[1]
+                };
+                let d = p - handle;
+                return d.x.hypot(d.y) <= 10.0;
+            }
+        }
+        p.y <= MTEXT_RULER_H
+            && self
+                .ruler
+                .is_some_and(|r| (p.x - self.to_screen(r.handle(), 0.0).x).abs() <= RULER_GRAB_PX)
+    }
+
+    /// The width a drag reaches after moving `dx` px from where it started.
+    fn dragged_width(&self, start_width: f32, dx: f32) -> Option<f64> {
+        let ruler = self.ruler?;
+        let width = start_width + ruler.growth * dx / self.scale;
+        Some(f64::from(width.max(self.scale.recip())))
+    }
+
     /// Visible-char offset (0..=N) nearest the cursor point (bounds-local px).
     fn offset_at(&self, p: iced::Point) -> usize {
         if self.boxes.is_empty() {
             return 0;
         }
-        let wx = self.minx + (p.x - MTEXT_PREVIEW_PAD) / self.scale;
-        let wy = self.miny + (self.content_h - p.y - MTEXT_PREVIEW_PAD) / self.scale;
+        let (rx, ry) = if let Some(cell) = self.cell {
+            cell.unproject(p)
+        } else {
+            (
+                self.minx + (p.x - MTEXT_PREVIEW_PAD) / self.scale,
+                self.miny + (self.content_h - p.y - MTEXT_PREVIEW_PAD) / self.scale,
+            )
+        };
+        let (wx, wy) = turn((self.rotation.0, -self.rotation.1), rx, ry);
         let mut best = 0usize;
         let mut best_d = f32::MAX;
         for b in &self.boxes {
@@ -164,6 +281,9 @@ impl MTextPreview {
 #[derive(Default)]
 struct MTextPreviewState {
     dragging: bool,
+    /// A ruler drag: where it started (px) and the box width then.
+    width_drag: Option<(f32, f32)>,
+    height_drag: Option<(f32, f32)>,
 }
 
 impl iced::widget::canvas::Program<Message> for MTextPreview {
@@ -182,12 +302,85 @@ impl iced::widget::canvas::Program<Message> for MTextPreview {
         match event {
             Event::Mouse(Me::ButtonPressed(Button::Left)) => {
                 if let Some(p) = cursor.position_in(bounds) {
+                    if self.inplace {
+                        if let Some(cell) = self.cell {
+                            let a = cell.corners[2];
+                            let b = cell.corners[3];
+                            let handle = iced::Point::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+                            let d = p - handle;
+                            if d.x.hypot(d.y) <= 10.0 {
+                                let (x, y) = cell.unproject(p);
+                                let (_, y) = turn((self.rotation.0, -self.rotation.1), x, y);
+                                let (x0, y0) = cell.unproject(cell.corners[0]);
+                                let (x1, y1) = cell.unproject(cell.corners[3]);
+                                let (_, y0) = turn((self.rotation.0, -self.rotation.1), x0, y0);
+                                let (_, y1) = turn((self.rotation.0, -self.rotation.1), x1, y1);
+                                state.height_drag = Some((y, (y0 - y1).abs()));
+                                return Some(Action::capture());
+                            }
+                        }
+                    }
+                    if self.inplace && self.on_handle(p) {
+                        let cell = self.cell?;
+                        let (x, y) = cell.unproject(p);
+                        let (x, _) = turn((self.rotation.0, -self.rotation.1), x, y);
+                        let ruler = self.ruler?;
+                        state.width_drag = Some((x, ruler.right - ruler.left));
+                        return Some(Action::capture());
+                    }
+                    if self.cell.is_some_and(|cell| !cell.contains(p)) {
+                        return Some(
+                            Action::publish(if self.inplace {
+                                Message::MTextOk
+                            } else {
+                                Message::TableEditorClick(p)
+                            })
+                            .and_capture(),
+                        );
+                    }
+                    if let Some(ruler) = self.ruler.filter(|_| self.on_handle(p)) {
+                        state.width_drag = Some((p.x, ruler.right - ruler.left));
+                        return Some(Action::capture());
+                    }
+                    if p.y <= MTEXT_RULER_H && self.ruler.is_some() {
+                        // The ruler band is not text: no caret move.
+                        return Some(Action::capture());
+                    }
                     state.dragging = true;
                     let off = self.offset_at(p);
                     return Some(Action::publish(Message::MTextSelStart(off)).and_capture());
                 }
             }
+            Event::Mouse(Me::ButtonPressed(Button::Right)) if self.inplace => {
+                let p = cursor.position_in(bounds)?;
+                if self.cell.is_some_and(|cell| cell.contains(p)) {
+                    let off = self.offset_at(p);
+                    return Some(Action::publish(Message::MTextContextOpen(p, off)).and_capture());
+                }
+            }
             Event::Mouse(Me::CursorMoved { .. }) => {
+                if let Some((start, height)) = state.height_drag {
+                    let point = cursor.position_from(bounds.position())?;
+                    let (x, y) = self.cell?.unproject(point);
+                    let (_, y) = turn((self.rotation.0, -self.rotation.1), x, y);
+                    return Some(
+                        Action::publish(Message::MTextHeightDrag(Some(f64::from(
+                            (height + start - y).max(0.001),
+                        ))))
+                        .and_capture(),
+                    );
+                }
+                if let Some((start, width)) = state.width_drag {
+                    let point = cursor.position_from(bounds.position())?;
+                    let width = if self.inplace {
+                        let (x, y) = self.cell?.unproject(point);
+                        let (x, _) = turn((self.rotation.0, -self.rotation.1), x, y);
+                        f64::from((width + self.ruler?.growth * (x - start)).max(0.001))
+                    } else {
+                        self.dragged_width(width, point.x - start)?
+                    };
+                    return Some(Action::publish(Message::MTextBoxDrag(Some(width))).and_capture());
+                }
                 if state.dragging {
                     if let Some(p) = cursor.position_in(bounds) {
                         let off = self.offset_at(p);
@@ -196,14 +389,53 @@ impl iced::widget::canvas::Program<Message> for MTextPreview {
                 }
             }
             Event::Mouse(Me::ButtonReleased(Button::Left)) => {
+                if state.height_drag.take().is_some() {
+                    return Some(Action::publish(Message::MTextHeightDrag(None)).and_capture());
+                }
+                if state.width_drag.take().is_some() {
+                    return Some(Action::publish(Message::MTextBoxDrag(None)).and_capture());
+                }
                 if state.dragging {
                     state.dragging = false;
-                    return Some(Action::capture());
+                    return Some(Action::publish(Message::MTextSelEnd).and_capture());
                 }
             }
             _ => {}
         }
         None
+    }
+
+    fn mouse_interaction(
+        &self,
+        state: &MTextPreviewState,
+        bounds: iced::Rectangle,
+        cursor: iced::mouse::Cursor,
+    ) -> iced::mouse::Interaction {
+        if state.height_drag.is_some() {
+            return iced::mouse::Interaction::ResizingVertically;
+        }
+        let point = cursor.position_in(bounds);
+        if self.inplace
+            && point.is_some_and(|p| {
+                self.cell.is_some_and(|cell| {
+                    let a = cell.corners[2];
+                    let b = cell.corners[3];
+                    let handle = iced::Point::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+                    let d = p - handle;
+                    d.x.hypot(d.y) <= 10.0
+                })
+            })
+        {
+            return iced::mouse::Interaction::ResizingVertically;
+        }
+        if state.width_drag.is_some() || point.is_some_and(|p| self.on_handle(p)) {
+            return iced::mouse::Interaction::ResizingHorizontally;
+        }
+        // No pointer of its own over the text being edited, in place or in a
+        // table cell: any would hide the drawing under it from the wheel, so
+        // zoom would stop there. The fallback preview has its own scroll
+        // container.
+        iced::mouse::Interaction::default()
     }
 
     fn draw(
@@ -216,41 +448,158 @@ impl iced::widget::canvas::Program<Message> for MTextPreview {
     ) -> Vec<iced::widget::canvas::Geometry> {
         use iced::widget::canvas::{Frame, Path, Stroke};
         let mut frame = Frame::new(renderer, bounds.size());
-        let pad = MTEXT_PREVIEW_PAD;
-        // Draw at the real size; flip Y (world up → screen down).
-        let map = |x: f32, y: f32| {
-            iced::Point::new(
-                pad + (x - self.minx) * self.scale,
-                self.content_h - (pad + (y - self.miny) * self.scale),
-            )
-        };
-        // Wrap ruler: same screen-space position as the width slider handle.
-        let wrap_x = (pad + self.wrap_width_px).clamp(pad, bounds.width.max(pad));
-        let wrap_line = Path::new(|path| {
-            path.move_to(iced::Point::new(wrap_x, 0.0));
-            path.line_to(iced::Point::new(wrap_x, self.content_h));
-        });
-        frame.stroke(
-            &wrap_line,
-            Stroke::default()
-                .with_color(theme.palette().primary.base.color.scale_alpha(0.65))
-                .with_width(1.0),
-        );
-        // Selection highlight behind the glyphs.
+        let map = |x: f32, y: f32| self.to_screen(x, y);
+        if let Some(cell) = self.cell {
+            let outline = Path::new(|p| {
+                p.move_to(cell.corners[0]);
+                for corner in &cell.corners[1..] {
+                    p.line_to(*corner);
+                }
+                p.close();
+            });
+            frame.fill(
+                &outline,
+                if self.inplace && self.background {
+                    // Show Background: the box is filled, the drawing behind
+                    // it hidden.
+                    theme.palette().background.weak.color
+                } else if self.translucent {
+                    // Without it the drawing shows through the editor.
+                    Color::TRANSPARENT
+                } else if self.inplace {
+                    theme.palette().background.base.color
+                } else {
+                    theme.palette().primary.base.color.scale_alpha(0.08)
+                },
+            );
+            frame.stroke(
+                &outline,
+                Stroke::default()
+                    .with_color(theme.palette().primary.base.color)
+                    .with_width(2.0),
+            );
+        }
+        if self.inplace {
+            if let (Some(cell), Some(ruler)) = (self.cell, self.ruler) {
+                let a = cell.corners[0];
+                let b = cell.corners[1];
+                let edge = b - a;
+                let length = edge.x.hypot(edge.y);
+                if length > 1.0 {
+                    let along = edge / length;
+                    let mut normal = iced::Vector::new(along.y, -along.x);
+                    if normal.x * (cell.corners[3].x - a.x) + normal.y * (cell.corners[3].y - a.y)
+                        > 0.0
+                    {
+                        normal = -normal;
+                    }
+                    let ruler_line = Path::new(|p| {
+                        p.move_to(a + normal * 12.0);
+                        p.line_to(b + normal * 12.0);
+                        let count = (length / 12.0).floor().clamp(1.0, 120.0) as usize;
+                        for i in 0..=count {
+                            let point = a + edge * (i as f32 / count as f32) + normal * 12.0;
+                            p.move_to(point);
+                            p.line_to(point + normal * if i % 5 == 0 { 7.0 } else { 3.5 });
+                        }
+                    });
+                    frame.stroke(
+                        &ruler_line,
+                        Stroke::default()
+                            .with_color(theme.palette().primary.base.color)
+                            .with_width(1.0),
+                    );
+                    let labels = (length / 70.0).floor().clamp(1.0, 12.0) as usize;
+                    for i in 0..=labels {
+                        let fraction = i as f32 / labels as f32;
+                        frame.fill_text(iced::widget::canvas::Text {
+                            content: format!("{:.1}", (ruler.right - ruler.left) * fraction),
+                            position: a + edge * fraction + normal * 24.0,
+                            color: theme.palette().background.base.text,
+                            size: iced::Pixels(9.0),
+                            ..Default::default()
+                        });
+                    }
+                    let handle = if ruler.growth < 0.0 { a } else { b };
+                    frame.fill_rectangle(
+                        handle - iced::Vector::new(4.0, 4.0),
+                        iced::Size::new(8.0, 8.0),
+                        Color::WHITE,
+                    );
+                    let a = cell.corners[2];
+                    let b = cell.corners[3];
+                    let bottom = iced::Point::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+                    frame.fill_rectangle(
+                        bottom - iced::Vector::new(4.0, 4.0),
+                        iced::Size::new(8.0, 8.0),
+                        Color::WHITE,
+                    );
+                }
+            }
+        }
+        // A field's gray background, as the canvas draws it.
+        let [r, g, blue, _] = crate::entities::field::BACKGROUND;
+        let gray = Color::from_rgb(r, g, blue);
+        for &(a, b) in &self.fields {
+            for bx in self.boxes.iter().filter(|bx| bx.vis >= a && bx.vis < b) {
+                let (low, high) = line_band(&self.boxes, bx);
+                let quad = Path::new(|p| {
+                    p.move_to(map(bx.xmin, low));
+                    p.line_to(map(bx.xmax, low));
+                    p.line_to(map(bx.xmax, high));
+                    p.line_to(map(bx.xmin, high));
+                    p.close();
+                });
+                frame.fill(&quad, gray);
+            }
+        }
+        // Selection highlight behind the glyphs, over the whole line height
+        // (descenders and accents included), turned with the text.
         if let Some((a, b)) = self.sel {
             for bx in &self.boxes {
                 if bx.vis >= a && bx.vis < b {
-                    let p0 = map(bx.xmin, bx.ymax);
-                    let p1 = map(bx.xmax, bx.ymin);
-                    let rect = Path::rectangle(
-                        iced::Point::new(p0.x.min(p1.x), p0.y.min(p1.y)),
-                        iced::Size::new((p1.x - p0.x).abs(), (p1.y - p0.y).abs()),
-                    );
+                    let (low, high) = line_band(&self.boxes, bx);
+                    let quad = Path::new(|p| {
+                        p.move_to(map(bx.xmin, low));
+                        p.line_to(map(bx.xmax, low));
+                        p.line_to(map(bx.xmax, high));
+                        p.line_to(map(bx.xmin, high));
+                        p.close();
+                    });
                     frame.fill(
-                        &rect,
-                        theme.palette().primary.base.color.scale_alpha(0.45),
+                        &quad,
+                        self.highlight
+                            .unwrap_or_else(|| theme.palette().primary.base.color.scale_alpha(0.45)),
                     );
                 }
+            }
+        }
+        // A misspelled word: a red dashed line under its letters.
+        for &(a, b) in &self.marks {
+            for bx in self.boxes.iter().filter(|bx| bx.vis >= a && bx.vis < b) {
+                let (low, _) = line_band(&self.boxes, bx);
+                let start = map(bx.xmin, low);
+                let end = map(bx.xmax, low);
+                let length = (end.x - start.x).hypot(end.y - start.y);
+                if length < 0.5 {
+                    continue;
+                }
+                let step = (end - start) * (1.0 / length);
+                let mut at = 0.0;
+                let dashes = Path::new(|p| {
+                    while at < length {
+                        let to = (at + 3.0).min(length);
+                        p.move_to(start + step * at);
+                        p.line_to(start + step * to);
+                        at += 5.0;
+                    }
+                });
+                frame.stroke(
+                    &dashes,
+                    Stroke::default()
+                        .with_color(Color::from_rgb8(230, 30, 30))
+                        .with_width(1.2),
+                );
             }
         }
         for (seg, col, width) in &self.segments {
@@ -263,7 +612,30 @@ impl iced::widget::canvas::Program<Message> for MTextPreview {
                     p.line_to(map(x, y));
                 }
             });
-            frame.stroke(&path, Stroke::default().with_color(*col).with_width(*width));
+            let col = readable_on(*col, theme.palette().background.base);
+            frame.stroke(&path, Stroke::default().with_color(col).with_width(*width));
+        }
+        if let Some(ruler) = self.ruler.filter(|_| !self.inplace) {
+            // The box width: a rule between the box edges with end ticks and
+            // a handle on the edge that moves.
+            let color = theme.palette().primary.base.color;
+            let mid = MTEXT_RULER_H * 0.5;
+            let (l, r) = (map(ruler.left, 0.0).x, map(ruler.right, 0.0).x);
+            let rule = Path::new(|p| {
+                p.move_to(iced::Point::new(l, mid));
+                p.line_to(iced::Point::new(r, mid));
+                for x in [l, r] {
+                    p.move_to(iced::Point::new(x, 4.0));
+                    p.line_to(iced::Point::new(x, MTEXT_RULER_H - 4.0));
+                }
+            });
+            frame.stroke(&rule, Stroke::default().with_color(color).with_width(1.0));
+            let x = map(ruler.handle(), 0.0).x;
+            frame.fill_rectangle(
+                iced::Point::new(x - 3.0, 2.0),
+                iced::Size::new(6.0, MTEXT_RULER_H - 4.0),
+                color,
+            );
         }
         // Caret — a vertical bar at the caret's glyph boundary, shown when the
         // selection is empty (a plain text cursor).
@@ -274,11 +646,17 @@ impl iced::widget::canvas::Program<Message> for MTextPreview {
             // Empty text: show a caret at the top-left so the user can type.
             // Its height matches the preview's constant em (see EM_PX) so the
             // empty-editor caret isn't tiny.
+            let top = MTEXT_PREVIEW_PAD + self.ruler.map_or(0.0, |_| MTEXT_RULER_H);
             let path = Path::new(|p| {
-                p.move_to(iced::Point::new(MTEXT_PREVIEW_PAD, MTEXT_PREVIEW_PAD));
+                if let Some(cell) = self.cell {
+                    p.move_to(map(0.0, 0.0));
+                    p.line_to(map(0.0, -cell.height));
+                    return;
+                }
+                p.move_to(iced::Point::new(MTEXT_PREVIEW_PAD, top));
                 p.line_to(iced::Point::new(
                     MTEXT_PREVIEW_PAD,
-                    (MTEXT_PREVIEW_PAD + 40.0).min(self.content_h),
+                    (top + 40.0).min(self.content_h),
                 ));
             });
             frame.stroke(
@@ -327,6 +705,45 @@ impl iced::widget::canvas::Program<Message> for MTextPreview {
 /// Split every preview WireModel into finite (x, y) polyline runs, each
 /// carrying its wire's colour (so inline `\C` / the colour dropdown shows) and a
 /// stroke width (bold runs carry a wider pen via `line_weight_px`).
+/// A text colour too close to the editor background (a light grey layer on
+/// the light theme's white) pulled toward the theme's text colour, keeping
+/// some of its own hue.
+/// The misspelled words the editor underlines.
+fn ed_marks(ed: &super::super::mtext_editor::MTextEditorState) -> Vec<(usize, usize)> {
+    ed.spell_marks.clone()
+}
+
+/// The fields the editor shades, when FIELDDISPLAY is on.
+fn ed_fields(ed: &super::super::mtext_editor::MTextEditorState) -> Vec<(usize, usize)> {
+    if crate::entities::field::display() {
+        ed.field_shading()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The selection fill set with Text Highlight Color.
+fn ed_highlight() -> Option<Color> {
+    crate::app::mtext_prefs::prefs()
+        .highlight
+        .map(|[r, g, b]| Color::from_rgb8(r, g, b))
+}
+
+fn readable_on(col: Color, background: iced::theme::palette::Pair) -> Color {
+    let luminance = |c: Color| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+    if (luminance(col) - luminance(background.color)).abs() >= 0.35 {
+        return col;
+    }
+    let text = background.text;
+    let mix = |a: f32, b: f32| a * 0.3 + b * 0.7;
+    Color {
+        r: mix(col.r, text.r),
+        g: mix(col.g, text.g),
+        b: mix(col.b, text.b),
+        a: col.a,
+    }
+}
+
 fn mtext_preview_segments(
     ed: &super::super::mtext_editor::MTextEditorState,
 ) -> Vec<(Vec<(f32, f32)>, Color, f32)> {
@@ -355,6 +772,205 @@ fn mtext_preview_segments(
     out
 }
 
+/// The existing text surface projected into a table cell at drawing scale.
+pub(super) fn table_cell_editor_overlay(
+    ed: &super::super::mtext_editor::MTextEditorState,
+    cell: super::super::table_cell_edit::CellCanvas,
+    size: (f32, f32),
+) -> Element<'static, Message> {
+    let angle = ed.rotation_input_value().unwrap_or(0.0) as f32;
+    let prog = MTextPreview {
+        segments: mtext_preview_segments(ed),
+        boxes: ed.glyph_boxes.clone(),
+        sel: ed.sel,
+        caret: ed.caret,
+        caret_on: ed.caret_blink_on,
+        minx: 0.0,
+        miny: 0.0,
+        scale: 1.0,
+        content_h: size.1,
+        ruler: None,
+        rotation: (angle.cos(), angle.sin()),
+        cell: Some(cell),
+        inplace: false,
+        translucent: false,
+        marks: ed_marks(ed),
+        fields: ed_fields(ed),
+        highlight: ed_highlight(),
+        background: false,
+    };
+    crate::ui::ime_zone::ime_zone(
+        iced::widget::canvas(prog).width(size.0).height(size.1),
+        Message::CommandAppendChar,
+    )
+}
+
+/// The angle the in-place editor shows the text at: its own, or level when
+/// the editor is not WYSIWYG (MTEXTFIXED 2).
+pub(super) fn editor_angle(ed: &super::super::mtext_editor::MTextEditorState) -> f32 {
+    if crate::app::mtext_prefs::prefs().wysiwyg {
+        ed.rotation_input_value().unwrap_or(0.0) as f32
+    } else {
+        0.0
+    }
+}
+
+/// The editing surface with the tag under text the editor just changed and
+/// the right-click menu; a press outside an open menu closes it.
+fn with_editor_menus<'a>(
+    ed: &super::super::mtext_editor::MTextEditorState,
+    cell: super::super::table_cell_edit::CellCanvas,
+    angle: f32,
+    bottom_inset: f32,
+    surface: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let (sin, cos) = angle.sin_cos();
+    let place = |u: f32, v: f32| cell.project(u * cos - v * sin, u * sin + v * cos);
+    let tag = mtext_menu::context::smart_tag(ed, place);
+    let menu = mtext_menu::context::context_menu(ed);
+    if tag.is_none() && menu.is_none() {
+        return surface;
+    }
+    let mut layers = stack![surface];
+    if let Some((at, tag)) = tag {
+        layers = layers.push(position_canvas_overlay(at, tag));
+    }
+    if let Some((at, panel)) = menu {
+        layers = layers
+            .push(
+                mouse_area(iced::widget::Space::new().width(Fill).height(Fill))
+                    .on_press(Message::MTextContextClose)
+                    .on_right_press(Message::MTextContextClose),
+            )
+            .push(position_canvas_overlay_clamped(at, bottom_inset, Vector::ZERO, panel));
+    }
+    layers.into()
+}
+
+/// A drawing-scale editing surface and a separate formatting toolbar.
+pub(super) fn mtext_inplace_overlay<'a>(
+    ed: &'a super::super::mtext_editor::MTextEditorState,
+    styles: Vec<String>,
+    cell: super::super::table_cell_edit::CellCanvas,
+    size: (f32, f32),
+    show_toolbar: bool,
+    bottom_inset: f32,
+) -> Element<'a, Message> {
+    let angle = editor_angle(ed);
+    let prog = MTextPreview {
+        segments: mtext_preview_segments(ed),
+        boxes: ed.glyph_boxes.clone(),
+        sel: ed.sel,
+        caret: ed.caret,
+        caret_on: ed.caret_blink_on,
+        minx: 0.0,
+        miny: 0.0,
+        scale: 1.0,
+        content_h: size.1,
+        ruler: ed.ruler.then(|| {
+            let width = ed.rect_width as f32;
+            let growth = ed.box_growth();
+            let left = if growth == 2.0 {
+                -width * 0.5
+            } else if growth < 0.0 {
+                -width
+            } else {
+                0.0
+            };
+            BoxRuler {
+                left,
+                right: left + width,
+                growth,
+            }
+        }),
+        rotation: (angle.cos(), angle.sin()),
+        cell: Some(cell),
+        inplace: true,
+        // A multileader owns additional graphics and cannot be hidden whole.
+        translucent: ed.editing.is_none() || ed.hidden_source_tab.is_some(),
+        marks: ed_marks(ed),
+        fields: ed_fields(ed),
+        highlight: ed_highlight(),
+        background: crate::app::mtext_prefs::prefs().show_background,
+    };
+    let surface = crate::ui::ime_zone::ime_zone(
+        iced::widget::canvas(prog).width(size.0).height(size.1),
+        Message::CommandAppendChar,
+    );
+    let surface = with_editor_menus(ed, cell, angle, bottom_inset, surface);
+    // Keep the commonly edited fields visible together on a normal viewport.
+    // The first row still scrolls horizontally when the viewport is narrow.
+    let toolbar_width = size.0.min(1000.0).max(1.0);
+    // With the ribbon's Text Editor tab on show (MTEXTTOOLBAR 2), the text
+    // has no toolbar of its own; a panel the tab opens shows by the text.
+    if !show_toolbar {
+        let x = cell.corners.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+        let bottom = cell
+            .corners
+            .iter()
+            .map(|p| p.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut layers = stack![surface];
+        if let Some(menu) = ed.menu {
+            let anchor = iced::Point::new(
+                x.clamp(0.0, (size.0 - 320.0).max(0.0)),
+                (bottom + 8.0).clamp(0.0, (size.1 - 200.0).max(0.0)),
+            );
+            layers = layers.push(position_canvas_overlay(anchor, mtext_menu::panel(ed, menu)));
+        }
+        return layers.into();
+    }
+    let drag_handle = mouse_area(
+        container(text("⋮⋮").size(15))
+            .height(58)
+            .center_y(58)
+            .padding([2, 3]),
+    )
+    .on_press(Message::MTextToolbarGrab)
+    .interaction(iced::mouse::Interaction::Grab);
+    let toolbar = container(
+        row![
+            drag_handle,
+            mtext_editor_content(ed, &styles, crate::ui::modal::ModalSizing::FILL, 0.0, true,)
+        ]
+        .spacing(2),
+    )
+    .style(container::bordered_box)
+    .padding(3)
+    .width(toolbar_width);
+    let x = cell
+        .corners
+        .iter()
+        .map(|p| p.x)
+        .fold(f32::INFINITY, f32::min);
+    let y = cell
+        .corners
+        .iter()
+        .map(|p| p.y)
+        .fold(f32::INFINITY, f32::min);
+    let bottom = cell
+        .corners
+        .iter()
+        .map(|p| p.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let toolbar_y = if y >= 95.0 {
+        y - 95.0
+    } else {
+        bottom.min((size.1 - 95.0).max(0.0))
+    };
+    let anchor = iced::Point::new(
+        (x + ed.toolbar_offset.x).clamp(0.0, (size.0 - toolbar_width).max(0.0)),
+        (toolbar_y + ed.toolbar_offset.y).clamp(0.0, (size.1 - 100.0).max(0.0)),
+    );
+    mouse_area(stack![
+        surface,
+        position_canvas_overlay(anchor, toolbar.into())
+    ])
+    .on_move(Message::MTextToolbarMove)
+    .on_release(Message::MTextToolbarRelease)
+    .into()
+}
+
 pub(super) fn mtext_editor_overlay<'a>(
     ed: &'a super::super::mtext_editor::MTextEditorState,
     styles: Vec<String>,
@@ -370,21 +986,22 @@ pub(super) fn mtext_editor_overlay<'a>(
         ed,
         &styles,
         crate::ui::modal::ModalSizing::INTRINSIC,
-        writing_area_px,
         (writing_area_px * 0.5).max(1.0),
+        false,
     );
     let content = mtext_editor_content(
         ed,
         &styles,
         crate::ui::modal::ModalSizing::FILL,
-        writing_area_px,
         (writing_area_px * 0.5).max(1.0),
+        false,
     );
-    let content = crate::ui::modal::intrinsic(
+    let content = crate::ui::modal::intrinsic_with_min(
         measurement,
         content,
         iced::Size::INFINITE,
         modal_resize,
+        MTEXT_EDITOR_MIN_SIZE,
     );
 
     crate::ui::modal::modal(
@@ -397,12 +1014,27 @@ pub(super) fn mtext_editor_overlay<'a>(
     )
 }
 
+/// The right-click menu of a first-row field with a value of its own. One
+/// `mouse_area` row: a button inside a `ContextMenu` overlay loses its press
+/// state on every rebuild and never publishes (see `xref_manager::menu_row`).
+fn reset_menu(field: &'static str, value: &str) -> Element<'static, Message> {
+    let row = iced::widget::mouse_area(
+        container(text(crate::tf!("Reset to style ({value})")).size(12)).padding([5, 12]),
+    )
+    .on_press(Message::MTextResetToStyle(field))
+    .interaction(iced::mouse::Interaction::Pointer);
+    container(row)
+        .style(container::bordered_box)
+        .padding(2)
+        .into()
+}
+
 fn mtext_editor_content<'a>(
     ed: &'a super::super::mtext_editor::MTextEditorState,
     styles: &[String],
     sizing: crate::ui::modal::ModalSizing,
-    writing_area_px: f32,
     intrinsic_preview_height: f32,
+    toolbar_only: bool,
 ) -> Element<'a, Message> {
     let width = sizing.width;
     let height = sizing.height;
@@ -411,35 +1043,8 @@ fn mtext_editor_content<'a>(
     } else {
         iced::Length::Fixed(intrinsic_preview_height)
     };
-    use super::super::mtext_editor::{JustifyChoice, MTextFmt, ParaAlign};
     use iced::widget::canvas;
 
-    let btn_style = |theme: &Theme, status: button::Status| {
-        let palette = theme.palette();
-        let pair = match status {
-            button::Status::Hovered | button::Status::Pressed => palette.background.strong,
-            _ => palette.background.weak,
-        };
-        button::Style {
-        background: Some(Background::Color(pair.color)),
-        text_color: pair.text,
-        border: Border {
-            color: palette.background.neutral.color,
-            width: 1.0,
-            radius: 3.0.into(),
-        },
-        shadow: iced::Shadow::default(),
-        snap: false,
-        }
-    };
-    let icon_btn = move |bytes: &'static [u8], msg: Message| -> Element<'static, Message> {
-        button(crate::ui::icons::themed(bytes, 18.0))
-            .on_press(msg)
-            .padding(3)
-            .style(btn_style)
-            .into()
-    };
-    let lbl = |s: &'static str| text(s).size(11);
     let small_input = |placeholder: &'static str,
                        val: &str,
                        on: fn(String) -> Message,
@@ -447,49 +1052,117 @@ fn mtext_editor_content<'a>(
      -> Element<'static, Message> {
         text_input(placeholder, val)
             .on_input(on)
+            .on_submit(Message::MTextFieldSubmit)
             .width(iced::Length::Fixed(w))
             .padding(3)
             .size(12)
             .into()
     };
 
-    // ── Row 1: style / font / height · format icons · colour ──────────────
-    let style_opts: Vec<String> = if styles.is_empty() {
+    // ── Row 1: the object's own values, each labelled ──────────────────────
+    // A label above its control; font, height, width and oblique also say,
+    // on a line of their own under the label, where their value comes from:
+    // the style (green), the text's own (red), or the style with overrides
+    // (orange).
+    let labelled = |name: std::borrow::Cow<'static, str>,
+                    origin: Option<super::super::mtext_editor::ValueOrigin>,
+                    control: Element<'a, Message>|
+     -> Element<'a, Message> {
+        use super::super::mtext_editor::ValueOrigin;
+        let mark: Element<'a, Message> = match origin {
+            Some(origin) => {
+                let (label, accent): (_, fn(&Theme) -> iced::Color) = match origin {
+                    ValueOrigin::Style => (crate::tr!("mtext-object-origin", "style"), |theme| {
+                        theme.palette().success.base.color
+                    }),
+                    ValueOrigin::Custom => (crate::tr!("mtext-object-origin", "custom"), |theme| {
+                        theme.palette().danger.base.color
+                    }),
+                    ValueOrigin::Mixed => (crate::tr!("mtext-object-origin", "mixed"), |theme| {
+                        theme.palette().warning.base.color
+                    }),
+                };
+                text(label)
+                    .size(10)
+                    .font(iced::Font {
+                        style: iced::font::Style::Italic,
+                        ..iced::Font::DEFAULT
+                    })
+                    .style(move |theme: &Theme| {
+                        // Readable on the editor's panel, lighter than the
+                        // base in a dark theme and darker in a light one.
+                        let background = theme.palette().background;
+                        text::Style {
+                            color: Some(crate::ui::style::common::readable_accent(
+                                accent(theme),
+                                background.weak.color,
+                                background.base.text,
+                            )),
+                        }
+                    })
+                    .into()
+            }
+            None => iced::widget::Space::new().into(),
+        };
+        if toolbar_only {
+            return row![
+                column![text(name).size(10), container(mark).height(13)].spacing(0),
+                control
+            ]
+            .spacing(3)
+            .align_y(iced::Alignment::Center)
+            .into();
+        }
+        // The mark keeps its line when there is none, and every control sits
+        // in a band of one height: the labels, the marks and the controls
+        // each share one line whatever the control's own height.
+        let mark = container(mark).height(13);
+        let control = container(control).height(30).center_y(30);
+        iced::widget::column![text(name).size(11), mark, control]
+            .spacing(0)
+            .into()
+    };
+    let mut style_opts: Vec<String> = if styles.is_empty() {
         vec!["Standard".to_string()]
     } else {
         styles.to_vec()
     };
-    let style_pl = iced::widget::pick_list(
-        Some(ed.style.clone()),
-        style_opts,
-        |value| value.to_string(),
-    )
+    if !style_opts.contains(&ed.style) {
+        style_opts.push(ed.style.clone());
+    }
+    let style_pl =
+        crate::ui::dropdown_list::pick_list(Some(ed.style.clone()), style_opts, |value| {
+            value.to_string()
+        })
         .on_select(Message::MTextStyle)
         .text_size(11)
-        .width(iced::Length::Fixed(96.0));
+        .width(iced::Length::Fixed(if toolbar_only { 82.0 } else { 96.0 }));
     let annotative = checkbox(ed.annotative)
         .on_toggle(Message::MTextAnnotative)
         .size(14);
-    let font_sel = if ed.font.trim().is_empty() {
-        "[Style default]".to_string()
-    } else {
-        ed.font.clone()
+    // Without a font of its own the text draws with the style's, which the
+    // field shows (the mark under the label says "By style").
+    let font = ed.font_field();
+    let selected = match &ed.object_style.font {
+        Some(style_font) if font.trim().is_empty() => style_font.clone(),
+        _ => crate::ui::font_picker::FontChoice::of_name(&font),
     };
-    let font_pl = iced::widget::pick_list(
-        Some(font_sel),
-        MTEXT_FONTS
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>(),
-        |value| t!(value).into_owned(),
-    )
-    .on_select(Message::MTextFont)
-    .text_size(11)
-    .width(iced::Length::Fixed(120.0));
+    let file = match &selected {
+        crate::ui::font_picker::FontChoice::Stroke(file) => file.clone(),
+        _ => font,
+    };
+    let font_pl = crate::ui::font_picker::view(crate::ui::font_picker::FontPicker {
+        state: &ed.font_picker,
+        selected,
+        file,
+        width: iced::Length::Fixed(if toolbar_only { 120.0 } else { 150.0 }),
+        read_only: false,
+        on_event: Message::MTextFontPicker,
+    });
     // Same colour picker as the Properties panel (named swatches + "More…" full
     // palette), applied to the selection or the whole text.
     let color_pl = iced::widget::container(crate::ui::color_select::color_selector(
-        codec::types::Color::from_index(ed.color_aci as i16),
+        ed.whole_text_color(),
         ed.color_picker_open,
         crate::ui::color_select::ColorExtras {
             by_layer: true,
@@ -498,280 +1171,153 @@ fn mtext_editor_content<'a>(
         },
         Message::MTextColorChanged,
         Message::MTextColorPickerToggle,
-        Message::OpenColorWindow(
-            crate::app::ColorPickTarget::MText,
-            codec::types::Color::from_index(ed.color_aci as i16),
-        ),
+        Message::OpenColorWindow(crate::app::ColorPickTarget::MText, ed.whole_text_color()),
     ))
-    .width(iced::Length::Fixed(150.0));
+    .width(iced::Length::Fixed(if toolbar_only {
+        110.0
+    } else {
+        150.0
+    }));
 
+    // A value of the text's own takes "Reset to style" on a right click.
+    let resettable = |field: &'static str,
+                      origin: Option<super::super::mtext_editor::ValueOrigin>,
+                      cell: Element<'a, Message>|
+     -> Element<'a, Message> {
+        if origin != Some(super::super::mtext_editor::ValueOrigin::Custom) {
+            return cell;
+        }
+        let value = ed.style_value(field);
+        iced_aw::ContextMenu::new(cell, move || reset_menu(field, &value)).into()
+    };
+    let font_origin = Some(ed.value_origin("font"));
+    let height_origin = ed.height_origin();
+    let width_origin = Some(ed.value_origin("width"));
+    let oblique_origin = Some(ed.value_origin("oblique"));
     let row1 = row![
-        style_pl,
-        row![annotative, text(t!("Annotative")).size(11)]
+        labelled(
+            t!("Style"),
+            None,
+            row![style_pl, mtext_menu::style_menu(ed)]
+                .spacing(2)
+                .align_y(iced::Alignment::Center)
+                .into()
+        ),
+        resettable(
+            "font",
+            font_origin,
+            labelled(t!("Font"), font_origin, font_pl)
+        ),
+        resettable(
+            "height",
+            height_origin,
+            labelled(
+                t!("Height"),
+                height_origin,
+                small_input(
+                    "2.5",
+                    ed.span_field("height", &ed.height),
+                    Message::MTextHeight,
+                    64.0
+                )
+            )
+        ),
+        resettable(
+            "width",
+            width_origin,
+            labelled(
+                t!("Width factor"),
+                width_origin,
+                small_input(
+                    "1",
+                    ed.span_field("width", &ed.width),
+                    Message::MTextWidth,
+                    64.0
+                )
+            )
+        ),
+        resettable(
+            "oblique",
+            oblique_origin,
+            labelled(
+                crate::tr!("mtext-object-origin", "oblique").into(),
+                oblique_origin,
+                row![
+                    small_input(
+                        "0",
+                        ed.span_field("oblique", &ed.oblique),
+                        Message::MTextOblique,
+                        52.0
+                    ),
+                    text("°").size(12)
+                ]
+                .spacing(3)
+                .align_y(iced::Alignment::Center)
+                .into()
+            )
+        ),
+        labelled(
+            t!("Rotation"),
+            None,
+            row![
+                small_input("0", &ed.rotation, Message::MTextRotation, 52.0),
+                text("°").size(12)
+            ]
             .spacing(3)
-            .align_y(iced::Alignment::Center),
-        font_pl,
-        small_input("2.5", &ed.height, Message::MTextHeight, 64.0),
-        iced::widget::Space::new().width(6),
-        icon_btn(
-            include_bytes!("../../../assets/icons/mt_bold.svg"),
-            Message::MTextFmt(MTextFmt::Bold)
+            .align_y(iced::Alignment::Center)
+            .into()
         ),
-        icon_btn(
-            include_bytes!("../../../assets/icons/mt_italic.svg"),
-            Message::MTextFmt(MTextFmt::Italic)
+        labelled(t!("Color"), None, color_pl.into()),
+        labelled(
+            "".into(),
+            None,
+            row![annotative, text(t!("Annotative")).size(11)]
+                .spacing(3)
+                .align_y(iced::Alignment::Center)
+                .into()
         ),
-        icon_btn(
-            include_bytes!("../../../assets/icons/mt_underline.svg"),
-            Message::MTextFmt(MTextFmt::Underline)
-        ),
-        icon_btn(
-            include_bytes!("../../../assets/icons/mt_overline.svg"),
-            Message::MTextFmt(MTextFmt::Overline)
-        ),
-        icon_btn(
-            include_bytes!("../../../assets/icons/mt_strike.svg"),
-            Message::MTextFmt(MTextFmt::Strike)
-        ),
-        icon_btn(
-            include_bytes!("../../../assets/icons/mt_upper.svg"),
-            Message::MTextFmt(MTextFmt::Uppercase)
-        ),
-        icon_btn(
-            include_bytes!("../../../assets/icons/mt_lower.svg"),
-            Message::MTextFmt(MTextFmt::Lowercase)
-        ),
-        iced::widget::Space::new().width(width),
-        color_pl,
     ]
-    .spacing(4)
-    .align_y(iced::Alignment::Center)
-    .width(width);
+    .spacing(if toolbar_only { 4 } else { 10 })
+    .align_y(iced::Alignment::Start)
+    .width(if toolbar_only {
+        iced::Length::Shrink
+    } else {
+        width
+    });
 
-    // ── Row 2: oblique / width / char-spacing · align · line spacing · OK ─
-    let justify = iced::widget::pick_list(
-        Some(JustifyChoice(ed.attachment)),
-        JustifyChoice::ALL,
-        |value| value.to_string(),
-    )
-    .on_select(|c| Message::MTextJustify(c.0))
-    .text_size(11)
-    .width(iced::Length::Fixed(112.0));
-    let row2 = row![
-        button(lbl("↶"))
-            .on_press(Message::MTextUndo)
-            .padding(3)
-            .style(btn_style),
-        button(lbl("↷"))
-            .on_press(Message::MTextRedo)
-            .padding(3)
-            .style(btn_style),
-        lbl("O"),
-        small_input("0", &ed.oblique, Message::MTextOblique, 48.0),
-        lbl("W"),
-        small_input("1", &ed.width, Message::MTextWidth, 48.0),
-        lbl("◊"),
-        small_input("0", &ed.char_space, Message::MTextCharSpace, 48.0),
-        iced::widget::Space::new().width(6),
-        icon_btn(
-            include_bytes!("../../../assets/icons/mt_align_left.svg"),
-            Message::MTextAlign(ParaAlign::Left)
-        ),
-        icon_btn(
-            include_bytes!("../../../assets/icons/mt_align_center.svg"),
-            Message::MTextAlign(ParaAlign::Center)
-        ),
-        icon_btn(
-            include_bytes!("../../../assets/icons/mt_align_right.svg"),
-            Message::MTextAlign(ParaAlign::Right)
-        ),
-        icon_btn(
-            include_bytes!("../../../assets/icons/mt_align_justify.svg"),
-            Message::MTextAlign(ParaAlign::Justify)
-        ),
-        iced::widget::Space::new().width(6),
-        justify,
-        lbl("LS"),
-        button(lbl("1"))
-            .on_press(Message::MTextLineSpacing(1.0))
-            .padding(3)
-            .style(btn_style),
-        button(lbl("1.5"))
-            .on_press(Message::MTextLineSpacing(1.5))
-            .padding(3)
-            .style(btn_style),
-        button(lbl("2"))
-            .on_press(Message::MTextLineSpacing(2.0))
-            .padding(3)
-            .style(btn_style),
-        button(lbl("Stack"))
-            .on_press(Message::MTextStack)
-            .padding(3)
-            .style(btn_style),
-        button(lbl("Clear"))
-            .on_press(Message::MTextClearFormatting)
-            .padding(3)
-            .style(btn_style),
-        button(lbl("°"))
-            .on_press(Message::MTextInsert("°".to_string()))
-            .padding(3)
-            .style(btn_style),
-        button(lbl("±"))
-            .on_press(Message::MTextInsert("±".to_string()))
-            .padding(3)
-            .style(btn_style),
-        button(lbl("⌀"))
-            .on_press(Message::MTextInsert("⌀".to_string()))
-            .padding(3)
-            .style(btn_style),
-    ]
-    .spacing(4)
-    .align_y(iced::Alignment::Center)
-    .width(width);
+    // ── Row 2: character formatting, undo, alignment and the menus ─────────
+    // Below its full width the row scrolls sideways; the thin bar sits
+    // under the controls, never over them.
+    let row2 = iced::widget::scrollable(mtext_toolbar::format_row(ed))
+        .id("mtext-toolbar-2")
+        .direction(iced::widget::scrollable::Direction::Horizontal(
+            iced::widget::scrollable::Scrollbar::new()
+                .width(4)
+                .scroller_width(4)
+                .spacing(2),
+        ))
+        .width(width);
 
-    let column_mode = match (ed.column_type, ed.column_auto_height) {
-        (1, _) => "Static",
-        (2, true) => "Dynamic auto",
-        (2, false) => "Dynamic manual",
-        _ => "No columns",
+    if toolbar_only {
+        let fields = scrollable(row1)
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                iced::widget::scrollable::Scrollbar::new()
+                    .width(3)
+                    .scroller_width(3),
+            ))
+            .width(width);
+        return column![
+            fields,
+            row![row2, mtext_toolbar::compact_status_bar(ed)]
+                .spacing(3)
+                .align_y(iced::Alignment::Center)
+        ]
+        .spacing(2)
+        .width(width)
+        .into();
     }
-    .to_string();
-    let column_picker = iced::widget::pick_list(
-        Some(column_mode),
-        ["No columns", "Static", "Dynamic auto", "Dynamic manual"]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>(),
-        |value| t!(value).into_owned(),
-    )
-    .on_select(Message::MTextColumnMode)
-    .text_size(11)
-    .width(iced::Length::Fixed(120.0));
-    let reverse = checkbox(ed.column_flow_reversed)
-        .on_toggle(Message::MTextColumnFlowReversed)
-        .size(14);
-    let row3 = row![
-        lbl("Columns"),
-        column_picker,
-        lbl("Count"),
-        small_input("2", &ed.column_count, Message::MTextColumnCount, 42.0),
-        lbl("Height"),
-        text_input("0", &ed.rect_height)
-            .on_input(Message::MTextColumnHeight)
-            .width(iced::Length::Fixed(58.0))
-            .padding(3)
-            .size(12),
-        lbl("Width"),
-        small_input("0", &ed.column_width, Message::MTextColumnWidth, 58.0),
-        lbl("Gutter"),
-        small_input("0", &ed.column_gutter, Message::MTextColumnGutter, 58.0),
-        reverse,
-        lbl("Reverse"),
-        iced::widget::Space::new().width(8),
-        lbl("First"),
-        text_input("0", &ed.paragraph_first_indent)
-            .on_input(|value| Message::MTextParagraphNumber(
-                super::super::mtext_editor::ParaNumber::FirstIndent,
-                value,
-            ))
-            .width(iced::Length::Fixed(48.0))
-            .padding(3)
-            .size(12),
-        lbl("Left"),
-        text_input("0", &ed.paragraph_left_indent)
-            .on_input(|value| Message::MTextParagraphNumber(
-                super::super::mtext_editor::ParaNumber::LeftIndent,
-                value,
-            ))
-            .width(iced::Length::Fixed(48.0))
-            .padding(3)
-            .size(12),
-        lbl("Right"),
-        text_input("0", &ed.paragraph_right_indent)
-            .on_input(|value| Message::MTextParagraphNumber(
-                super::super::mtext_editor::ParaNumber::RightIndent,
-                value,
-            ))
-            .width(iced::Length::Fixed(48.0))
-            .padding(3)
-            .size(12),
-        lbl("Before"),
-        text_input("0", &ed.paragraph_space_before)
-            .on_input(|value| Message::MTextParagraphNumber(
-                super::super::mtext_editor::ParaNumber::SpaceBefore,
-                value,
-            ))
-            .width(iced::Length::Fixed(48.0))
-            .padding(3)
-            .size(12),
-        lbl("After"),
-        text_input("0", &ed.paragraph_space_after)
-            .on_input(|value| Message::MTextParagraphNumber(
-                super::super::mtext_editor::ParaNumber::SpaceAfter,
-                value,
-            ))
-            .width(iced::Length::Fixed(48.0))
-            .padding(3)
-            .size(12),
-    ]
-    .spacing(4)
-    .align_y(iced::Alignment::Center)
-    .width(width);
-    let row4 = row![
-        lbl("Find"),
-        text_input(&t!("Find"), &ed.find_text)
-            .on_input(Message::MTextFindText)
-            .width(iced::Length::Fixed(140.0))
-            .padding(3)
-            .size(12),
-        button(lbl("Next"))
-            .on_press(Message::MTextFindNext)
-            .padding(3)
-            .style(btn_style),
-        lbl("Replace"),
-        text_input(&t!("Replace"), &ed.replace_text)
-            .on_input(Message::MTextReplaceText)
-            .width(iced::Length::Fixed(140.0))
-            .padding(3)
-            .size(12),
-        button(lbl("Replace"))
-            .on_press(Message::MTextReplaceNext)
-            .padding(3)
-            .style(btn_style),
-        button(lbl("Replace All"))
-            .on_press(Message::MTextReplaceAll)
-            .padding(3)
-            .style(btn_style),
-    ]
-    .spacing(4)
-    .align_y(iced::Alignment::Center)
-    .width(width);
 
     let preview_scale = ed.preview_scale();
-    let slider_min = 1e-6_f64;
-    let slider_max =
-        f64::from(writing_area_px / preview_scale).max(slider_min * 2.0);
-    let width_slider = column![
-        row![
-            text(t!("Width: %{value}", value = format!("{:.3}", ed.rect_width))).size(11),
-            Space::new().width(width),
-            text(format!("{:.0}%", ed.rect_width / slider_max * 100.0)).size(11),
-        ]
-        .width(width),
-        container(
-            iced::widget::slider(
-                slider_min..=slider_max,
-                ed.rect_width.clamp(slider_min, slider_max),
-                Message::MTextRectWidth,
-            )
-            .step((slider_max * 0.01).max(1e-6))
-            .width(width),
-        )
-        .padding([0.0, MTEXT_PREVIEW_PAD])
-        .width(width),
-    ]
-    .spacing(2)
-    .width(width);
 
     // ── Body: the rendered preview (the editor is preview-only). It fills the
     // space left by the toolbars, so the resizable modal's extra height flows
@@ -785,13 +1331,13 @@ fn mtext_editor_content<'a>(
             .style(move |theme: &Theme| {
                 let palette = theme.palette();
                 container::Style {
-                background: Some(Background::Color(palette.background.base.color)),
-                border: Border {
-                    color: palette.background.neutral.color,
-                    width: 1.0,
-                    radius: 3.0.into(),
-                },
-                ..Default::default()
+                    background: Some(Background::Color(palette.background.base.color)),
+                    border: Border {
+                        color: palette.background.neutral.color,
+                        width: 1.0,
+                        radius: 3.0.into(),
+                    },
+                    ..Default::default()
                 }
             })
             .padding(2)
@@ -800,36 +1346,79 @@ fn mtext_editor_content<'a>(
             .into()
     } else {
         let segments = mtext_preview_segments(ed);
+        // The preview shows the text at the angle it will have in the drawing,
+        // unless that is steeper than 45°: vertical or upside-down text is
+        // laid out level, so it reads along the caret and the keyboard.
+        let angle = ed.rotation_input_value().unwrap_or(0.0) as f32;
+        let rotation = if angle == 0.0 || angle.cos() < std::f32::consts::FRAC_1_SQRT_2 {
+            (1.0, 0.0)
+        } else {
+            (angle.cos(), angle.sin())
+        };
         let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        let mut extend = |x: f32, y: f32| {
+            let (x, y) = turn(rotation, x, y);
+            minx = minx.min(x);
+            miny = miny.min(y);
+            maxx = maxx.max(x);
+            maxy = maxy.max(y);
+        };
         for (seg, _, _) in &segments {
             for &(x, y) in seg {
-                minx = minx.min(x);
-                miny = miny.min(y);
-                maxx = maxx.max(x);
-                maxy = maxy.max(y);
+                extend(x, y);
             }
         }
         // Include glyph boxes so all-whitespace / box-only lines still anchor
         // the transform (hit-testing relies on minx/miny).
         for b in &ed.glyph_boxes {
-            minx = minx.min(b.xmin);
-            miny = miny.min(b.ymin);
-            maxx = maxx.max(b.xmax);
-            maxy = maxy.max(b.ymax);
+            for (x, y) in [
+                (b.xmin, b.ymin),
+                (b.xmax, b.ymin),
+                (b.xmax, b.ymax),
+                (b.xmin, b.ymax),
+            ] {
+                extend(x, y);
+            }
         }
         let scale = preview_scale;
-        let content_h = if maxx >= minx {
-            ((maxy - miny) * scale + 2.0 * MTEXT_PREVIEW_PAD).max(40.0)
-        } else {
-            40.0
-        };
+        // The ruler reads along the layout's x axis, so a turned preview has
+        // none (the status bar's field still sets the width). The box grows
+        // from its attachment: rightwards, both ways or leftwards.
+        let ruler = (rotation == (1.0, 0.0)).then(|| {
+            let width = ed.rect_width as f32;
+            let growth = ed.box_growth();
+            let (left, right) = if growth == 2.0 {
+                (-width * 0.5, width * 0.5)
+            } else if growth < 0.0 {
+                (-width, 0.0)
+            } else {
+                (0.0, width)
+            };
+            BoxRuler {
+                left,
+                right,
+                growth,
+            }
+        });
+        if let Some(ruler) = ruler {
+            if maxx < minx {
+                (minx, maxx, miny, maxy) = (ruler.left, ruler.right, 0.0, 0.0);
+            }
+            minx = minx.min(ruler.left);
+            maxx = maxx.max(ruler.right);
+        }
+        let band = ruler.map_or(0.0, |_| MTEXT_RULER_H);
+        let content_h = band
+            + if maxx >= minx {
+                ((maxy - miny) * scale + 2.0 * MTEXT_PREVIEW_PAD).max(40.0)
+            } else {
+                40.0
+            };
         // Multi-column MTEXT lays its columns out side by side, so the content
         // can be wider than the editor; size the canvas to the real content
         // width and let the scroll area pan horizontally to reach later columns.
         let content_w = if maxx >= minx {
-            ((maxx - minx).max(ed.rect_width as f32) * scale
-                + 2.0 * MTEXT_PREVIEW_PAD)
-                .max(40.0)
+            ((maxx - minx).max(ed.rect_width as f32) * scale + 2.0 * MTEXT_PREVIEW_PAD).max(40.0)
         } else {
             ed.rect_width as f32 * scale + 2.0 * MTEXT_PREVIEW_PAD
         };
@@ -843,7 +1432,15 @@ fn mtext_editor_content<'a>(
             miny,
             scale,
             content_h,
-            wrap_width_px: ed.rect_width as f32 * scale,
+            ruler,
+            rotation,
+            cell: None,
+            inplace: false,
+            translucent: false,
+            marks: ed_marks(ed),
+            fields: ed_fields(ed),
+            highlight: ed_highlight(),
+            background: false,
         };
         let cv = canvas(prog)
             .width(iced::Length::Fixed(content_w))
@@ -852,6 +1449,9 @@ fn mtext_editor_content<'a>(
         // directions so a taller-than-view text scrolls vertically and a
         // wider-than-view multi-column text scrolls horizontally.
         use iced::widget::scrollable::{Direction, Scrollbar};
+        // Typing into the preview goes through the platform input method, so
+        // Chinese, Japanese and Korean text can be entered (#2231).
+        let cv = crate::ui::ime_zone::ime_zone(cv, Message::CommandAppendChar);
         container(
             iced::widget::scrollable(cv)
                 .direction(Direction::Both {
@@ -861,9 +1461,9 @@ fn mtext_editor_content<'a>(
                 .width(width)
                 .height(preview_height),
         )
-            .style(move |theme: &Theme| {
-                let palette = theme.palette();
-                container::Style {
+        .style(move |theme: &Theme| {
+            let palette = theme.palette();
+            container::Style {
                 background: Some(Background::Color(palette.background.base.color)),
                 border: Border {
                     color: palette.background.neutral.color,
@@ -871,35 +1471,17 @@ fn mtext_editor_content<'a>(
                     radius: 3.0.into(),
                 },
                 ..Default::default()
-                }
-            })
-            .padding(2)
-            .width(width)
-            .height(preview_height)
-            .into()
+            }
+        })
+        .padding(2)
+        .id("mtext-editor-viewport")
+        .width(width)
+        .height(preview_height)
+        .into()
     };
 
-    // ── Top action bar: Apply keeps editing; Close saves and exits. Escape
-    // remains the explicit discard path.
-    let action_bar = container(
-        row![
-            iced::widget::Space::new().width(width),
-            crate::ui::style::style_manager::tb_button(t!("Apply"), Message::MTextApply, true),
-            crate::ui::style::style_manager::tb_button(t!("Close Text Editor"), Message::MTextOk, true),
-        ]
-        .align_y(iced::Alignment::Center),
-    )
-    .style(|theme: &Theme| container::Style {
-        background: Some(Background::Color(
-            theme.palette().background.weak.color
-        )),
-        ..Default::default()
-    })
-    .width(width)
-    .padding([5, 8]);
-
     container(
-        column![action_bar, row1, row2, row3, row4, width_slider, body]
+        column![row1, row2, body, mtext_toolbar::status_bar(ed, width)]
             .spacing(6)
             .width(width)
             .height(height),
@@ -918,7 +1500,7 @@ fn mtext_editor_content<'a>(
 /// flip logic runs (e.g. to put a specific row of a menu under the pointer).
 /// When the shifted panel does not fit it flips to the other side of the
 /// *original* anchor, so the pointer never ends up over an unintended row.
-fn position_canvas_overlay_clamped<'a>(
+pub(super) fn position_canvas_overlay_clamped<'a>(
     anchor: iced::Point,
     bottom_inset: f32,
     offset: Vector,
@@ -930,6 +1512,7 @@ fn position_canvas_overlay_clamped<'a>(
         bottom_inset: bottom_inset.max(0.0),
         gap: 0.0,
         offset,
+        passive: false,
     })
 }
 
@@ -946,6 +1529,72 @@ pub(super) fn position_canvas_overlay_near_cursor<'a>(
         bottom_inset: bottom_inset.max(0.0),
         gap: 12.0,
         offset: Vector::ZERO,
+        passive: false,
+    })
+}
+
+/// Native parameter help stays within the viewport and passes input through.
+pub(super) fn grip_tip_overlay<'a>(
+    anchor: iced::Point,
+    bottom_inset: f32,
+    value: String,
+) -> Element<'a, Message> {
+    let panel = container(
+        text(value)
+            .size(12)
+            .shaping(iced::advanced::text::Shaping::Advanced),
+    )
+    .padding(6)
+    .width(Length::Fit.max(420.0))
+    .style(container::bordered_box);
+    Element::new(ClampedPin {
+        content: panel.into(),
+        anchor,
+        bottom_inset: bottom_inset.max(0.0),
+        gap: 12.0,
+        offset: Vector::ZERO,
+        passive: true,
+    })
+}
+
+/// Measured, wrapping text in the existing clamped panel layout. Input goes
+/// straight through, including clicks directly on the result text.
+pub(super) fn measurement_overlay<'a>(
+    anchor: iced::Point,
+    bottom_inset: f32,
+    value: String,
+) -> Element<'a, Message> {
+    // Inquiry commands return a compact, comma-separated summary for the
+    // command line. Show its fields on separate lines in the transient HUD,
+    // without altering the command-line history or the measured precision.
+    let display_value = if value.contains("\n") {
+        value.replace(",  ", "\n").replace(", ", "\n")
+    } else {
+        value
+    };
+    let panel = container(text(display_value).size(12))
+        .padding([6, 8])
+        .width(Length::Fit.max(300.0))
+        .style(|theme: &Theme| {
+            let palette = theme.palette();
+            container::Style {
+                background: Some(Background::Color(palette.background.weak.color)),
+                text_color: Some(palette.background.weak.text),
+                border: Border {
+                    color: palette.background.neutral.color,
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                ..Default::default()
+            }
+        });
+    Element::new(ClampedPin {
+        content: panel.into(),
+        anchor,
+        bottom_inset: bottom_inset.max(0.0),
+        gap: 18.0,
+        offset: Vector::ZERO,
+        passive: true,
     })
 }
 
@@ -956,6 +1605,8 @@ struct ClampedPin<'a> {
     gap: f32,
     /// Preferred placement shift from the anchor (applied before fitting).
     offset: Vector,
+    /// Readouts prefer above the cursor and never participate in input.
+    passive: bool,
 }
 
 impl Widget<Message, Theme, iced::Renderer> for ClampedPin<'_> {
@@ -1010,7 +1661,9 @@ impl Widget<Message, Theme, iced::Renderer> for ClampedPin<'_> {
         let max_y = (max.height - bottom_inset - MARGIN - content.height).max(MARGIN);
         let below = self.anchor.y + self.gap + self.offset.y;
         let above = self.anchor.y - self.gap - content.height;
-        let y = if below <= max_y {
+        let y = if self.passive && above >= MARGIN && above <= max_y {
+            above
+        } else if below <= max_y {
             below.max(MARGIN)
         } else if above >= MARGIN {
             above
@@ -1018,6 +1671,9 @@ impl Widget<Message, Theme, iced::Renderer> for ClampedPin<'_> {
             max_y
         };
 
+        // A cursor over the command-line inset can put even the "above"
+        // candidate below the safe area. Keep this passive readout inside it.
+        let y = if self.passive { y.min(max_y) } else { y };
         node = node.move_to(iced::Point::new(x, y));
         let size = limits.resolve(Length::Fill, Length::Fill, node.size());
         layout::Node::with_children(size, vec![node])
@@ -1048,6 +1704,9 @@ impl Widget<Message, Theme, iced::Renderer> for ClampedPin<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if self.passive {
+            return;
+        }
         self.content.as_widget_mut().update(
             tree,
             event,
@@ -1067,6 +1726,9 @@ impl Widget<Message, Theme, iced::Renderer> for ClampedPin<'_> {
         viewport: &Rectangle,
         renderer: &iced::Renderer,
     ) -> mouse::Interaction {
+        if self.passive {
+            return mouse::Interaction::None;
+        }
         self.content.as_widget().mouse_interaction(
             tree,
             layout.children().next().unwrap(),
@@ -1123,10 +1785,14 @@ impl Widget<Message, Theme, iced::Renderer> for ClampedPin<'_> {
 /// Horizontal inset so the pointer rests inside the default row, not on the
 /// panel's border, when the menu opens.
 const MENU_CURSOR_INSET_X: f32 = 24.0;
+/// Width of the right-click menu's editor.
+const MENU_EDITOR_W: f32 = 300.0;
 /// Width of the icon gutter every row reserves so labels line up whether or
 /// not the row carries a glyph (object snaps, command icons).
 const MENU_GUTTER_W: f32 = 18.0;
-const MENU_ICON_SIZE: f32 = 14.0;
+const MENU_ICON_SIZE: f32 = km::ROW_ICON;
+/// Trailing check mark of checked rows; sits in the submenu caret column.
+const MENU_CHECK_SIZE: f32 = km::BAR_ICON;
 
 /// The gutter cell: the row's glyph, faded with a disabled row, or empty
 /// space of the same width.
@@ -1145,7 +1811,10 @@ fn context_menu_gutter(icon: Option<MenuIcon>, enabled: bool) -> Element<'static
         Some(MenuIcon::Chrome(bytes)) => chrome(bytes),
         Some(MenuIcon::Tool(bytes)) if enabled => icons::semantic(bytes, MENU_ICON_SIZE),
         Some(MenuIcon::Tool(bytes)) => icons::semantic_disabled(bytes, MENU_ICON_SIZE),
-        None => iced::widget::Space::new().width(MENU_ICON_SIZE).height(MENU_ICON_SIZE).into(),
+        None => iced::widget::Space::new()
+            .width(MENU_ICON_SIZE)
+            .height(MENU_ICON_SIZE)
+            .into(),
     };
     container(cell)
         .width(Length::Fixed(MENU_GUTTER_W))
@@ -1165,19 +1834,9 @@ pub(super) fn viewport_context_menu_overlay(
     menu: &ContextMenu,
     highlighted: Option<usize>,
 ) -> Element<'static, Message> {
-    let sep = || -> Element<'static, Message> {
-        container(iced::widget::Space::new().width(Fill).height(1))
-            .style(|theme: &Theme| container::Style {
-                background: Some(Background::Color(
-                    theme.palette().background.weak.color,
-                )),
-                ..Default::default()
-            })
-            .width(Fill)
-            .height(1)
-            .padding([0, 6])
-            .into()
-    };
+    // The kit menu's separator: a hairline centred in the separator
+    // height the model counts (`MENU_SEP_H`).
+    let sep = || crate::ui::kit::menu::entry(crate::ui::kit::menu::Item::Separator);
 
     // Index into `menu.selectable()` of the row being rendered, so the
     // keyboard highlight lands on the same row the model counts.
@@ -1202,30 +1861,35 @@ pub(super) fn viewport_context_menu_overlay(
                 let is_hl = highlighted == Some(sel_idx);
                 let enabled = !children.is_empty();
                 let caret = if !enabled {
-                    crate::ui::icons::themed_disabled_arrow_right(9.0)
+                    crate::ui::icons::themed_disabled_arrow_right(km::CARET)
                 } else if *open {
-                    crate::ui::icons::themed_arrow_down(9.0)
+                    crate::ui::icons::themed_arrow_down(km::CARET)
                 } else {
-                    crate::ui::icons::themed_arrow_right(9.0)
+                    crate::ui::icons::themed_arrow_right(km::CARET)
                 };
                 let content = row![
                     context_menu_gutter(*icon, enabled),
-                    text(label.clone()).size(12),
+                    text(label.clone())
+                        .size(ui_text::UI)
+                        .line_height(ui_text::line())
+                        .wrapping(iced::widget::text::Wrapping::None),
                     iced::widget::Space::new().width(Fill),
                     caret,
                 ]
-                .spacing(4)
+                .spacing(km::TOOL_GAP)
                 .align_y(iced::Center);
                 let mut btn = button(content)
                     .padding(iced::Padding {
-                        top: 3.0,
-                        right: 12.0,
-                        bottom: 3.0,
-                        left: 6.0,
+                        top: 0.0,
+                        right: km::MENU_PAD_X,
+                        bottom: 0.0,
+                        left: km::TOOL_GAP,
                     })
                     .width(Fill)
                     .height(Length::Fixed(MENU_ROW_H))
-                    .style(move |theme: &Theme, status| context_menu_row_style(theme, status, is_hl));
+                    .style(move |theme: &Theme, status| {
+                        context_menu_row_style(theme, status, is_hl)
+                    });
                 if enabled {
                     btn = btn.on_press(Message::ContextMenuSubmenuToggle(*id));
                 }
@@ -1234,7 +1898,7 @@ pub(super) fn viewport_context_menu_overlay(
                 if *open {
                     for child in children {
                         let is_hl = highlighted == Some(sel_idx);
-                        items.push(context_menu_row(child, 14.0, is_hl));
+                        items.push(context_menu_row(child, km::INDENT, is_hl));
                         sel_idx += 1;
                     }
                 }
@@ -1242,18 +1906,20 @@ pub(super) fn viewport_context_menu_overlay(
         }
     }
 
-    let menu_col = column(items).spacing(0).width(Length::Fixed(menu.width));
+    let menu_col = column(items).spacing(0).width(Length::Fill);
     let menu_col = scrollable(menu_col)
         .height(Length::Shrink)
         .direction(scrollable::Direction::Vertical(
             scrollable::Scrollbar::new()
-                .width(8)
-                .scroller_width(6),
-        ));
+                .width(km::SCROLL_THUMB_W)
+                .scroller_width(km::SCROLL_THUMB_W),
+        ))
+        .style(crate::ui::kit::scroll_style);
 
+    // The kit menu's frame.
     let panel = container(menu_col)
-        .style(container::bordered_box)
-        .padding([MENU_PAD_TOP as u16, 0])
+        .style(crate::ui::kit::menu::frame_style)
+        .padding(crate::ui::kit::menu::inset(MENU_PAD_TOP))
         .width(Length::Fixed(menu.width));
 
     // Shift the panel so the default row's centre line is under the pointer.
@@ -1264,16 +1930,155 @@ pub(super) fn viewport_context_menu_overlay(
     position_canvas_overlay_clamped(pos, bottom_inset, offset, panel.into())
 }
 
-/// One menu row: label (bold for the default row, "✓ "-prefixed when
-/// checked), and the keyword hint right-aligned and dimmed. Disabled rows
-/// render without a press handler and with faded text.
-fn context_menu_row(item: &MenuItem, indent: f32, highlighted: bool) -> Element<'static, Message> {
-    let label = if item.checked {
-        format!("✓ {}", item.label)
-    } else {
-        item.label.clone()
+/// The right-click menu turned into its editor, where it was: every row
+/// with a tick to show or hide it (submenu entries indented under their
+/// submenu), the user's own commands with up / down / remove, and a field
+/// to add a command by name or alias.
+pub(super) fn context_menu_editor_overlay(
+    pos: iced::Point,
+    bottom_inset: f32,
+    rows: &[MenuRow],
+    custom: &crate::ui::popup::context_menu::MenuCustomization,
+    draft: &str,
+) -> Element<'static, Message> {
+    use crate::app::ContextMenuEditMsg as E;
+    use crate::ui::popup::context_menu::row_key;
+    let edit = |msg: E| Message::ContextMenuEdit(msg);
+    let shown = |key: &str| !custom.hidden.iter().any(|hidden| hidden == key);
+    let tick = |key: String, label: String, indent: f32| -> Element<'static, Message> {
+        let on = shown(&key);
+        row![
+            iced::widget::Space::new().width(indent),
+            iced::widget::checkbox(on)
+                .label(label)
+                .text_size(ui_text::UI)
+                .size(km::CHECK)
+                .on_toggle(move |_| Message::ContextMenuEdit(E::Toggle(key.clone()))),
+        ]
+        .into()
     };
-    let mut label_text = text(label).size(12);
+    let mut items: Vec<Element<'static, Message>> = vec![crate::ui::kit::value_text(
+        crate::tr!("context-menu", "editor-title"),
+        true,
+    )];
+    for row in rows {
+        match row {
+            // Repeat stays: it is the menu's default row.
+            MenuRow::Item(item) if item.default => {}
+            MenuRow::Item(item) => {
+                if let Some(key) = row_key(row) {
+                    items.push(tick(key, item.label.clone(), 0.0));
+                }
+            }
+            MenuRow::Submenu {
+                id,
+                label,
+                items: children,
+                ..
+            } => {
+                if let Some(key) = row_key(row) {
+                    items.push(tick(key, label.clone(), 0.0));
+                }
+                // Recent Input lists whatever ran last: only the whole of it hides.
+                let fixed = *id != crate::ui::popup::context_menu::SubmenuId::RecentInput;
+                for child in children.iter().filter(|_| fixed) {
+                    let key = row_key(&MenuRow::Item(child.clone())).unwrap_or_default();
+                    items.push(tick(key, child.label.clone(), km::INDENT));
+                }
+            }
+            MenuRow::Separator => {}
+        }
+    }
+    items.push(crate::ui::kit::value_text(
+        crate::tr!("context-menu", "my-commands"),
+        true,
+    ));
+    let small = |glyph: &'static str, msg: Message| {
+        button(container(text(glyph).size(ui_text::UI).line_height(ui_text::line())).center(Fill))
+            .on_press(msg)
+            .width(Length::Fixed(km::BAR_BUTTON))
+            .height(Length::Fixed(km::BAR_BUTTON))
+            .padding(0)
+            .style(crate::ui::kit::flat_button_style(false))
+    };
+    for (index, (label, command)) in custom.custom.iter().enumerate() {
+        items.push(
+            row![
+                crate::ui::kit::one_line(text(format!("{label}  ({command})")))
+                    .size(ui_text::UI)
+                    .line_height(ui_text::line())
+                    .width(Fill),
+                small("↑", edit(E::Move(index, true))),
+                small("↓", edit(E::Move(index, false))),
+                small("×", edit(E::Remove(index))),
+            ]
+            .align_y(iced::Center)
+            .into(),
+        );
+    }
+    items.push(
+        row![
+            iced::widget::text_input(&crate::tr!("context-menu", "command-placeholder"), draft)
+                .on_input(|typed| Message::ContextMenuEdit(E::Draft(typed)))
+                .on_submit(edit(E::Add))
+                .size(ui_text::UI)
+                .line_height(ui_text::line())
+                .padding(crate::ui::kit::BOX_PAD)
+                .style(crate::ui::kit::combo_style)
+                .width(Fill),
+            crate::ui::kit::text_button(
+                crate::tr!("context-menu", "add"),
+                Some(edit(E::Add)),
+                false
+            ),
+        ]
+        .spacing(km::TOOL_GAP)
+        .align_y(iced::Center)
+        .into(),
+    );
+    items.push(
+        row![
+            iced::widget::Space::new().width(Fill),
+            crate::ui::kit::text_button(
+                crate::tr!("context-menu", "done"),
+                Some(edit(E::Done)),
+                true
+            ),
+        ]
+        .into(),
+    );
+    let body = scrollable(
+        column(items)
+            .spacing(km::TOOL_GAP)
+            .padding([km::TOOL_GAP, km::GRID_INSET_L])
+            .width(Length::Fixed(MENU_EDITOR_W)),
+    )
+    .style(crate::ui::kit::scroll_style)
+    .height(Length::Shrink);
+    let panel = container(body)
+        .style(crate::ui::kit::menu::frame_style)
+        .padding(crate::ui::kit::menu::inset(MENU_PAD_TOP))
+        .width(Length::Fixed(MENU_EDITOR_W));
+    position_canvas_overlay_clamped(
+        pos,
+        bottom_inset,
+        Vector::new(-MENU_CURSOR_INSET_X, 0.0),
+        panel.into(),
+    )
+}
+
+/// One menu row: label (bold for the default row), the keyword hint
+/// right-aligned and dimmed, and a check mark in the trailing column (where
+/// submenu headers draw their caret) when checked, so checked labels stay
+/// aligned with the others. Disabled rows render without a press handler and
+/// with faded text and icons.
+fn context_menu_row(item: &MenuItem, indent: f32, highlighted: bool) -> Element<'static, Message> {
+    // Rows have a fixed height: a long label must not wrap onto the next
+    // row (#2170).
+    let mut label_text = text(item.label.clone())
+        .size(ui_text::UI)
+        .line_height(ui_text::line())
+        .wrapping(iced::widget::text::Wrapping::None);
     if item.default {
         label_text = label_text.font(iced::Font {
             weight: iced::font::Weight::Bold,
@@ -1282,33 +2087,39 @@ fn context_menu_row(item: &MenuItem, indent: f32, highlighted: bool) -> Element<
     }
     let enabled = item.enabled;
     let mut content = row![context_menu_gutter(item.icon, enabled), label_text]
-        .spacing(4)
+        .spacing(km::TOOL_GAP)
         .align_y(iced::Center);
     if let Some(hint) = item.hint.as_ref() {
-        content = content
-            .push(iced::widget::Space::new().width(Fill))
-            .push(
-                text(hint.clone())
-                    .size(11)
-                    .style(move |theme: &Theme| {
-                        let palette = theme.palette();
-                        let base = if highlighted {
-                            palette.primary.strong.text
-                        } else {
-                            palette.background.base.text
-                        };
-                        iced::widget::text::Style {
-                            color: Some(base.scale_alpha(if enabled { 0.6 } else { 0.35 })),
-                        }
+        // Muted, as a kit menu item's shortcut.
+        content = content.push(iced::widget::Space::new().width(Fill)).push(
+            text(hint.clone())
+                .size(ui_text::UI)
+                .line_height(ui_text::line())
+                .style(move |theme: &Theme| iced::widget::text::Style {
+                    color: Some(if enabled {
+                        chrome::muted(theme)
+                    } else {
+                        chrome::muted(theme).scale_alpha(0.6)
                     }),
-            );
+                }),
+        );
+    }
+    if item.checked {
+        if item.hint.is_none() {
+            content = content.push(iced::widget::Space::new().width(Fill));
+        }
+        content = content.push(if enabled {
+            crate::ui::icons::themed(crate::ui::icons::CHECK, MENU_CHECK_SIZE)
+        } else {
+            crate::ui::icons::themed_disabled(crate::ui::icons::CHECK, MENU_CHECK_SIZE)
+        });
     }
     let mut btn = button(content)
         .padding(iced::Padding {
-            top: 3.0,
-            right: 12.0,
-            bottom: 3.0,
-            left: 6.0 + indent,
+            top: 0.0,
+            right: km::MENU_PAD_X,
+            bottom: 0.0,
+            left: km::TOOL_GAP + indent,
         })
         .width(Fill)
         .height(Length::Fixed(MENU_ROW_H))
@@ -1319,24 +2130,21 @@ fn context_menu_row(item: &MenuItem, indent: f32, highlighted: bool) -> Element<
     btn.into()
 }
 
-/// Row colours: keyboard highlight uses the accent (as the grip popup does),
-/// hover the subtle background tint, disabled rows faded text.
-fn context_menu_row_style(theme: &Theme, status: button::Status, highlighted: bool) -> button::Style {
-    let palette = theme.palette();
-    let (background, text_color) = if highlighted {
-        (
-            Some(Background::Color(palette.primary.strong.color)),
-            palette.primary.strong.text,
-        )
-    } else {
-        match status {
-            button::Status::Hovered | button::Status::Pressed => (
-                Some(Background::Color(palette.background.weak.color)),
-                palette.background.weak.text,
-            ),
-            button::Status::Disabled => (None, palette.background.base.text.scale_alpha(0.42)),
-            button::Status::Active => (None, palette.background.base.text),
-        }
+/// Row colours, the kit menu's: the keyboard highlight and the hovered
+/// row lit with `hover`, disabled rows muted.
+fn context_menu_row_style(
+    theme: &Theme,
+    status: button::Status,
+    highlighted: bool,
+) -> button::Style {
+    let lit = highlighted || matches!(status, button::Status::Hovered | button::Status::Pressed);
+    let (background, text_color) = match status {
+        button::Status::Disabled => (None, chrome::muted(theme)),
+        _ if lit => (
+            Some(Background::Color(chrome::hover(theme))),
+            chrome::text(theme),
+        ),
+        _ => (None, chrome::text(theme)),
     };
     button::Style {
         background,
@@ -1350,65 +2158,144 @@ fn context_menu_row_style(theme: &Theme, status: button::Status, highlighted: bo
     }
 }
 
+// ── Quad cursor menu ────────────────────────────────────────────────────────
+
+/// Render the quad cursor menu (panels from
+/// `ui::popup::quad_menu::quad_panels_for_target`) on its anchor and a
+/// full-viewport click catcher: collapsed the single default-command tile,
+/// expanded the panel card with its tab strip, the default icon always under
+/// the pointer, so a follow-up click in place launches the command with the
+/// same cursor discipline as the context menu. The catcher sits *below* the
+/// card: an outside press closes the quad (docs/quad-menu.md §3.5).
+pub(super) fn viewport_quad_overlay<'a>(
+    quad: &QuadUi,
+    panels: &[QuadPanel],
+    quad_width: usize,
+    bottom_inset: f32,
+) -> Element<'a, Message> {
+    use crate::ui::popup::quad_overlay;
+
+    // Collapsed the quad is one tile; expanded the pinned panel card. An
+    // empty primary panel (nothing applicable) has nothing to show.
+    let quad_element = if quad.expanded {
+        Some(quad_overlay::quad_expanded_card(quad, panels, quad_width))
+    } else {
+        panels.first().and_then(|panel| {
+            panel
+                .items
+                .first()
+                .map(|item| quad_overlay::quad_collapsed_tile(item, &panel.id))
+        })
+    };
+
+    // The hover quad opens on its own beside the cursor: it catches no clicks
+    // and sits up and right of the pointer, so the hovered object can still
+    // be clicked, and it closes when the cursor leaves for elsewhere.
+    if quad.mode == crate::ui::popup::quad_menu::QuadMode::Hover {
+        let Some(content) = quad_element else {
+            return iced::widget::Space::new().into();
+        };
+        let gap = quad_overlay::QUAD_HOVER_GAP;
+        let offset = if quad.expanded {
+            Vector::new(
+                gap - quad_overlay::QUAD_PANEL_PAD,
+                -(gap + quad_overlay::QUAD_TILE + quad_overlay::QUAD_PANEL_PAD),
+            )
+        } else {
+            Vector::new(gap, -(gap + quad_overlay::QUAD_TILE))
+        };
+        return position_canvas_overlay_clamped(quad.anchor, bottom_inset, offset, content);
+    }
+
+    let catcher = mouse_area(
+        container(iced::widget::Space::new().width(Fill).height(Fill))
+            .width(Fill)
+            .height(Fill),
+    )
+    .on_press(Message::Quad(QuadMsg::Close))
+    .on_right_press(Message::Quad(QuadMsg::Close));
+
+    let Some(content) = quad_element else {
+        // No commands at all: the catcher alone lets the next click close it.
+        return catcher.into();
+    };
+
+    // Keep the default icon's centre under the pointer: the grid pad plus
+    // the half tile (collapsed just the half tile).
+    let half_tile = quad_overlay::QUAD_TILE * 0.5;
+    let offset = if quad.expanded {
+        Vector::new(
+            -(quad_overlay::QUAD_PANEL_PAD + half_tile),
+            -(quad_overlay::QUAD_PANEL_PAD + half_tile),
+        )
+    } else {
+        Vector::new(-half_tile, -half_tile)
+    };
+    stack![
+        catcher,
+        position_canvas_overlay_clamped(quad.anchor, bottom_inset, offset, content)
+    ]
+    .into()
+}
+
 /// One-shot snap override menu (Shift+RMB, #337): a cursor-anchored grid of
-/// snap ICONS only — the names show as hover tooltips. Picking one applies
-/// that snap to just the next point pick; the trailing MTP cell instead
-/// suspends the prompt for two picks and returns their midpoint.
+/// snap ICONS only — the names show as hover tooltips, with the letter that
+/// picks each from the keyboard. Picking one applies that snap to just the
+/// next point pick; MTP and FROM instead suspend the prompt to compute a point.
 pub(super) fn snap_override_overlay(pos: iced::Point) -> Element<'static, Message> {
     const COLS: usize = 4;
 
-    let cell_icon = |icon: &'static [u8], label: String, msg: Message| -> Element<'static, Message> {
-        let icon = container(crate::ui::icons::themed::<Message>(icon, 16.0))
-        .width(26)
-        .height(26)
-        .align_x(iced::Center)
-        .align_y(iced::Center);
-        let btn = button(icon)
-            .on_press(msg)
-            .style(|theme: &Theme, status| button::Style {
-                background: matches!(
-                    status,
-                    button::Status::Hovered | button::Status::Pressed
-                )
-                .then_some(Background::Color(
-                    theme.palette().primary.weak.color
-                )),
-                border: Border::default(),
-                text_color: theme.palette().background.base.text,
-                ..Default::default()
-            })
-            .padding(2);
-        iced::widget::tooltip(
-            btn,
-            container(text(label).size(11))
-                .style(|theme: &Theme| {
-                    let palette = theme.palette();
-                    container::Style {
-                    background: Some(Background::Color(palette.background.strong.color)),
-                    border: Border {
-                        color: palette.background.neutral.color,
-                        width: 1.0,
-                        radius: 2.0.into(),
-                    },
-                    text_color: Some(palette.background.strong.text),
+    let cell_icon =
+        |icon: &'static [u8], label: String, msg: Message| -> Element<'static, Message> {
+            let icon = container(crate::ui::icons::themed::<Message>(icon, 16.0))
+                .width(26)
+                .height(26)
+                .align_x(iced::Center)
+                .align_y(iced::Center);
+            let btn = button(icon)
+                .on_press(msg)
+                .style(|theme: &Theme, status| button::Style {
+                    background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+                        .then_some(Background::Color(theme.palette().primary.weak.color)),
+                    border: Border::default(),
+                    text_color: theme.palette().background.base.text,
                     ..Default::default()
-                    }
                 })
-                .padding([2, 6]),
-            iced::widget::tooltip::Position::Bottom,
-        )
-        .into()
-    };
+                .padding(2);
+            iced::widget::tooltip(
+                btn,
+                container(text(label).size(11))
+                    .style(|theme: &Theme| {
+                        let palette = theme.palette();
+                        container::Style {
+                            background: Some(Background::Color(palette.background.strong.color)),
+                            border: Border {
+                                color: palette.background.neutral.color,
+                                width: 1.0,
+                                radius: 2.0.into(),
+                            },
+                            text_color: Some(palette.background.strong.text),
+                            ..Default::default()
+                        }
+                    })
+                    .padding([2, 6]),
+                iced::widget::tooltip::Position::Bottom,
+            )
+            .into()
+        };
 
-    // MTP (`_M2P`) goes last, after Parallel: two picks, so not a
-    // `SnapType`, but same icon-only cell with hover tooltip.
-    let mut cells: Vec<Element<'static, Message>> = Vec::with_capacity(
-        crate::snap::ALL_SNAP_MODES.len() + 1,
-    );
+    // Point modifiers follow the snaps, with the same icon-only cells.
+    let mut cells: Vec<Element<'static, Message>> =
+        Vec::with_capacity(crate::snap::ALL_SNAP_MODES.len() + 2);
     for &(snap_type, _glyph, label) in crate::snap::ALL_SNAP_MODES {
+        // The tooltip teaches the letter that picks the cell from the keyboard.
+        let label = match crate::snap::override_menu_key(snap_type) {
+            Some(key) => format!("{} ({key})", t!(label)),
+            None => t!(label).into_owned(),
+        };
         cells.push(cell_icon(
             crate::ui::icons::osnap(snap_type),
-            label.to_string(),
+            label,
             Message::SnapOverridePick(snap_type),
         ));
     }
@@ -1416,6 +2303,11 @@ pub(super) fn snap_override_overlay(pos: iced::Point) -> Element<'static, Messag
         crate::ui::icons::mtp_icon(),
         t!("Mid Between 2 Points (M2P)").into_owned(),
         Message::SnapOverrideMtp,
+    ));
+    cells.push(cell_icon(
+        crate::ui::icons::from_icon(),
+        format!("{} (F)", t!("From")),
+        Message::SnapOverrideFrom,
     ));
     let mut grid = column![].spacing(2);
     while !cells.is_empty() {
@@ -1431,13 +2323,13 @@ pub(super) fn snap_override_overlay(pos: iced::Point) -> Element<'static, Messag
         .style(|theme: &Theme| {
             let palette = theme.palette();
             container::Style {
-            background: Some(Background::Color(palette.background.weak.color)),
-            border: Border {
-                color: palette.background.neutral.color,
-                width: 1.0,
-                radius: 4.0.into(),
-            },
-            ..Default::default()
+                background: Some(Background::Color(palette.background.weak.color)),
+                border: Border {
+                    color: palette.background.neutral.color,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
             }
         })
         .padding(4);
@@ -1464,7 +2356,8 @@ const QSELECT_ANY_PROP: &str = "(Any property)";
 /// field and button styles as the other workspace dialogs.
 pub(super) fn qselect_overlay<'a>(
     state: &'a crate::app::QSelectState,
-    types: &[String],
+    transparent_for: Option<&'a str>,
+    types: &[(String, usize)],
     properties: &[crate::app::QSelectPropertyChoice],
     candidate_count: usize,
     modal_offset: iced::Vector,
@@ -1472,6 +2365,7 @@ pub(super) fn qselect_overlay<'a>(
 ) -> Element<'a, Message> {
     let measurement = qselect_content(
         state,
+        transparent_for,
         types,
         properties,
         candidate_count,
@@ -1479,21 +2373,26 @@ pub(super) fn qselect_overlay<'a>(
     );
     let content = qselect_content(
         state,
+        transparent_for,
         types,
         properties,
         candidate_count,
         crate::ui::modal::ModalSizing::FILL,
     );
+    // Long imported values must not make the natural dialog span the viewport.
     let content = crate::ui::modal::intrinsic(
         measurement,
         content,
-        iced::Size::INFINITE,
+        iced::Size::new(480.0, f32::INFINITY),
         modal_resize,
     );
 
     crate::ui::modal::modal(
         Space::new().width(Fill).height(Fill),
-        t!("Quick Select"),
+        match transparent_for {
+            Some(command) => crate::tf!("Quick Select · for {}", command),
+            None => t!("Quick Select"),
+        },
         content,
         Message::QSelectClose,
         modal_offset,
@@ -1501,277 +2400,641 @@ pub(super) fn qselect_overlay<'a>(
     )
 }
 
+/// Object type label for the selection filter; INSERT reads as a block reference.
+fn qselect_type_label(name: &str) -> String {
+    if name == "Insert" {
+        t!("Block Reference").into_owned()
+    } else {
+        t!(name).into_owned()
+    }
+}
+
 fn qselect_content<'a>(
     state: &'a crate::app::QSelectState,
-    types: &[String],
+    transparent_for: Option<&'a str>,
+    types: &[(String, usize)],
     properties: &[crate::app::QSelectPropertyChoice],
     candidate_count: usize,
     sizing: crate::ui::modal::ModalSizing,
 ) -> Element<'a, Message> {
+    use crate::app::{QSelectMode, QSelectOp, QSelectResult, QSelectScope, QSelectValueEditor};
+    use crate::ui::style::form::{button_style, dialog_button, dialog_button_styled_opt};
     use iced::widget::{checkbox, rule};
-    use crate::ui::style::form::{dialog_button, dialog_button_styled_opt, form_radio};
-    let mut type_options: Vec<String> = vec![QSELECT_ANY_TYPE.to_string()];
-    type_options.extend(types.iter().cloned());
+    let fill = matches!(sizing.width, iced::Length::Fill);
+    let field_width = if fill { Fill } else { iced::Length::Shrink };
+    let flex_width = field_width;
 
-    let mut prop_options: Vec<crate::app::QSelectPropertyChoice> =
-        vec![crate::app::QSelectPropertyChoice {
-            field: String::new(),
-            label: t!(QSELECT_ANY_PROP).into_owned(),
-            editor: crate::app::QSelectValueEditor::Text,
-        }];
-    prop_options.extend(properties.iter().cloned());
+    let muted = |s: std::borrow::Cow<'static, str>| {
+        text(s)
+            .size(11)
+            .style(|theme: &Theme| iced::widget::text::Style {
+                color: Some(crate::ui::style::readable::muted_text(theme)),
+            })
+    };
+    let heading = |s: std::borrow::Cow<'static, str>| text(s).size(12);
+    let label =
+        |s: std::borrow::Cow<'static, str>| text(s).size(12).width(iced::Length::Fixed(96.0));
+    // A row of buttons where one is chosen; the chosen one uses the theme's
+    // accent, the rest stay neutral (#2611: no colours of its own).
+    let segmented = |options: Vec<(Message, std::borrow::Cow<'static, str>, bool)>| {
+        let buttons: Vec<Element<'a, Message>> = options
+            .into_iter()
+            .map(|(message, caption, chosen)| {
+                button(
+                    text(caption)
+                        .size(12)
+                        .align_x(iced::Center)
+                        .width(field_width),
+                )
+                .on_press(message)
+                .style(button_style(chosen))
+                .padding([4, 10])
+                .width(field_width)
+                .into()
+            })
+            .collect();
+        iced::widget::Row::with_children(buttons)
+            .spacing(2)
+            .width(sizing.width)
+    };
 
-    let number_property = state.property.as_ref().is_some_and(|property| {
-        matches!(property.editor, crate::app::QSelectValueEditor::Number)
-    });
-    let mut op_options: Vec<crate::app::QSelectOp> = vec![
-        crate::app::QSelectOp::Eq,
-        crate::app::QSelectOp::Neq,
+    // ── Search in ──────────────────────────────────────────────────────
+    let scopes = [QSelectScope::CurrentSpace, QSelectScope::CurrentSelection];
+    let search_in = column![
+        row![
+            heading(t!("Search in")),
+            Space::new().width(flex_width),
+            muted(crate::tf!(
+                "{} objects",
+                crate::ui::live_result::fmt_count(candidate_count)
+            )),
+        ]
+        .align_y(iced::Alignment::Center)
+        .width(sizing.width),
+        Space::new().height(5),
+        segmented(
+            scopes
+                .iter()
+                .map(|scope| {
+                    (
+                        Message::QSelectSetScope(*scope),
+                        match scope {
+                            QSelectScope::CurrentSelection => t!("Selection"),
+                            _ => std::borrow::Cow::Owned(scope.to_string()),
+                        },
+                        state.scope == *scope,
+                    )
+                })
+                // Window…: pick the objects to search in (#2611 mockup).
+                .chain(std::iter::once((
+                    Message::QSelectWindow,
+                    t!("Window…"),
+                    false,
+                )))
+                .collect()
+        ),
+        if state.scope == QSelectScope::CurrentSelection {
+            crate::ui::live_result::selection_note(
+                candidate_count,
+                Message::QSelectSetScope(QSelectScope::CurrentSpace),
+            )
+        } else {
+            Element::from(Space::new().height(0))
+        },
     ];
-    if number_property {
-        op_options.push(crate::app::QSelectOp::Gt);
-        op_options.push(crate::app::QSelectOp::Lt);
-    }
-    op_options.push(crate::app::QSelectOp::Any);
 
+    // ── Object type · Property · Value ─────────────────────────────────
+    let mut type_options: Vec<String> = vec![QSELECT_ANY_TYPE.to_string()];
+    type_options.extend(types.iter().map(|(name, _)| name.clone()));
+    let counts: std::collections::HashMap<String, usize> = types.iter().cloned().collect();
     let type_sel = state
         .type_filter
         .clone()
         .unwrap_or_else(|| QSELECT_ANY_TYPE.to_string());
-    let prop_sel = state
-        .property
-        .clone()
-        .unwrap_or(crate::app::QSelectPropertyChoice {
-            field: String::new(),
-            label: t!(QSELECT_ANY_PROP).into_owned(),
-            editor: crate::app::QSelectValueEditor::Text,
-        });
-
-    let value_enabled =
-        state.property.is_some() && !matches!(state.operator, crate::app::QSelectOp::Any);
-    let field_width = if matches!(sizing.width, iced::Length::Fill) {
-        Fill
-    } else {
-        iced::Length::Shrink
-    };
-    let flex_width = if matches!(sizing.width, iced::Length::Fill) {
-        Fill
-    } else {
-        iced::Length::Shrink
-    };
-
-    let label = |s: std::borrow::Cow<'static, str>| {
-        text(s)
-            .size(12)
-            .width(iced::Length::Fixed(112.0))
-    };
-    let section_label = |s: std::borrow::Cow<'static, str>| {
-        text(s).size(11).style(|theme: &Theme| iced::widget::text::Style {
-            color: Some(theme.palette().background.base.text.scale_alpha(0.65)),
+    let type_picker =
+        crate::ui::dropdown_list::pick_list(Some(type_sel), type_options, move |name| match counts
+            .get(name)
+        {
+            Some(count) => format!(
+                "{}   {}",
+                qselect_type_label(name),
+                crate::ui::live_result::fmt_count(*count)
+            ),
+            None => t!(QSELECT_ANY_TYPE).into_owned(),
         })
-    };
+        .on_select(|s: String| {
+            if s == QSELECT_ANY_TYPE {
+                Message::QSelectSetType(None)
+            } else {
+                Message::QSelectSetType(Some(s))
+            }
+        })
+        .text_size(12)
+        .width(field_width);
 
+    let any_property = crate::app::QSelectPropertyChoice {
+        field: String::new(),
+        label: t!(QSELECT_ANY_PROP).into_owned(),
+        editor: QSelectValueEditor::Text,
+    };
+    let mut prop_options = vec![any_property.clone()];
+    prop_options.extend(properties.iter().cloned());
+    let prop_sel = state.property.clone().unwrap_or(any_property);
+    let property_picker =
+        crate::ui::dropdown_list::pick_list(Some(prop_sel), prop_options, |value| {
+            value.to_string()
+        })
+        .on_select(|p: crate::app::QSelectPropertyChoice| {
+            if p.field.is_empty() {
+                Message::QSelectSetProperty(None)
+            } else {
+                Message::QSelectSetProperty(Some(p))
+            }
+        })
+        .text_size(12)
+        .width(field_width);
+
+    let number_property = state
+        .property
+        .as_ref()
+        .is_some_and(|property| matches!(property.editor, QSelectValueEditor::Number));
+    let mut op_options = vec![QSelectOp::Eq, QSelectOp::Neq];
+    if number_property {
+        op_options.extend([QSelectOp::Gt, QSelectOp::Ge, QSelectOp::Lt, QSelectOp::Le]);
+    }
+    op_options.push(QSelectOp::Any);
+    let op_picker =
+        crate::ui::dropdown_list::pick_list(Some(state.operator), op_options, |value| {
+            value.to_string()
+        })
+        .on_select(Message::QSelectSetOperator)
+        .text_size(12)
+        .width(iced::Length::Fixed(120.0));
+
+    let value_enabled = state.property.is_some() && !matches!(state.operator, QSelectOp::Any);
     let value_editor: Element<'a, Message> = match state.property.as_ref() {
         Some(property) => match &property.editor {
-            crate::app::QSelectValueEditor::Choice(options) => {
+            QSelectValueEditor::Choice(options) => {
                 let selected = (!state.value.is_empty()).then(|| state.value.clone());
-                let picker = iced::widget::pick_list(
-                    selected,
-                    options.clone(),
-                    |value| value.to_string(),
-                )
-                .width(field_width);
+                let picker =
+                    crate::ui::dropdown_list::pick_list(selected, options.clone(), |value| {
+                        value.to_string()
+                    })
+                    .width(field_width);
                 if value_enabled {
                     picker.on_select(Message::QSelectSetValue).into()
                 } else {
                     picker.into()
                 }
             }
-            crate::app::QSelectValueEditor::Text
-            | crate::app::QSelectValueEditor::Number => {
-                let mut input = text_input("", &state.value).size(12).width(field_width);
+            QSelectValueEditor::Text | QSelectValueEditor::Number => {
+                // Room to type even in the dialog's natural size.
+                let width = if fill {
+                    Fill
+                } else {
+                    iced::Length::Fixed(150.0)
+                };
+                let mut input = text_input("", &state.value).size(12).width(width);
                 if value_enabled {
                     input = input.on_input(Message::QSelectSetValue);
                 }
                 input.into()
             }
         },
-        None => text_input("", "").size(12).width(field_width).into(),
+        None => text_input("", "")
+            .size(12)
+            .width(if fill {
+                Fill
+            } else {
+                iced::Length::Fixed(150.0)
+            })
+            .into(),
     };
-
-    let derived_error = if candidate_count == 0 {
-        Some(crate::t!("No objects are available in this scope.").into_owned())
-    } else if value_enabled && number_property
-        && crate::entities::common::parse_f64(&state.value).is_none()
-    {
-        Some(crate::t!("Enter a valid number.").into_owned())
-    } else if value_enabled
-        && state.property.as_ref().is_some_and(|property| {
-            matches!(property.editor, crate::app::QSelectValueEditor::Choice(_))
-        })
-        && state.value.is_empty()
-    {
-        Some(crate::t!("Choose a value.").into_owned())
-    } else if matches!(state.operator, crate::app::QSelectOp::Gt | crate::app::QSelectOp::Lt)
-        && !number_property
-    {
-        Some(crate::t!("This operator requires a numeric property.").into_owned())
-    } else {
-        None
-    };
-    let error = state.error.clone().or(derived_error);
-
-    let scope_options = vec![
-        crate::app::QSelectScope::CurrentSpace,
-        crate::app::QSelectScope::CurrentSelection,
-    ];
-    let scope_picker = iced::widget::pick_list(
-        Some(state.scope),
-        scope_options,
-        |value| value.to_string(),
-    )
-    .on_select(Message::QSelectSetScope)
-    .width(field_width);
-
-    let mut append = checkbox(state.append).size(14);
-    if matches!(state.scope, crate::app::QSelectScope::CurrentSpace) {
-        append = append.on_toggle(Message::QSelectSetAppend);
+    // The most frequent values in the scope, one click each.
+    let mut shortcuts = row![].spacing(4);
+    if value_enabled {
+        for (value, count) in state.value_counts.iter().take(3) {
+            shortcuts = shortcuts.push(
+                button(text(format!("{value}  ({count})")).size(11))
+                    .on_press(Message::QSelectSetValue(value.clone()))
+                    .style(button_style(state.value == *value))
+                    .padding([2, 8]),
+            );
+        }
     }
 
-    let cancel = dialog_button(t!("Cancel"), Message::QSelectClose, false);
-    let apply = dialog_button_styled_opt(
-        t!("Apply"),
-        error.is_none().then_some(Message::QSelectApply),
+    // Conditions from a picked object (#2611 mockup: the pipette).
+    let pipette = iced::widget::tooltip(
+        button(crate::ui::icons::themed(crate::ui::icons::EYEDROPPER, 13.0))
+            .on_press_maybe(
+                (state.editing_condition.is_none() && state.sample.is_none())
+                    .then_some(Message::QSelectPickObject),
+            )
+            .style(button::secondary)
+            .padding([5, 7]),
+        container(text(t!("Select object")).size(11)).padding([3, 7]),
+        iced::widget::tooltip::Position::Bottom,
+    );
+    let draft_ready = state.type_filter.is_some() || state.property.is_some();
+    let add_draft = button(
+        text(if state.editing_condition.is_some() {
+            t!("Update")
+        } else {
+            t!("Add")
+        })
+        .size(12),
+    )
+    .on_press_maybe(
+        (draft_ready
+            && state.sample.is_none()
+            && crate::app::QSelectCondition::validation_error_for(
+                state.type_filter.as_deref(),
+                state.property.as_ref(),
+                state.operator,
+                &state.value,
+            )
+            .is_none())
+        .then_some(Message::QSelectAddCondition),
+    )
+    .style(button::secondary)
+    .padding([5, 10]);
+    // A value typed that is not one (a word where a number goes): said under
+    // the field, not at the bottom.
+    let inline_error = (!state.value.is_empty())
+        .then(|| {
+            crate::app::QSelectCondition::validation_error_for(
+                state.type_filter.as_deref(),
+                state.property.as_ref(),
+                state.operator,
+                &state.value,
+            )
+        })
+        .flatten();
+    let fields = column![
+        row![label(t!("Object type")), type_picker, pipette]
+            .align_y(iced::Alignment::Center)
+            .spacing(8)
+            .width(sizing.width),
+        Space::new().height(6),
+        row![label(t!("Property")), property_picker]
+            .align_y(iced::Alignment::Center)
+            .spacing(8)
+            .width(sizing.width),
+        Space::new().height(6),
+        row![
+            label(t!("Value")),
+            op_picker,
+            value_editor,
+            crate::ui::live_result::pattern_help(),
+            add_draft
+        ]
+        .align_y(iced::Alignment::Center)
+        .spacing(6)
+        .width(sizing.width),
+        // What is wrong with the value, right under it (mockup, States).
+        match (&inline_error, value_enabled) {
+            (Some(problem), true) => Element::from(row![
+                Space::new().width(iced::Length::Fixed(104.0)),
+                text(problem.clone()).size(11).style(|theme: &Theme| {
+                    iced::widget::text::Style {
+                        color: Some(theme.palette().danger.base.color),
+                    }
+                })
+            ]),
+            _ => Element::from(Space::new().height(0)),
+        },
+        Space::new().height(4),
+        row![Space::new().width(iced::Length::Fixed(104.0)), shortcuts],
+    ];
+
+    // ── Conditions, or the picked object's properties to tick ─────────
+    let conditions_block: Element<'a, Message> = if let Some(sample) = &state.sample {
+        let mut rows = column![].spacing(4);
+        for (index, (condition, ticked)) in sample.rows.iter().enumerate() {
+            rows = rows.push(
+                checkbox(*ticked)
+                    .label(qselect_condition_summary(condition))
+                    .text_size(12)
+                    .size(14)
+                    .on_toggle(move |_| Message::QSelectSampleToggle(index)),
+            );
+        }
+        column![
+            heading(crate::tf!(
+                "Properties of the picked {}",
+                qselect_type_label(&sample.type_name)
+            )),
+            Space::new().height(5),
+            iced::widget::scrollable(rows)
+                .height(150)
+                .width(sizing.width),
+            Space::new().height(6),
+            row![
+                dialog_button(t!("Add ticked conditions"), Message::QSelectSampleAdd, true),
+                dialog_button(t!("Cancel"), Message::QSelectSampleCancel, false),
+            ]
+            .spacing(6),
+        ]
+        .into()
+    } else {
+        let mut rows = column![].spacing(2);
+        if state.conditions.is_empty() {
+            rows = rows.push(muted(t!("No conditions added.")));
+        }
+        // One block per object type, its count from the live result (#2611
+        // mockup: "Line · Layer = FAL* · 312").
+        let mut types_in_order: Vec<Option<String>> = Vec::new();
+        for condition in &state.conditions {
+            if !types_in_order.contains(&condition.type_filter) {
+                types_in_order.push(condition.type_filter.clone());
+            }
+        }
+        for type_filter in types_in_order {
+            let count = type_filter.as_ref().and_then(|t| {
+                state
+                    .live_by_type
+                    .iter()
+                    .find(|(name, _)| name == t)
+                    .map(|(_, n)| *n)
+            });
+            rows = rows.push(
+                row![
+                    text(
+                        type_filter
+                            .as_deref()
+                            .map(qselect_type_label)
+                            .unwrap_or_else(|| t!(QSELECT_ANY_TYPE).into_owned())
+                    )
+                    .size(12)
+                    .width(flex_width),
+                    muted(std::borrow::Cow::Owned(
+                        count
+                            .map(crate::ui::live_result::fmt_count)
+                            .unwrap_or_default()
+                    )),
+                ]
+                .align_y(iced::Alignment::Center),
+            );
+            for (index, condition) in state
+                .conditions
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.type_filter == type_filter)
+            {
+                if condition.property.is_none() {
+                    continue;
+                }
+                let editing = state.editing_condition == Some(index);
+                let mut summary = qselect_condition_summary(condition);
+                if let Some((_, rest)) = summary.split_once(" · ") {
+                    summary = rest.to_string();
+                }
+                rows = rows.push(
+                    row![
+                        Space::new().width(14),
+                        text(summary)
+                            .size(12)
+                            .width(flex_width)
+                            .style(move |theme: &Theme| iced::widget::text::Style {
+                                color: editing.then_some(theme.palette().primary.base.color),
+                            }),
+                        button(text(t!("Edit")).size(11))
+                            .on_press(Message::QSelectEditCondition(index))
+                            .style(button::text)
+                            .padding([2, 6]),
+                        button(crate::ui::icons::themed(crate::ui::icons::TRASH, 12.0))
+                            .on_press(Message::QSelectRemoveCondition(index))
+                            .style(button::text)
+                            .padding([2, 6]),
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center),
+                );
+            }
+        }
+        let mut heading_row =
+            row![heading(t!("Conditions (all of an object's type must match)")).width(flex_width)]
+                .align_y(iced::Alignment::Center);
+        if state.editing_condition.is_some() {
+            heading_row = heading_row.push(
+                button(text(t!("Cancel edit")).size(11))
+                    .on_press(Message::QSelectCancelEdit)
+                    .style(button::text)
+                    .padding([2, 6]),
+            );
+        }
+        if !state.conditions.is_empty() {
+            heading_row = heading_row.push(
+                button(text(t!("Clear")).size(11))
+                    .on_press(Message::QSelectClearConditions)
+                    .style(button::text)
+                    .padding([2, 6]),
+            );
+        }
+        column![
+            heading_row,
+            Space::new().height(5),
+            iced::widget::scrollable(rows)
+                .height(if fill { Fill } else { iced::Length::Shrink })
+                .width(sizing.width),
+        ]
+        .into()
+    };
+
+    // ── Live result ────────────────────────────────────────────────────
+    // The count large; with samples of several types, how many of each.
+    let of_scope = match state.scope {
+        QSelectScope::CurrentSelection => crate::tf!(
+            "of {} in the selection",
+            crate::ui::live_result::fmt_count(candidate_count)
+        ),
+        _ => crate::tf!(
+            "of {} in current space",
+            crate::ui::live_result::fmt_count(candidate_count)
+        ),
+    };
+    let first = if state.live_by_type.len() > 1 {
+        state
+            .live_by_type
+            .iter()
+            .map(|(name, n)| {
+                format!(
+                    "{} {}",
+                    crate::ui::live_result::fmt_count(*n),
+                    qselect_type_label(name)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    } else if state.live_count == 0 {
+        t!("No match").into_owned()
+    } else {
+        t!("objects match").into_owned()
+    };
+    let live = container(
+        row![
+            container(crate::ui::live_result::big_count_two_lines(
+                state.live_count,
+                first,
+                of_scope,
+            ))
+            .width(flex_width),
+            crate::ui::live_result::show_toggle(
+                state.show,
+                t!("Show").into_owned(),
+                Message::QSelectSetShow(!state.show),
+            ),
+        ]
+        .align_y(iced::Alignment::Center)
+        .spacing(8)
+        .width(sizing.width),
+    )
+    .padding([8, 10])
+    .width(sizing.width)
+    .style(|theme: &Theme| {
+        let palette = theme.palette();
+        container::Style {
+            background: Some(Background::Color(palette.background.base.color)),
+            border: Border {
+                color: palette.background.neutral.color,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        }
+    });
+
+    // ── Result ─────────────────────────────────────────────────────────
+    let results = [
+        (QSelectResult::New, t!("New selection")),
+        (QSelectResult::Add, t!("Add")),
+        (QSelectResult::Remove, t!("Remove")),
+    ];
+    let result = column![
+        heading(t!("Result")),
+        Space::new().height(5),
+        segmented(
+            results
+                .into_iter()
+                .map(|(value, caption)| {
+                    (
+                        Message::QSelectSetResult(value),
+                        caption,
+                        state.result == value,
+                    )
+                })
+                .collect()
+        ),
+        Space::new().height(6),
+        checkbox(matches!(state.mode, QSelectMode::Exclude))
+            .label(t!("Select the objects that do not match"))
+            .text_size(12)
+            .size(14)
+            .on_toggle(|on| {
+                Message::QSelectSetMode(if on {
+                    QSelectMode::Exclude
+                } else {
+                    QSelectMode::Include
+                })
+            }),
+    ];
+
+    // ── Footer ─────────────────────────────────────────────────────────
+    // A half-made draft beside finished conditions is no error: Add stays
+    // off until it is complete (#2611 mockup, States).
+    let error = state.error.clone().or(if candidate_count == 0 {
+        Some(t!("No objects are available in this scope.").into_owned())
+    } else {
+        // A value's problem shows under the value; a missing value is said
+        // by the Select button.
+        None
+    });
+    // Numbers compare as numbers: say so where it matters (mockup Sample).
+    let numeric = state.conditions.iter().any(|c| {
+        c.property
+            .as_ref()
+            .is_some_and(|p| matches!(p.editor, QSelectValueEditor::Number))
+    });
+    let can_select = state.sample.is_none()
+        && state.editing_condition.is_none()
+        && state.live_count > 0
+        && !(state.conditions.is_empty()
+            && state.property.is_some()
+            && state.value.is_empty()
+            && !matches!(state.operator, QSelectOp::Any));
+    // A property chosen and no value yet, nothing else to go on (mockup).
+    let waiting_for_value = state.conditions.is_empty()
+        && state.property.is_some()
+        && state.value.is_empty()
+        && !matches!(state.operator, QSelectOp::Any);
+    let select = dialog_button_styled_opt(
+        match transparent_for {
+            _ if waiting_for_value => t!("Choose a value first"),
+            Some(command) => crate::tf!("Use {} in {}", state.live_count, command),
+            None => crate::tf!("Select {}", state.live_count),
+        },
+        can_select.then_some(Message::QSelectApply),
         button::primary,
     );
-
-    let panel_body = column![
-        section_label(t!("Scope")),
-        Space::new().height(5),
-        row![label(t!("Apply to:")), scope_picker]
-            .align_y(iced::Alignment::Center)
-            .spacing(8)
-            .width(sizing.width),
-        Space::new().height(4),
-        text(crate::tf!("{} candidate object(s)", candidate_count))
-            .size(11)
-            .style(|theme: &Theme| iced::widget::text::Style {
-                color: Some(theme.palette().background.base.text.scale_alpha(0.65)),
-            }),
-        Space::new().height(10),
-        container(rule::horizontal(1)).width(flex_width),
-        Space::new().height(10),
-        section_label(t!("Filter")),
-        Space::new().height(5),
+    // The same conditions in FILTER, with groups and NOT (#2611).
+    let advanced = button(
         row![
-            label(t!("Object type:")),
-            iced::widget::pick_list(
-                Some(type_sel),
-                type_options,
-                |value| t!(value).into_owned(),
-            )
-            .on_select(|s: String| {
-                if s == QSELECT_ANY_TYPE {
-                    Message::QSelectSetType(None)
-                } else {
-                    Message::QSelectSetType(Some(s))
-                }
-            })
-            .width(field_width),
+            crate::ui::icons::themed(crate::ui::icons::ST_FILTER, 13.0),
+            text(t!("Advanced…")).size(12),
         ]
-        .align_y(iced::Alignment::Center)
-        .spacing(8)
-        .width(sizing.width),
-        Space::new().height(6),
-        row![
-            label(t!("Property:")),
-            iced::widget::pick_list(
-                Some(prop_sel),
-                prop_options,
-                |value| value.to_string(),
-            )
-            .on_select(|p: crate::app::QSelectPropertyChoice| {
-                if p.field.is_empty() {
-                    Message::QSelectSetProperty(None)
-                } else {
-                    Message::QSelectSetProperty(Some(p))
-                }
-            })
-            .width(field_width),
-        ]
-        .align_y(iced::Alignment::Center)
-        .spacing(8)
-        .width(sizing.width),
-        Space::new().height(6),
-        row![
-            label(t!("Operator:")),
-            iced::widget::pick_list(
-                Some(state.operator),
-                op_options,
-                |value| value.to_string(),
-            )
-            .on_select(Message::QSelectSetOperator)
-            .width(field_width),
-        ]
-        .align_y(iced::Alignment::Center)
-        .spacing(8)
-        .width(sizing.width),
-        Space::new().height(6),
-        row![label(t!("Value:")), value_editor]
-            .align_y(iced::Alignment::Center)
-            .spacing(8)
-            .width(sizing.width),
-        Space::new().height(10),
-        container(rule::horizontal(1)).width(flex_width),
-        Space::new().height(10),
-        section_label(t!("Result")),
-        Space::new().height(5),
-        column![
-            form_radio(
-                t!("Include matching objects"),
-                crate::app::QSelectMode::Include,
-                Some(state.mode),
-                Message::QSelectSetMode,
-            ),
-            form_radio(
-                t!("Exclude matching objects"),
-                crate::app::QSelectMode::Exclude,
-                Some(state.mode),
-                Message::QSelectSetMode,
-            ),
-        ]
-        .spacing(5),
-        Space::new().height(8),
-        row![
-            append,
-            Space::new().width(6),
-            text(t!("Append result to current selection")).size(12),
-        ]
+        .spacing(5)
         .align_y(iced::Alignment::Center),
+    )
+    .on_press_maybe(state.sample.is_none().then_some(Message::QSelectAdvanced))
+    .style(button::secondary)
+    .padding([6, 12]);
+    let footer = row![
+        advanced,
+        Space::new().width(flex_width),
+        dialog_button(t!("Cancel"), Message::QSelectClose, false),
+        Space::new().width(8),
+        select,
+    ]
+    .align_y(iced::Alignment::Center);
+
+    let divider = || container(rule::horizontal(1)).width(flex_width);
+    let panel_body = column![
+        search_in,
         Space::new().height(10),
-        if let Some(message) = error {
-            text(message)
-                .size(11)
-                .style(|theme: &Theme| iced::widget::text::Style {
-                    color: Some(theme.palette().danger.base.color),
-                })
+        divider(),
+        Space::new().height(10),
+        fields,
+        Space::new().height(10),
+        conditions_block,
+        Space::new().height(10),
+        live,
+        if numeric {
+            Element::from(
+                muted(t!("Numbers compare as numbers: 3 also finds 3.0000.")).width(sizing.width),
+            )
         } else {
-            text("").size(11)
+            Element::from(Space::new().height(0))
+        },
+        Space::new().height(10),
+        result,
+        Space::new().height(8),
+        match error {
+            Some(message) =>
+                text(message)
+                    .size(11)
+                    .style(|theme: &Theme| iced::widget::text::Style {
+                        color: Some(theme.palette().danger.base.color),
+                    }),
+            None => text("").size(11),
         },
         Space::new().height(8),
-        row![
-            Space::new().width(flex_width),
-            cancel,
-            Space::new().width(8),
-            apply,
-        ]
-        .align_y(iced::Alignment::Center),
+        footer,
     ]
     .spacing(0)
     .width(sizing.width)
     .height(sizing.height);
 
-    let panel = container(panel_body)
+    container(panel_body)
         .padding(16)
         .width(sizing.width)
         .height(sizing.height)
@@ -1786,7 +3049,413 @@ fn qselect_content<'a>(
                 },
                 ..Default::default()
             }
-        });
+        })
+        .into()
+}
 
-    panel.into()
+/// One condition as a line: "Line · Layer = FAL*".
+fn qselect_condition_summary(condition: &crate::app::QSelectCondition) -> String {
+    let type_label = condition
+        .type_filter
+        .as_deref()
+        .map(qselect_type_label)
+        .unwrap_or_else(|| t!(QSELECT_ANY_TYPE).into_owned());
+    match &condition.property {
+        None => type_label,
+        Some(_) if condition.operator == crate::app::QSelectOp::Any => type_label,
+        Some(property) => {
+            let op = match condition.operator {
+                crate::app::QSelectOp::Eq => "=",
+                crate::app::QSelectOp::Neq => "!=",
+                crate::app::QSelectOp::Gt => ">",
+                crate::app::QSelectOp::Ge => ">=",
+                crate::app::QSelectOp::Lt => "<",
+                crate::app::QSelectOp::Le => "<=",
+                crate::app::QSelectOp::Any => "",
+            };
+            format!("{type_label} · {property} {op} {}", condition.value)
+        }
+    }
+}
+
+#[cfg(test)]
+mod measurement_tests {
+    use super::*;
+    #[test]
+    fn measurement_overlay_passes_all_clicks_on_text() {
+        for make_overlay in [
+            measurement_overlay as fn(iced::Point, f32, String) -> Element<'static, Message>,
+            grip_tip_overlay,
+        ] {
+            let underlay = mouse_area(Space::new().width(Fill).height(Fill))
+                .on_press(Message::ViewportLeftPress)
+                .on_right_press(Message::ViewportRightPress)
+                .on_middle_press(Message::ViewportMiddlePress);
+            let mut ui = iced_test::simulator(stack![
+                underlay,
+                make_overlay(
+                    iced::Point::new(400.0, 300.0),
+                    60.0,
+                    "measurement-result".into()
+                )
+            ]);
+            let center = ui
+                .find("measurement-result")
+                .unwrap()
+                .visible_bounds()
+                .unwrap()
+                .center();
+            ui.point_at(center);
+            for button in [
+                iced::mouse::Button::Left,
+                iced::mouse::Button::Right,
+                iced::mouse::Button::Middle,
+            ] {
+                ui.simulate([Event::Mouse(iced::mouse::Event::ButtonPressed(button))]);
+                ui.simulate([Event::Mouse(iced::mouse::Event::ButtonReleased(button))]);
+            }
+            let messages: Vec<_> = ui.into_messages().collect();
+            assert!(messages
+                .iter()
+                .any(|m| matches!(m, Message::ViewportLeftPress)));
+            assert!(messages
+                .iter()
+                .any(|m| matches!(m, Message::ViewportRightPress)));
+            assert!(messages
+                .iter()
+                .any(|m| matches!(m, Message::ViewportMiddlePress)));
+        }
+    }
+    #[test]
+    fn measurement_overlay_stays_inside_canvas_above_command_line() {
+        for make_overlay in [
+            measurement_overlay as fn(iced::Point, f32, String) -> Element<'static, Message>,
+            grip_tip_overlay,
+        ] {
+            for anchor in [iced::Point::new(5.0, 5.0), iced::Point::new(790.0, 595.0)] {
+                let mut ui = iced_test::simulator::Simulator::with_size(
+                    Default::default(),
+                    iced::Size::new(800.0, 600.0),
+                    make_overlay(anchor, 90.0, "measurement-result".into()),
+                );
+                let bounds = ui
+                    .find("measurement-result")
+                    .unwrap()
+                    .visible_bounds()
+                    .unwrap();
+                assert!(bounds.x >= 4.0 && bounds.y >= 4.0);
+                assert!(bounds.x + bounds.width <= 796.0 && bounds.y + bounds.height <= 506.0);
+            }
+        }
+    }
+
+    /// The value list is a panel with its own width, not a readout that
+    /// stretches to fit: it lands wholly inside the canvas, on the side of the
+    /// grip that has room for it.
+    #[test]
+    fn the_value_list_panel_sits_beside_the_grip_and_away_from_the_edges() {
+        for (anchor, expected_x) in [
+            (iced::Point::new(60.0, 300.0), 60.0 + 12.0),
+            (iced::Point::new(780.0, 300.0), 780.0 - 12.0 - 240.0),
+        ] {
+            let mut ui = iced_test::simulator::Simulator::with_size(
+                Default::default(),
+                iced::Size::new(800.0, 600.0),
+                position_canvas_overlay_near_cursor(
+                    anchor,
+                    90.0,
+                    container(Space::new().width(240).height(120))
+                        .id(iced::widget::Id::new("value-list"))
+                        .into(),
+                ),
+            );
+            let bounds = ui
+                .find(iced::widget::Id::new("value-list"))
+                .expect("the value list is drawn")
+                .visible_bounds()
+                .expect("the value list is visible");
+            assert_eq!(
+                bounds.x, expected_x,
+                "the list takes the side of the grip with room for it ({anchor:?})"
+            );
+            assert_eq!(
+                bounds.width, 240.0,
+                "the list keeps its own width rather than stretching"
+            );
+            assert!(
+                bounds.y >= 4.0 && bounds.y + bounds.height <= 506.0,
+                "the list stays between the top edge and the command line: {bounds:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cell_editor_wheel_tests {
+    use super::*;
+    #[test]
+    fn wheel_over_the_typed_in_cell_still_zooms_the_drawing() {
+        wheel_zooms_over_editor(false);
+    }
+
+    #[test]
+    fn wheel_over_the_inplace_text_editor_still_zooms_the_drawing() {
+        wheel_zooms_over_editor(true);
+    }
+
+    fn wheel_zooms_over_editor(inplace: bool) {
+        let p = |x, y| iced::Point::new(x, y);
+        let cell = crate::app::table_cell_edit::CellCanvas {
+            origin: p(100.0, 100.0),
+            x: iced::Vector::new(1.0, 0.0),
+            y: iced::Vector::new(0.0, 1.0),
+            corners: [
+                p(100.0, 100.0),
+                p(300.0, 100.0),
+                p(300.0, 160.0),
+                p(100.0, 160.0),
+            ],
+            height: 60.0,
+        };
+        let editor = MTextPreview {
+            segments: Vec::new(),
+            boxes: Vec::new(),
+            sel: None,
+            caret: 0,
+            caret_on: true,
+            minx: 0.0,
+            miny: 0.0,
+            scale: 1.0,
+            content_h: 600.0,
+            ruler: None,
+            rotation: (1.0, 0.0),
+            cell: Some(cell),
+            inplace,
+            translucent: false,
+            marks: Vec::new(),
+            fields: Vec::new(),
+            highlight: None,
+            background: false,
+        };
+        let drawing =
+            mouse_area(Space::new().width(Fill).height(Fill)).on_scroll(Message::ViewportScroll);
+        let mut ui = iced_test::simulator::Simulator::with_size(
+            Default::default(),
+            iced::Size::new(800.0, 600.0),
+            stack![
+                drawing,
+                iced::widget::canvas(editor).width(Fill).height(Fill)
+            ],
+        );
+        ui.point_at(p(200.0, 130.0));
+        ui.simulate([Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+        })]);
+        assert!(ui
+            .into_messages()
+            .any(|m| matches!(m, Message::ViewportScroll(_))));
+    }
+}
+
+#[cfg(test)]
+mod quad_view_tests {
+    use super::*;
+    use crate::ui::popup::quad_menu::{QuadIcon, QuadItem, QuadMode};
+
+    fn quad_item(label: &str, command: &str) -> QuadItem {
+        QuadItem {
+            label: label.to_string(),
+            command: command.to_string(),
+            // Distinct two-letter glyph per item so the sim can find each
+            // tile by its own text: the label itself only renders inside
+            // the bottom tooltip.
+            icon: QuadIcon::Glyph(label.chars().take(2).collect::<String>().to_uppercase()),
+        }
+    }
+
+    fn quad_panels() -> Vec<QuadPanel> {
+        vec![QuadPanel {
+            id: "quad.primary".to_string(),
+            label: String::new(),
+            items: vec![quad_item("Move", "MOVE"), quad_item("Copy", "COPY")],
+            applies_to: Vec::new(),
+        }]
+    }
+
+    fn collapsed_quad() -> Element<'static, Message> {
+        let quad = QuadUi::open(iced::Point::new(300.0, 225.0), QuadMode::Selection);
+        viewport_quad_overlay(&quad, &quad_panels(), 6, 60.0)
+    }
+
+    fn expanded_quad() -> Element<'static, Message> {
+        let mut quad = QuadUi::open(iced::Point::new(300.0, 225.0), QuadMode::Selection);
+        quad.expanded = true;
+        viewport_quad_overlay(&quad, &quad_panels(), 6, 60.0)
+    }
+
+    /// Press (down + up) at canvas point `at` over the given quad overlay on
+    /// a viewport with a passive click surface underneath.
+    fn press_at(overlay: Element<'static, Message>, at: iced::Point) -> Vec<Message> {
+        let underlay =
+            mouse_area(Space::new().width(Fill).height(Fill)).on_press(Message::ViewportLeftPress);
+        let mut ui = iced_test::simulator::Simulator::with_size(
+            Default::default(),
+            iced::Size::new(600.0, 450.0),
+            stack![underlay, overlay],
+        );
+        ui.point_at(at);
+        ui.simulate([Event::Mouse(iced::mouse::Event::ButtonPressed(
+            iced::mouse::Button::Left,
+        ))]);
+        ui.simulate([Event::Mouse(iced::mouse::Event::ButtonReleased(
+            iced::mouse::Button::Left,
+        ))]);
+        ui.into_messages().collect()
+    }
+
+    /// The glyph text of a quad tile, with its visible bounds, for
+    /// geometry asserts.
+    fn find_tile(
+        ui: &mut iced_test::simulator::Simulator<'static, Message>,
+        glyph: &str,
+    ) -> iced::Rectangle {
+        ui.find(glyph)
+            .expect("tile glyph is in the tree")
+            .visible_bounds()
+            .expect("tile glyph is visible")
+    }
+
+    #[test]
+    fn collapsed_quad_default_tile_picks_in_place_and_expands_on_hover() {
+        // The collapsed tile is centred on the anchor: its glyph text sits
+        // there, and clicking through (the sim's own click; the tile's
+        // bottom tooltip never intercepts) launches the default command in
+        // place, expanding the card. Nothing leaks into the viewport.
+        let mut ui = iced_test::simulator::Simulator::with_size(
+            Default::default(),
+            iced::Size::new(600.0, 450.0),
+            collapsed_quad(),
+        );
+        let bounds = find_tile(&mut ui, "MO");
+        assert_eq!(
+            (
+                bounds.x + bounds.width / 2.0,
+                bounds.y + bounds.height / 2.0
+            ),
+            (300.0, 225.0),
+            "the collapsed tile's glyph is centred on the anchor"
+        );
+        // A real cursor move at the resting anchor enters the tile first
+        // (the sim's cursor starts unavailable; point_at arms it), then the
+        // click picks the default command in place.
+        ui.point_at(iced::Point::new(300.0, 225.0));
+        ui.simulate([Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: iced::Point::new(300.0, 225.0),
+        })]);
+        ui.click("MO").expect("MO button should be clickable");
+        let messages: Vec<_> = ui.into_messages().collect();
+        assert!(messages
+            .iter()
+            .any(|m| matches!(m, Message::Quad(QuadMsg::Expand(true)))));
+        assert!(messages.iter().any(|m| matches!(
+            m,
+            Message::Quad(QuadMsg::Pick { panel_id, item_index: 0 }) if panel_id == "quad.primary"
+        )));
+        assert!(!messages
+            .iter()
+            .any(|m| matches!(m, Message::ViewportLeftPress)));
+    }
+
+    #[test]
+    fn expanded_quad_grid_tiles_pick_with_panel_id_and_index() {
+        // Grid order left-to-right: the second tile sits a tile plus the
+        // gap to the right of the anchor-centred first tile. The sim clicks
+        // the second tile's own glyph text.
+        let mut ui = iced_test::simulator::Simulator::with_size(
+            Default::default(),
+            iced::Size::new(600.0, 450.0),
+            expanded_quad(),
+        );
+        let second = find_tile(&mut ui, "CO");
+        assert_eq!(
+            second.x + second.width / 2.0,
+            300.0
+                + crate::ui::popup::quad_overlay::QUAD_TILE
+                + crate::ui::popup::quad_overlay::QUAD_TILE_GAP,
+            "the second tile's glyph centres a tile plus a gap right of the anchor"
+        );
+        ui.click("CO").expect("CO button should be clickable");
+        let messages: Vec<_> = ui.into_messages().collect();
+        assert!(messages.iter().any(|m| matches!(
+            m,
+            Message::Quad(QuadMsg::Pick { panel_id, item_index: 1 }) if panel_id == "quad.primary"
+        )));
+    }
+
+    #[test]
+    fn hover_quad_sits_beside_the_cursor_and_catches_no_click() {
+        // The hover quad opens unasked: its tile goes up and right of the
+        // cursor, so a click on the hovered object reaches the drawing.
+        use crate::ui::popup::quad_overlay::{QUAD_HOVER_GAP, QUAD_TILE};
+        let hover = || {
+            let quad = QuadUi::open(iced::Point::new(300.0, 225.0), QuadMode::Hover);
+            viewport_quad_overlay(&quad, &quad_panels(), 6, 60.0)
+        };
+        let at_cursor = press_at(hover(), iced::Point::new(300.0, 225.0));
+        assert!(
+            !at_cursor.iter().any(|m| matches!(m, Message::Quad(_))),
+            "{at_cursor:?}"
+        );
+        let middle = QUAD_HOVER_GAP + QUAD_TILE * 0.5;
+        let on_tile = press_at(hover(), iced::Point::new(300.0 + middle, 225.0 - middle));
+        assert!(
+            on_tile
+                .iter()
+                .any(|m| matches!(m, Message::Quad(QuadMsg::Pick { .. }))),
+            "{on_tile:?}"
+        );
+    }
+
+    #[test]
+    fn quad_outside_press_closes() {
+        let messages = press_at(collapsed_quad(), iced::Point::new(40.0, 40.0));
+        assert!(messages
+            .iter()
+            .any(|m| matches!(m, Message::Quad(QuadMsg::Close))));
+        assert!(!messages
+            .iter()
+            .any(|m| matches!(m, Message::Quad(QuadMsg::Pick { .. }))));
+    }
+
+    #[test]
+    fn expanded_quad_card_hugs_the_grid() {
+        // The overlay is a full-viewport layer (click catcher + card); the
+        // card itself must be sized to its content — the grid's columns
+        // (tile + gap) plus the two panel pads — not stretch its panel
+        // background across the whole screen.
+        let items = quad_panels().first().expect("primary panel").items.len();
+        let mut ui = iced_test::simulator::Simulator::with_size(
+            Default::default(),
+            iced::Size::new(600.0, 450.0),
+            expanded_quad(),
+        );
+        let bounds = ui
+            .find(iced::widget::Id::new("quad-expanded-card"))
+            .expect("the expanded card is in the tree")
+            .visible_bounds()
+            .expect("the expanded card is visible");
+        use crate::ui::popup::quad_overlay::{QUAD_PANEL_PAD, QUAD_TILE, QUAD_TILE_GAP};
+        // One row of `min(cols, items)` tiles: widths (tile + gap) minus the
+        // trailing gap, then the two pads around the grid.
+        let expected = items.min(6) as f32 * (QUAD_TILE + QUAD_TILE_GAP) - QUAD_TILE_GAP
+            + 2.0 * QUAD_PANEL_PAD;
+        assert_eq!(
+            bounds.width, expected,
+            "the card hugs the icon grid plus padding (quad_width=6)"
+        );
+        assert!(
+            bounds.width < 300.0,
+            "the card must not stretch across the viewport"
+        );
+    }
 }

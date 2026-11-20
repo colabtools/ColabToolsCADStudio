@@ -7,7 +7,7 @@
 
 use super::{failure, OpenCADStudio};
 use crate::app::Message;
-use codec::{CadDocument, EntityType, Handle};
+use document::{Document, EntityType, Handle};
 use iced::Task;
 use serde_json::{json, Value};
 
@@ -188,12 +188,7 @@ pub struct TextMatcher {
 }
 
 impl TextMatcher {
-    pub fn new(
-        search: String,
-        match_case: bool,
-        whole_word: bool,
-        ignore_accents: bool,
-    ) -> Self {
+    pub fn new(search: String, match_case: bool, whole_word: bool, ignore_accents: bool) -> Self {
         Self {
             search,
             match_case,
@@ -393,7 +388,7 @@ pub fn replace_mtext_safe(
     // Convert replacement newlines to \P for MText compatibility
     let raw_replacement = to_raw_mtext_replacement(replacement);
 
-    let mut doc = codec::entities::mtext_format::parse_mtext(raw, true);
+    let mut doc = document::entities::mtext_format::parse_mtext(raw, true);
     let mut total_replaced = 0;
 
     // First attempt: replace within individual parsed spans (preserves fine-grained formatting)
@@ -419,7 +414,7 @@ pub fn replace_mtext_safe(
     if total_replaced > 0 {
         if has_trailing_paragraph_break(raw) {
             doc.paragraphs
-                .push(codec::entities::mtext_format::MTextParagraph::new());
+                .push(document::entities::mtext_format::MTextParagraph::new());
         }
         (doc.to_mtext_string(), total_replaced)
     } else {
@@ -613,33 +608,50 @@ fn skip_mtext_paragraph_break(raw: &str, from: usize) -> Option<usize> {
 /// Extracts the plain display text and position for an entity.
 pub fn entity_text_info(
     entity: &EntityType,
-    document: &CadDocument,
+    document: &Document,
 ) -> Option<(String, String, [f64; 3])> {
     // Returns (raw_value, plain_text, [x, y, z])
     match entity {
         EntityType::Text(t) => {
             let raw = t.value.clone();
             let plain = decode_dxf_escapes(&raw);
-            let pos = [t.insertion_point.x, t.insertion_point.y, t.insertion_point.z];
+            let pos = [
+                t.insertion_point.x,
+                t.insertion_point.y,
+                t.insertion_point.z,
+            ];
             Some((raw, plain, pos))
         }
         EntityType::MText(t) => {
             let raw = t.value.clone();
-            let plain_raw = codec::entities::mtext_format::parse_mtext(&raw, true).to_plain_text();
+            let plain_raw =
+                document::entities::mtext_format::parse_mtext(&raw, true).to_plain_text();
             let plain = decode_dxf_escapes(&plain_raw);
-            let pos = [t.insertion_point.x, t.insertion_point.y, t.insertion_point.z];
+            let pos = [
+                t.insertion_point.x,
+                t.insertion_point.y,
+                t.insertion_point.z,
+            ];
             Some((raw, plain, pos))
         }
         EntityType::AttributeDefinition(ad) => {
             let raw = ad.default_value.clone();
             let plain = decode_dxf_escapes(&raw);
-            let pos = [ad.insertion_point.x, ad.insertion_point.y, ad.insertion_point.z];
+            let pos = [
+                ad.insertion_point.x,
+                ad.insertion_point.y,
+                ad.insertion_point.z,
+            ];
             Some((raw, plain, pos))
         }
         EntityType::AttributeEntity(ae) => {
             let raw = ae.get_value().to_string();
             let plain = decode_dxf_escapes(&raw);
-            let pos = [ae.insertion_point.x, ae.insertion_point.y, ae.insertion_point.z];
+            let pos = [
+                ae.insertion_point.x,
+                ae.insertion_point.y,
+                ae.insertion_point.z,
+            ];
             Some((raw, plain, pos))
         }
         EntityType::Dimension(dim) => {
@@ -723,7 +735,7 @@ fn parse_types_filter(req: &Value) -> Option<Vec<String>> {
     }
 }
 
-fn entity_block_name(doc: &CadDocument, entity_handle: Handle, owner: Handle) -> Option<String> {
+fn entity_block_name(doc: &Document, entity_handle: Handle, owner: Handle) -> Option<String> {
     if let Some(record) = doc.block_records.iter().find(|r| r.handle == owner) {
         return Some(record.name.clone());
     }
@@ -1114,11 +1126,12 @@ impl OpenCADStudio {
                             continue;
                         }
 
-                        let (is_system_valid, suggestions) = if let Some(ref speller) = system_speller {
-                            speller.check_word(w, want_suggestions)
-                        } else {
-                            (false, Vec::new())
-                        };
+                        let (is_system_valid, suggestions) =
+                            if let Some(ref speller) = system_speller {
+                                speller.check_word(w, want_suggestions)
+                            } else {
+                                (false, Vec::new())
+                            };
 
                         if !is_system_valid {
                             entity_had_match = true;
@@ -1149,8 +1162,7 @@ impl OpenCADStudio {
                     let plain = decode_dxf_escapes(raw);
 
                     for (idx, (matcher, replacement)) in pair_matchers.iter().enumerate() {
-                        let (new_text, count) =
-                            matcher.replace_all_in(&plain, replacement, true);
+                        let (new_text, count) = matcher.replace_all_in(&plain, replacement, true);
                         if count > 0 {
                             pair_hit_counts[idx] += count;
                             total_occurrences += count;
@@ -1199,11 +1211,12 @@ impl OpenCADStudio {
                                     continue;
                                 }
 
-                                let (is_system_valid, suggestions) = if let Some(ref speller) = system_speller {
-                                    speller.check_word(w, want_suggestions)
-                                } else {
-                                    (false, Vec::new())
-                                };
+                                let (is_system_valid, suggestions) =
+                                    if let Some(ref speller) = system_speller {
+                                        speller.check_word(w, want_suggestions)
+                                    } else {
+                                        (false, Vec::new())
+                                    };
 
                                 if !is_system_valid {
                                     entity_had_match = true;
@@ -1339,7 +1352,12 @@ impl OpenCADStudio {
 
         let matchers: Vec<(TextMatcher, String)> = pairs
             .into_iter()
-            .map(|(f, r)| (TextMatcher::new(f, match_case, whole_word, ignore_accents), r))
+            .map(|(f, r)| {
+                (
+                    TextMatcher::new(f, match_case, whole_word, ignore_accents),
+                    r,
+                )
+            })
             .collect();
 
         if push_undo && !dry_run {
@@ -1574,8 +1592,7 @@ impl OpenCADStudio {
 
         if !dry_run {
             // Refresh scene caches and dirty flags
-            self.invalidate_property_targets(i, &changed_handles);
-            self.tabs[i].scene.bump_geometry();
+            self.invalidate_property_targets_or_blocks(i, &changed_handles);
             self.tabs[i].dirty = true;
             self.refresh_properties();
 
@@ -1694,14 +1711,16 @@ mod tests {
         // Test 1: Plain LF query matching raw \P
         let raw1 = "Loge \\Pgardien";
         let matcher1 = TextMatcher::new("Loge \ngardien".into(), false, false, true);
-        let (replaced1, count1) = replace_mtext_safe(raw1, &matcher1, "Security \nGuard Booth", true);
+        let (replaced1, count1) =
+            replace_mtext_safe(raw1, &matcher1, "Security \nGuard Booth", true);
         assert_eq!(count1, 1);
         assert_eq!(replaced1, "Security \\PGuard Booth");
 
         // Test 2: Multiline with complex formatting codes preserved
         let raw2 = "\\pxqc;{\\fCentury Gothic|b1|i0|c0|p34;ACCÈS ET SORTIE\\PMARCHANDISES}";
         let matcher2 = TextMatcher::new("ACCÈS ET SORTIE\nMARCHANDISES".into(), false, false, true);
-        let (replaced2, count2) = replace_mtext_safe(raw2, &matcher2, "GOODS ACCESS AND EXIT", true);
+        let (replaced2, count2) =
+            replace_mtext_safe(raw2, &matcher2, "GOODS ACCESS AND EXIT", true);
         assert_eq!(count2, 1);
         assert!(replaced2.contains("GOODS ACCESS AND EXIT"));
         assert!(replaced2.contains("\\pxqc;"));
@@ -1715,4 +1734,3 @@ mod tests {
         assert_eq!(replaced3, "{\\pqc;WAREHOUSE OFFICE}");
     }
 }
-

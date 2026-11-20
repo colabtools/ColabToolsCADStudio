@@ -21,8 +21,178 @@
 /// adds the `BuiltinPlugin::on_load` lifecycle callback and
 /// `HostApi::document_path`. v6 appends generic host system-variable access
 /// (`HostApi::system_variable` / `set_system_variable`). v7 appends atomic,
-/// undoable replacement of a set of existing entities.
-pub const API_VERSION: u32 = 7;
+/// undoable replacement of a set of existing entities. v8 appends name-addressed
+/// XRecord object CRUD under named-object-dictionary paths
+/// (`HostApi::create_xrecord` / `read_xrecord` / `update_xrecord` /
+/// `delete_xrecord` / `list_xrecords`). v9 appends the reference-only entity
+/// designation (`HostApi::set_reference_only`): display-only geometry a plugin
+/// still owns and refreshes while the built-in edit paths treat it like a
+/// locked layer. v10 appends `BuiltinPlugin::entity_classes`: plugin-declared
+/// XDATA class-identity display labels, folded into the registered manifest.
+/// Display-only; the host consults the declaration only while the declaring
+/// plugin is loaded, and entities without one keep their native type names.
+/// v11 appends the plugin grip surface: `HostApi::entity_grips` (built-in
+/// grip enumeration with viewport parity), `HostApi::grip_drag` (the same
+/// one-undo-step edit the interactive viewport performs), and
+/// `HostApi::set_plugin_grips` plus `BuiltinPlugin::on_custom_grip_event`
+/// (plugin-declared, plugin-owned custom grip points: session display state
+/// the host renders, hit-tests and drags but never interprets). v12 lands
+/// the consumer-validation hardening: the plugin-directed LIVE-GEOMETRY
+/// channel (CustomGripResponse::live_entities, capped), grip deliveries
+/// that never block the UI loop (bounded polls plus the settle watchdog
+/// that tears a silent plugin connection down), nested COMMAND frames
+/// refused inside grip deliveries (their execution would need the message
+/// loop the blocked delivery cannot pump — the UI-freeze wedge), cheap
+/// per-entity reads (HostApi::entities_batch) so refresh passes never
+/// re-clone invalidated document snapshots, and the deterministic-boot
+/// retry for plugin command dispatch. v13 closes the consumer's validation
+/// round: live geometry is VISUAL-ONLY against the parametric solver too
+/// (the restyled bump policy — bonded partners no longer move by host
+/// action mid-drag), constraint creation is a first-class HostApi write
+/// (`HostApi::constraint_create`, joining the caller's open scope like
+/// every other write; the driver's `begin_undo` joins plugin scopes
+/// instead of closing them — a re-bond composed of writes + constraints +
+/// replays is ONE plugin-labeled step), `CommandRequest::RunQuiet` replays
+/// commands with the command-line echo suppressed, the notification channel
+/// attaches deterministically (`PluginNotification::ChannelReady` ack;
+/// boot-window broadcasts defer then flush), boundary notifications carry
+/// DIRTY REGIONS (`DocumentChangedRegions`: touched entities + record
+/// pairs), and record walks batch (`read_xrecords` / `update_xrecords` /
+/// `list_xrecords_with_entries` — one frame per pass, not per record).
+///
+/// **API v14** (the newest painted release; two arcs landed in it: the
+/// runner's self-driving export — no Rust type crosses the library
+/// boundary — and the parametric/class envelopes being reshaped IN PLACE
+/// before release; api_version stays 14): `stage_parametric_chain` — a
+/// declared alignment
+/// chain whose driving ramps are declared DATA (the vocabulary any record
+/// model restates its laws with) turns into reference-only display
+/// geometry staged by the host (exact Line/Arc carriers for the constant
+/// classes, the exact from-end-states Hermite for the profile's
+/// at-most-quadratic polynomial slope class, measured chords within the
+/// declared tolerance for every table law), audited seam-to-seam
+/// before anything is staged and capped by
+/// [`MAX_PLUGIN_LIVE_ENTITIES`](crate::host::MAX_PLUGIN_LIVE_ENTITIES); and
+/// `sample_parametric` — the same engine exposed as a pure placement
+/// evaluation. It adds plugin-scoped class objects —
+/// `register_plugin_class` / `stage_plugin_class_instance`: a declared
+/// entity class (schema version + grip schema + parameter schema) whose
+/// instances carry only identity and a host-evaluated display descriptor
+/// (the parametric engine is the first host-known kind; kinds append at
+/// the end); the staged display set is reference-only and stamped with the
+/// class identity key. Class declarations are session state (like the grip
+/// sets); records stay the only file truth. `CustomGripResponse` gains the
+/// `descriptor` field (serde default): a Begin answer can hand the host a
+/// live design so the host re-derives preview geometry locally per move
+/// instead of the plugin streaming it (older hosts read `None` and keep
+/// the v12 semantics). The declaration's parameter schema —
+/// [`PluginClassParameter`](crate::host::PluginClassParameter): name +
+/// value kind + editability, serde default so declarations without the
+/// field read as an empty schema — and the session's properties pair
+/// (`plugin_class_instance_properties` / `update_plugin_class_instance_parameter`)
+/// turn a stamped instance's record rows into readable/writable
+/// properties: the reading surface renders the declared rows; for rows the
+/// declaration marks editable the write path patches the (name, value)
+/// entry pair on the instance's design record row through the existing
+/// XRecord update machinery (one undo step, the record's dirty
+/// notification re-stages the declaring plugin). The values stay the
+/// records' truth; the host renders and writes only what the declaration
+/// spells, never inventing semantics for a name or kind it does not know.
+/// The host's properties panel rides the same core for selections whose
+/// XDATA carries a registered class key, and the read half crosses the
+/// wire additively (`PluginRequest::PluginClassInstanceProperties` /
+/// `PluginResponse::PluginClassInstancePropertiesResult` with the declared
+/// [`PluginClassParameterRow`](crate::host::PluginClassParameterRow) rows —
+/// appended at the END of the request/response enums; the python `ocs`
+/// surface exposes it as `plugin_class_instance_properties`). A curve's
+/// driving quantity is declared as DATA — a
+/// [`Ramp`](crate::host::Ramp) payload (polynomial, piecewise or sampled
+/// table) per segment, the vocabulary any alignment library restates its
+/// own laws with (the v14 envelope was reshaped IN PLACE to these generic
+/// shapes before release; api_version stays 14 because no deployed
+/// plugins pre-date the reshaping) — and the host's generic Gaussian
+/// integrator executes it; new blend shapes join as declared data, never
+/// as per-shape host code. The drag pipeline consumes
+/// the Begin descriptor: [`PluginGripSchemaEntry`](crate::host::PluginGripSchemaEntry)
+/// gains an optional `drives` row (a
+/// [`PluginGripAnchor`](crate::host::PluginGripAnchor): the segment, the
+/// end and the record-model anchor law the grip re-anchors; serde default
+/// keeps earlier declarations streaming) and
+/// [`CustomGripResponse`](crate::host::CustomGripResponse) gains the
+/// accompanying per-move tolerance (the same value the plugin staged its
+/// instance with). When a Begin answer hands the host a serviceable
+/// descriptor design — a profile-chain END anchor — the host
+/// re-derives the display set LOCALLY per coalesced cursor move through
+/// the declared anchor law's own generic solve (the ramp's end value
+/// re-derives per its arm's integral gain, the downstream joints
+/// re-declare from the engine's own sampling, and the chain's own audit
+/// gates every move): no Move frames cross the IPC, the per-move restage
+/// patches the same staged handles through the visual-only phase (zero
+/// history steps, the byte-identical restore before the settle), and the
+/// plugin's settle callback stays the ONE write window (records first,
+/// then the re-stage; exactly one labeled undo step). Unserved declarations
+/// fall back to the v12 streaming path with one headline.
+/// v14: the plugin runs the runner loop itself through `ocs_plugin_run`
+/// (emitted by `export_plugin!`), so no Rust type crosses the library
+/// boundary. The host no longer matches the plugin's compiler or codec commit;
+/// it matches the codec types' wire shapes (`version_info::wire_schema`).
+/// v15: quad panels + custom icons — the declarative quad-cursor-menu surface
+/// (`QuadPanelDef` / `PluginRequest::RegisterQuadPanels` /
+/// `HostNotification::QuadAction`), appending to the protocol enums only.
+/// v16: `PluginRequest::ValidateParametricChain` checks a parametric chain
+/// without staging it, appended to the protocol enums. A v15 host cannot
+/// decode the request and drops the connection, so a plugin that calls it
+/// declares v16 and the older host refuses to load it. Custom grips now
+/// snap (object snap, tracking, ortho, polar) and settle click-move-click
+/// like native grips.
+/// v17: reactive modal dialogs — `InteractiveCommand::on_dialog_action` (a new
+/// vtable slot, so the runner only calls it for v17 plugins), the
+/// `DialogValue::ChoiceOptions` / `Enabled` / `Visible` updates and the
+/// `DialogControl::Label` control, all appended to their enums. A v16 host
+/// cannot decode them, so a plugin that uses them declares v17.
+/// v18: complete dock-panel snapshots. An ordinary document-bound panel
+/// command synchronously reads typed values, exact text and validation errors
+/// through `HostApi::panel_snapshot`; the host authenticates panel ownership
+/// from the IPC transport and attaches the session's real tab. The appended
+/// request requires v18: a v17 host refuses the new plugin at load rather
+/// than accepting it and failing to decode the request. v17 plugins remain
+/// supported. Asynchronous `PanelAction` notifications remain read-only.
+/// v19: presentation controls for dialogs and dock panels —
+/// `DialogControl::StyledText` (heading / strong / muted / success / warning /
+/// danger text, mapped onto the host theme) and `DialogControl::Svg` (a static
+/// plugin-rendered SVG image, e.g. a chart), appended to the enum. A v18 host
+/// cannot decode them, so a plugin that sends them declares v19; v18 and
+/// older plugins remain supported unchanged.
+/// v20 adds `PluginClassInstance::selectable_custom`: flagged display entities
+/// stay selectable for plugin custom grips/panels, expose a class-only label,
+/// and refuse native geometry editing. Unflagged instances keep the legacy
+/// reference-only staging behavior.
+/// v21 adds `PluginGrip::xy_plane`: every custom-grip event is constrained to
+/// the grip's original world-XY plane. The default preserves legacy behavior.
+/// v22 adds `HostApi::set_geo_location` / `remove_geo_location`, writing the
+/// drawing's model-space GEODATA object (appended requests).
+/// v22 also adds `HostNotification::SelectionChangedDigest`: an O(1) selection
+/// notification (`tab_id`, monotonic per-tab `revision`, exact `count`) routed
+/// INSTEAD OF the legacy handle-list selection variants to plugins that report
+/// v22+; older plugins keep the exact legacy streams.
+/// v23 appends `TableOperation::LayoutSetTabOrder`: a plugin sets the order of
+/// the paper-space layout tabs in one undo step. A v22 host cannot decode it,
+/// so a plugin that sends it declares v23.
+/// Also additive on `PanelDef`: `PanelDef::style` (`PanelStyle::Palette`
+/// default, `PanelStyle::Form` for dialog-like form rendering); older payloads
+/// decode as `PanelStyle::Palette` via `deserialize_panel_style`.
+/// v24 appends `InteractiveCommand::on_undo_step`, the mid-command Ctrl+Z
+/// hook, with the `HostRequest::UndoStep` / `HostResponse::UndoStep` pair. A
+/// v23 runner cannot decode the request, so the host sends it only to plugins
+/// whose manifest declares v24; older plugins keep the document undo.
+/// v25 appends `BuiltinPlugin::tools` / `BuiltinPlugin::call_tool`, typed
+/// operations AI clients call over the automation bridge, with the
+/// `HostRequest::ListTools` / `CallTool` pair. Older runners cannot decode
+/// them, so the host asks only plugins whose manifest declares v25.
+/// v26 appends `TableOperation::CustomPropertiesSet`: a plugin sets the
+/// drawing's custom properties (DWGPROPS Custom) in one undo step. A v25 host
+/// cannot decode it, so a plugin that sends it declares v26.
+pub const API_VERSION: u32 = 26;
 
 /// Oldest plugin API major the current host still loads. This keeps previously
 /// compiled cdylibs usable as long as their vtable layout is a prefix of the
@@ -71,6 +241,35 @@ pub fn host_accepts_plugin_version(plugin_major: u32) -> bool {
     plugin_major >= API_VERSION_MIN_SUPPORTED && plugin_major <= effective_max_api_version()
 }
 
+/// A plugin's declaration of the entity classes it identifies via XDATA,
+/// surfaced by the host as display-only type labels (the Properties panel
+/// title and the automation `display_type` field).
+///
+/// The split is deliberate: the *identity* is a stable class KEY stamped into
+/// the entity's XDATA (one string value per entity, e.g. `"MYAPP-CLASS:LINE"`)
+/// and round-trips with the drawing; the *display labels* live in this
+/// declaration, so they are plugin-localizable and fixable without rewriting
+/// drawings. The declaration is consulted only while the declaring plugin is
+/// loaded — a plugin that is not installed, disabled, failed to load, or whose
+/// process has died contributes nothing, and its entities display as their
+/// bare native type.
+///
+/// Declared through [`crate::host::BuiltinPlugin::entity_classes`] (API v10);
+/// see `docs/plugin-architecture.md` for the full convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntityClasses {
+    /// XDATA application name whose records carry the class-identity keys
+    /// (e.g. `"CVIFC"`). Should be one of the manifest's `xdata_apps` so the
+    /// host knows the plugin writes under this id.
+    pub app_id: &'static str,
+    /// Prefix that marks a string XDATA value as a class-identity key
+    /// (e.g. `"CVIFC-CLASS:"`). The remainder of the value is the class key.
+    pub class_prefix: &'static str,
+    /// Class key → display label (e.g. `"LINE"` → `"Linear Element"`), in
+    /// declaration order. Display text never round-trips the drawing.
+    pub labels: &'static [(&'static str, &'static str)],
+}
+
 #[cfg(test)]
 mod tests {
     use crate::test_lock::ENV_LOCK;
@@ -102,14 +301,14 @@ mod tests {
 
     #[test]
     fn effective_max_defaults_to_api_version() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(MAX_API_VERSION_ENV);
         assert_eq!(effective_max_api_version(), API_VERSION);
     }
 
     #[test]
     fn effective_max_can_disable_v4() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(MAX_API_VERSION_ENV, "3");
         assert_eq!(effective_max_api_version(), 3);
         assert!(!host_accepts_plugin_version(4));
@@ -120,7 +319,7 @@ mod tests {
 
     #[test]
     fn effective_max_below_minimum_is_v3_only_mode() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(MAX_API_VERSION_ENV, "2");
         assert_eq!(effective_max_api_version(), 3);
         assert!(!host_accepts_plugin_version(4));
@@ -131,7 +330,7 @@ mod tests {
 
     #[test]
     fn effective_max_clamps_to_supported_range() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(MAX_API_VERSION_ENV, "99");
         assert_eq!(effective_max_api_version(), API_VERSION);
         std::env::set_var(MAX_API_VERSION_ENV, "1");
@@ -141,7 +340,7 @@ mod tests {
 
     #[test]
     fn host_accepts_supported_range() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(MAX_API_VERSION_ENV);
         assert!(host_accepts_plugin_version(API_VERSION_MIN_SUPPORTED));
         assert!(host_accepts_plugin_version(API_VERSION));

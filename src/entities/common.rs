@@ -28,13 +28,16 @@ pub struct UnitContext {
     pub angbase: f64,
     /// ANGDIR — true when written angles grow clockwise.
     pub angdir_cw: bool,
+    /// DIMZIN — zero suppression; its 8 bit drops the trailing zeros of a
+    /// decimal length or angle (`3.5000` → `3.5`, `1.0000` → `1`).
+    pub dimzin: i16,
 }
 
 impl UnitContext {
     /// The settings as this drawing holds them. Every place that formats or
     /// reads a number seeds the context from here, so none of them can be
     /// working from a different idea of the drawing's conventions.
-    pub fn from_header(header: &codec::document::HeaderVariables) -> Self {
+    pub fn from_header(header: &document::document::HeaderVariables) -> Self {
         Self {
             lunits: header.linear_unit_format,
             luprec: header.linear_unit_precision,
@@ -42,6 +45,7 @@ impl UnitContext {
             auprec: header.angular_unit_precision,
             angbase: header.angle_base,
             angdir_cw: header.angle_direction != 0,
+            dimzin: header.dim_zero_suppression,
         }
     }
 }
@@ -54,6 +58,7 @@ thread_local! {
         auprec: 0,
         angbase: 0.0,
         angdir_cw: false,
+        dimzin: 0,
     }) };
 }
 
@@ -68,10 +73,14 @@ thread_local! {
     /// the same place.
     static FIXED_TEXT_HEIGHTS: std::cell::RefCell<rustc_hash::FxHashMap<String, f64>> =
         std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    /// Resolved font of every text style, for text measured without the
+    /// document at hand (justification changes, attribute placement).
+    static STYLE_FONTS: std::cell::RefCell<rustc_hash::FxHashMap<String, String>> =
+        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
 /// Record which text styles fix their height, from the drawing's style table.
-pub fn set_fixed_text_heights(document: &codec::CadDocument) {
+pub fn set_fixed_text_heights(document: &document::Document) {
     FIXED_TEXT_HEIGHTS.with(|cell| {
         let mut map = cell.borrow_mut();
         map.clear();
@@ -81,6 +90,24 @@ pub fn set_fixed_text_heights(document: &codec::CadDocument) {
             }
         }
     });
+    STYLE_FONTS.with(|cell| {
+        let mut map = cell.borrow_mut();
+        map.clear();
+        for style in document.text_styles.iter() {
+            let font =
+                crate::entities::text_support::resolve_text_style(&style.name, document).font_name;
+            map.insert(style.name.to_ascii_lowercase(), font);
+        }
+    });
+}
+
+/// The resolved font of `style` (Standard when unnamed); empty when unknown.
+pub fn style_font(style: &str) -> String {
+    let key = match style.trim() {
+        "" => "standard".to_string(),
+        name => name.to_ascii_lowercase(),
+    };
+    STYLE_FONTS.with(|cell| cell.borrow().get(&key).cloned().unwrap_or_default())
 }
 
 /// The height `style` fixes, or `None` when it leaves the height to the entity.
@@ -93,6 +120,17 @@ pub fn style_fixed_height(style: &str) -> Option<f64> {
 /// they format f64 values into display strings.
 pub fn set_unit_context(ctx: UnitContext) {
     UNIT_CTX.with(|c| c.set(ctx));
+}
+
+/// Runs `f` with DIMZIN off: a command-line measurement shows every place
+/// LUPREC asks for (`Area = 5000.0000`); zero suppression is for the
+/// Properties palette.
+pub fn with_all_places<T>(f: impl FnOnce() -> T) -> T {
+    let saved = unit_context();
+    set_unit_context(UnitContext { dimzin: 0, ..saved });
+    let out = f();
+    set_unit_context(saved);
+    out
 }
 
 pub fn unit_context() -> UnitContext {
@@ -120,9 +158,17 @@ pub fn without_negative_zero(text: String) -> String {
     }
 }
 
+/// A coordinate typed into a dialog field, as a plain decimal at the drawing's
+/// LUPREC. Fields like these are typed straight back, so they print a number
+/// every length parser reads rather than the drawing's formatted length style.
+pub fn coordinate_text(value: f64, precision: i16) -> String {
+    let precision = precision.clamp(0, 8) as usize;
+    without_negative_zero(format!("{:.*}", precision, value))
+}
+
 fn format_signed_length(value: f64) -> String {
     let ctx = unit_context();
-    let prec = ctx.luprec.max(0) as usize;
+    let prec = ctx.luprec.max(0).min(15) as usize;
     match ctx.lunits {
         1 => format!("{:.*e}", prec, value),
         3 => {
@@ -141,10 +187,11 @@ fn format_signed_length(value: f64) -> String {
             }
         }
         4 | 5 => {
-            // Architectural and fractional formats use 1/64-inch resolution.
+            // Architectural and fractional read LUPREC as the power of two
+            // of the smallest fraction: 4 rounds to 1/16, 8 to 1/256.
             let sign = if value < 0.0 { "-" } else { "" };
             let abs = value.abs();
-            let denom = 64.0;
+            let denom = 2f64.powi(ctx.luprec.clamp(0, 8) as i32);
             let ticks = (abs * denom).round();
             let (feet, rest) = if ctx.lunits == 4 {
                 let per_foot = 12.0 * denom;
@@ -155,7 +202,7 @@ fn format_signed_length(value: f64) -> String {
             let whole = (rest / denom).floor();
             let mut n = (rest - whole * denom).round() as u64;
             let mut d = denom as u64;
-            while d > 1 && n % 2 == 0 && d % 2 == 0 {
+            while d > 1 && n.is_multiple_of(2) && d.is_multiple_of(2) {
                 n /= 2;
                 d /= 2;
             }
@@ -173,8 +220,38 @@ fn format_signed_length(value: f64) -> String {
                 None => format!("{}{:.0}{}", sign, whole, frac_str),
             }
         }
-        _ => format!("{:.*}", prec, value),
+        _ => trailing_zeros(fixed(value, prec), ctx.dimzin),
     }
+}
+
+/// `value` at `precision` decimals, a tie rounding away from zero as the
+/// drawing's own readouts do (878.90625 → 878.9063); plain `{:.4}` rounds a
+/// tie to even.
+fn fixed(value: f64, precision: usize) -> String {
+    let scale = 10f64.powi(precision as i32);
+    let rounded = (value * scale).round() / scale;
+    format!(
+        "{:.*}",
+        precision,
+        if rounded.is_finite() { rounded } else { value }
+    )
+}
+
+/// Drop the trailing zeros of a decimal (and a bare point) when DIMZIN asks
+/// for it, as the drawing writes its decimal lengths and angles.
+fn trailing_zeros(text: String, dimzin: i16) -> String {
+    if dimzin & 8 == 0 || !text.contains('.') {
+        return text;
+    }
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// A dimensionless decimal (a linetype scale) at the drawing's linear
+/// precision, whatever its linear unit format.
+pub fn format_decimal(value: f64) -> String {
+    let ctx = unit_context();
+    let precision = ctx.luprec.max(0).min(15) as usize;
+    without_negative_zero(trailing_zeros(fixed(value, precision), ctx.dimzin))
 }
 
 /// Format an area with the drawing's linear precision. Area stays a decimal
@@ -185,7 +262,7 @@ pub fn format_area(value: f64) -> String {
     if ctx.lunits == 1 {
         format!("{:.*e}", precision, value)
     } else {
-        format!("{:.*}", precision, value)
+        trailing_zeros(fixed(value, precision), ctx.dimzin)
     }
 }
 
@@ -196,7 +273,7 @@ pub fn format_angle(value_rad: f64) -> String {
 
 fn format_signed_angle(value_rad: f64) -> String {
     let ctx = unit_context();
-    let prec = ctx.auprec.max(0) as usize;
+    let prec = ctx.auprec.max(0).min(15) as usize;
     match ctx.aunits {
         1 => dms(value_rad.to_degrees(), prec),
         2 => {
@@ -205,25 +282,47 @@ fn format_signed_angle(value_rad: f64) -> String {
         }
         3 => format!("{:.*}r", prec, value_rad),
         4 => surveyor(value_rad, prec),
-        _ => format!("{:.*}°", prec, value_rad.to_degrees()),
+        // Decimal degrees carry no mark.
+        _ => trailing_zeros(format!("{:.*}", prec, value_rad.to_degrees()), ctx.dimzin),
     }
 }
 
 /// Degrees / minutes / seconds. Each part carries its own mark — `d`, `'`, `"`
-/// — so the written angle says which convention it is in.
+/// — so the written angle says which convention it is in. The precision
+/// counts the parts as the drawing does: 0 whole degrees (`27d`), 1–2 adds
+/// minutes (`26d34'`), 3–4 adds seconds (`26d33'54"`), and every step past 4
+/// a decimal of the seconds.
 fn dms(degrees: f64, prec: usize) -> String {
     let sign = if degrees < 0.0 { "-" } else { "" };
     let a = degrees.abs();
+    let decimals = prec.saturating_sub(4).min(11);
     // Round before splitting so seconds carry into minutes and degrees.
-    let scale = 10f64.powi(prec.min(15) as i32);
-    let per_minute = 60.0 * scale;
-    let per_degree = 60.0 * per_minute;
-    let ticks = (a * per_degree).round();
-    let d = (ticks / per_degree).trunc();
-    let rest = ticks - d * per_degree;
-    let m = (rest / per_minute).trunc();
-    let s = (rest - m * per_minute) / scale;
-    format!("{}{:.0}d{:.0}'{:.*}\"", sign, d, m, prec, s)
+    let unit = dms_unit_seconds(prec);
+    let label = match prec {
+        0 => 0,
+        1 | 2 => 1,
+        _ => 2,
+    };
+    let ticks = (a * 3600.0 / unit).round() * unit;
+    let d = (ticks / 3600.0).trunc();
+    let rest = ticks - d * 3600.0;
+    let m = (rest / 60.0).trunc();
+    let s = rest - m * 60.0;
+    match label {
+        0 => format!("{}{:.0}d", sign, d),
+        1 => format!("{}{:.0}d{:.0}'", sign, d, m),
+        _ => format!("{}{:.0}d{:.0}'{:.*}\"", sign, d, m, decimals, s),
+    }
+}
+
+/// The seconds one step of a degrees/minutes/seconds angle at `prec` is:
+/// a degree, a minute, a second, then a decimal of it per step past 4.
+fn dms_unit_seconds(prec: usize) -> f64 {
+    match prec {
+        0 => 3600.0,
+        1 | 2 => 60.0,
+        _ => 10f64.powi(-(prec.saturating_sub(4).min(11) as i32)),
+    }
 }
 
 /// Surveyor's units: a bearing away from north or south, toward east or west,
@@ -233,8 +332,9 @@ fn dms(degrees: f64, prec: usize) -> String {
 /// the single letter, which is also what keeps a 90° angle from reading as the
 /// contradictory `N 90d0'0" E`.
 fn surveyor(value_rad: f64, prec: usize) -> String {
-    // Quantize before choosing a cardinal or quadrant.
-    let scale = 3600.0 * 10f64.powi(prec.min(15) as i32);
+    // Quantize as the bearing is written, before choosing a cardinal or
+    // quadrant: steps per degree.
+    let scale = 3600.0 / dms_unit_seconds(prec);
     let turn = 360.0 * scale;
     let ticks = (value_rad.to_degrees().rem_euclid(360.0) * scale)
         .round()
@@ -632,8 +732,8 @@ pub fn lineweight_options() -> Vec<String> {
         "Default".to_string(),
     ];
     for value in [
-        0, 5, 9, 13, 15, 18, 20, 25, 30, 35, 40, 50, 53, 60, 70, 80, 90, 100, 106, 120,
-        140, 158, 200, 211,
+        0, 5, 9, 13, 15, 18, 20, 25, 30, 35, 40, 50, 53, 60, 70, 80, 90, 100, 106, 120, 140, 158,
+        200, 211,
     ] {
         options.push(format!("{:.2} mm", value as f64 / 100.0));
     }
@@ -671,13 +771,46 @@ pub fn num_prop(label: &str, field: &'static str, value: f64, editable: bool) ->
     }
 }
 
-/// A ◀ / ▶ index navigator row (e.g. a polyline's Current Vertex). `display` is
-/// the label shown between the arrows (e.g. "2 / 7").
-pub fn stepper_prop(
+/// Height row for a text or attribute entity. When its text style fixes a
+/// non-zero height, the row is read-only with a tooltip explaining how to make
+/// it editable (set the style height to 0 in STYLE or choose another style).
+pub fn text_height_prop(
     label: &str,
     field: &'static str,
-    display: impl Into<String>,
+    height: f64,
+    style: &str,
+    editable_when_unfixed: bool,
 ) -> Property {
+    if style_fixed_height(style).is_some() {
+        let style_name = style.trim();
+        let tooltip = if style_name.is_empty() {
+            crate::t!(
+                "Height is fixed by the text style. Set the style height to 0 in STYLE or choose another style to edit."
+            )
+            .into_owned()
+        } else {
+            crate::tf!(
+                "Height is fixed by text style \"{style}\". Set the style height to 0 in STYLE or choose another style to edit.",
+                style = style_name
+            )
+            .into_owned()
+        };
+        Property {
+            label: label.into(),
+            field,
+            value: PropValue::ReadOnlyWithTooltip {
+                value: format_length(height),
+                tooltip,
+            },
+        }
+    } else {
+        num_prop(label, field, height, editable_when_unfixed)
+    }
+}
+
+/// A ◀ / ▶ index navigator row (e.g. a polyline's Current Vertex). `display` is
+/// the label shown between the arrows (e.g. "2 / 7").
+pub fn stepper_prop(label: &str, field: &'static str, display: impl Into<String>) -> Property {
     Property {
         label: label.into(),
         field,
@@ -730,9 +863,7 @@ fn parse_angle_deg_unbounded(value: &str) -> Option<f64> {
     let i = rest.find(['°', 'd', 'D'])?;
     let d: f64 = rest[..i].trim().parse().ok()?;
     let mut total = d;
-    let tail = rest[i..]
-        .trim_start_matches(['°', 'd', 'D'])
-        .trim();
+    let tail = rest[i..].trim_start_matches(['°', 'd', 'D']).trim();
     if !tail.is_empty() {
         let (mpart, spart) = match tail.find('\'') {
             Some(j) => (&tail[..j], &tail[j + 1..]),
@@ -754,7 +885,7 @@ fn parse_angle_deg_unbounded(value: &str) -> Option<f64> {
 /// Re-exported rather than imported at each call site so the twelve modules
 /// that already reach for `entities::common::BulgeArc` keep working, and so
 /// there is one obvious place to see that the maths moved out.
-pub use kernel::geom2d::BulgeArc;
+pub use ocs_geom::geom2d::BulgeArc;
 
 /// Convert a 2D BulgeArc into a 3D TangentGeom::Arc with its world center,
 /// plane axes, radius, and counter-clockwise start/end sweep angles.
@@ -796,7 +927,7 @@ pub fn bulge_arc_to_tangent(
 /// Falls back to `triangulate_planar` if the vertex count is odd or less than 4.
 pub(crate) fn triangulate_band_ring(ring: &[[f64; 3]]) -> Vec<[f64; 3]> {
     let n = ring.len();
-    if n >= 4 && n % 2 == 0 {
+    if n >= 4 && n.is_multiple_of(2) {
         let m = n / 2;
         let mut tris = Vec::with_capacity((m - 1) * 6);
         for j in 0..m - 1 {
@@ -930,25 +1061,34 @@ pub(crate) fn tapered_band_points(
     let seg_count = if is_closed { n } else { n.saturating_sub(1) };
     let mut pts: Vec<[f64; 3]> = Vec::with_capacity(seg_count + 1);
     let mut widths: Vec<f32> = Vec::with_capacity(seg_count + 1);
-    let mut push = |x: f64, y: f64, w: f32| {
-        let (wx, wy, wz) = to_wcs(x, y);
-        pts.push([wx, wy, wz]);
+    let mut push = |xy: Option<(f64, f64)>, w: f32| {
+        // `None` is the NaN separator that breaks the band.
+        pts.push(xy.map_or([f64::NAN; 3], |(x, y)| to_wcs(x, y).into()));
         widths.push(w);
     };
+    let mut prev_end_width: Option<f64> = None;
     for i in 0..seg_count {
         let (p0, bulge, sw0, ew0) = verts[i];
         let (p1, _, _, _) = verts[(i + 1) % n];
-        if i == 0 {
-            push(p0[0], p0[1], sw0 as f32);
+        match prev_end_width {
+            None => push(Some((p0[0], p0[1])), sw0 as f32),
+            // A segment starting at another width than the last one ended
+            // steps there: break the band and restart it (#1628).
+            Some(prev) if (prev - sw0).abs() > 1e-9 => {
+                push(None, 0.0);
+                push(Some((p0[0], p0[1])), sw0 as f32);
+            }
+            Some(_) => {}
         }
+        prev_end_width = Some(ew0);
         if bulge.abs() < 1e-9 {
-            push(p1[0], p1[1], ew0 as f32);
+            push(Some((p1[0], p1[1])), ew0 as f32);
         } else if let Some(arc) = BulgeArc::from_bulge(p0, p1, bulge) {
-            let samples = arc.tessellate_angle(kernel::tessellation::DEFAULT_ANGLE);
+            let samples = arc.tessellate_angle(ocs_geom::tessellation::DEFAULT_ANGLE);
             let segments = samples.len().saturating_sub(1).max(1);
             for (index, s) in samples.into_iter().enumerate().skip(1) {
                 let t = index as f64 / segments as f64;
-                push(s[0], s[1], (sw0 + (ew0 - sw0) * t) as f32);
+                push(Some((s[0], s[1])), (sw0 + (ew0 - sw0) * t) as f32);
             }
         }
     }
@@ -970,10 +1110,10 @@ pub(crate) fn wide_band_outline(
     restart_per_segment: bool,
     to_wcs: &dyn Fn(f64, f64) -> (f64, f64, f64),
 ) -> WideBandOutline {
-    let source = kernel::geom2d::Polyline {
+    let source = ocs_geom::geom2d::Polyline {
         vertices: verts
             .iter()
-            .map(|(position, bulge, _, _)| kernel::geom2d::PolylineVertex {
+            .map(|(position, bulge, _, _)| ocs_geom::geom2d::PolylineVertex {
                 position: *position,
                 bulge: *bulge,
             })
@@ -990,10 +1130,10 @@ pub(crate) fn wide_band_outline(
         .take(segment_count)
         .map(|(_, _, start, end)| [*start, *end])
         .collect();
-    let boundary = kernel::geom2d::polyline_band_boundary(
+    let boundary = ocs_geom::geom2d::polyline_band_boundary(
         &source,
         &widths,
-        kernel::tessellation::DEFAULT_ANGLE,
+        ocs_geom::tessellation::DEFAULT_ANGLE,
     );
     let mut points = Vec::new();
     let mut stations = Vec::new();
@@ -1073,10 +1213,7 @@ pub(crate) fn extrude_wide_band_outline(
     point_segments.extend_from_slice(&base_segments);
 
     let mut emitted = HashSet::new();
-    for ((&point, &station), &segment) in base_points
-        .iter()
-        .zip(&base_stations)
-        .zip(&base_segments)
+    for ((&point, &station), &segment) in base_points.iter().zip(&base_stations).zip(&base_segments)
     {
         if !point[0].is_finite() {
             continue;
@@ -1104,6 +1241,67 @@ pub(crate) fn extrude_wide_band_outline(
         point_segments,
         station_pieces: outline.station_pieces,
         source_length: outline.source_length,
+    }
+}
+
+/// One wide-polyline segment as `polyline_segment_fill` takes it:
+/// `(p0, p1, hw0, hw1, bulge)`.
+pub(crate) type WideSegment = ([f32; 2], [f32; 2], f32, f32, f32);
+
+/// Mitre the bands of consecutive straight segments of the same width:
+/// both corners where they meet move to the joint's bisector, so the outer
+/// side has no notch and the inner side no overlap. `bands[k]` is the
+/// `polyline_segment_fill` quad of `segments[k]`; `closed` also joins the
+/// last segment to the first. Turns sharper than the wire shaders' mitre
+/// limit keep their butt ends.
+pub(crate) fn mitre_wide_joins(
+    bands: &mut [Vec<[f32; 2]>],
+    segments: &[WideSegment],
+    closed: bool,
+) {
+    let n = segments.len().min(bands.len());
+    let joins = if closed { n } else { n.saturating_sub(1) };
+    for i in 0..joins {
+        let next = (i + 1) % n;
+        let (a0, a1, _, h, a_bulge) = segments[i];
+        let (b0, b1, b_h, _, b_bulge) = segments[next];
+        if a_bulge.abs() > 1e-9 || b_bulge.abs() > 1e-9 || h < 1e-6 {
+            continue;
+        }
+        if bands[i].len() != 4
+            || bands[next].len() != 4
+            || (b_h - h).abs() > 1e-4 * h.max(1.0)
+            || (a1[0] - b0[0]).abs() > 1e-4
+            || (a1[1] - b0[1]).abs() > 1e-4
+        {
+            continue;
+        }
+        let unit = |p: [f32; 2], q: [f32; 2]| {
+            let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
+            let len = (dx * dx + dy * dy).sqrt();
+            (len > 1e-9).then(|| [dx / len, dy / len])
+        };
+        let (Some(d0), Some(d1)) = (unit(a0, a1), unit(b0, b1)) else {
+            continue;
+        };
+        let cos = d0[0] * d1[0] + d0[1] * d1[1];
+        let sin = d0[0] * d1[1] - d0[1] * d1[0];
+        if sin.abs() < 1e-6 || 1.0 + cos < 1e-6 {
+            continue;
+        }
+        let half_turn = (sin / (1.0 + cos)).abs() as f64;
+        if half_turn > crate::scene::pipeline::wire_gpu::MITER_LIMIT {
+            continue;
+        }
+        // Left normals; their sum over (1 + cos) reaches the bisector.
+        let k = h / (1.0 + cos);
+        let m = [k * (-d0[1] - d1[1]), k * (d0[0] + d1[0])];
+        let left = [a1[0] + m[0], a1[1] + m[1]];
+        let right = [a1[0] - m[0], a1[1] - m[1]];
+        bands[i][1] = left;
+        bands[i][2] = right;
+        bands[next][0] = left;
+        bands[next][3] = right;
     }
 }
 
@@ -1158,8 +1356,8 @@ pub(crate) fn polyline_segment_fill(
         let sign = b.signum();
         let cx = (mx + sign * d_perp * perp_x) as f32;
         let cy = (my + sign * d_perp * perp_y) as f32;
-        let a0 = ((p0[1] - cy) as f32).atan2((p0[0] - cx) as f32);
-        let a1 = ((p1[1] - cy) as f32).atan2((p1[0] - cx) as f32);
+        let a0 = (p0[1] - cy).atan2(p0[0] - cx);
+        let a1 = (p1[1] - cy).atan2(p1[0] - cx);
         let (sa, mut ea) = if bulge > 0.0 { (a0, a1) } else { (a1, a0) };
         if ea < sa {
             ea += std::f32::consts::TAU;
@@ -1219,25 +1417,25 @@ mod length_format_tests {
 
     #[test]
     fn fractional_carries_a_rounded_up_fraction() {
-        assert_eq!(with_units(5, 4, 5.99), "5 63/64");
-        assert_eq!(with_units(5, 4, 5.995), "6");
-        assert_eq!(with_units(5, 4, 0.995), "1");
-        assert_eq!(with_units(5, 4, 11.999), "12");
-        assert_eq!(with_units(5, 4, -5.995), "-6");
-        assert_eq!(with_units(5, 4, 0.5), "0 1/2");
-        assert_eq!(with_units(5, 4, 9.25), "9 1/4");
-        assert_eq!(with_units(5, 4, 3.0e17), "300000000000000000");
+        assert_eq!(with_units(5, 6, 5.99), "5 63/64");
+        assert_eq!(with_units(5, 6, 5.995), "6");
+        assert_eq!(with_units(5, 6, 0.995), "1");
+        assert_eq!(with_units(5, 6, 11.999), "12");
+        assert_eq!(with_units(5, 6, -5.995), "-6");
+        assert_eq!(with_units(5, 6, 0.5), "0 1/2");
+        assert_eq!(with_units(5, 6, 9.25), "9 1/4");
+        assert_eq!(with_units(5, 6, 3.0e17), "300000000000000000");
     }
 
     #[test]
     fn architectural_carries_into_feet() {
-        assert_eq!(with_units(4, 4, 11.99), "11 63/64\"");
-        assert_eq!(with_units(4, 4, 0.5), "0 1/2\"");
-        assert_eq!(with_units(4, 4, -9.25), "-9 1/4\"");
-        assert_eq!(with_units(4, 4, 11.999), "1'-0\"");
-        assert_eq!(with_units(4, 4, 23.999), "2'-0\"");
-        assert_eq!(with_units(4, 4, 66.5), "5'-6 1/2\"");
-        assert_eq!(with_units(4, 4, -11.999), "-1'-0\"");
+        assert_eq!(with_units(4, 6, 11.99), "11 63/64\"");
+        assert_eq!(with_units(4, 6, 0.5), "0 1/2\"");
+        assert_eq!(with_units(4, 6, -9.25), "-9 1/4\"");
+        assert_eq!(with_units(4, 6, 11.999), "1'-0\"");
+        assert_eq!(with_units(4, 6, 23.999), "2'-0\"");
+        assert_eq!(with_units(4, 6, 66.5), "5'-6 1/2\"");
+        assert_eq!(with_units(4, 6, -11.999), "-1'-0\"");
     }
 
     #[test]
@@ -1255,15 +1453,45 @@ mod length_format_tests {
     fn formatted_lengths_read_back() {
         for lunits in [3, 4, 5] {
             for value in [0.995f64, 5.995, 11.999, 23.999, 66.5, 9.25] {
-                let shown = with_units(lunits, if lunits == 3 { 4 } else { 4 }, value);
-                let read = parse_length(&shown)
-                    .unwrap_or_else(|| panic!("lunits {lunits} wrote {shown:?}, which does not read back"));
+                let shown = with_units(lunits, 4, value);
+                let read = parse_length(&shown).unwrap_or_else(|| {
+                    panic!("lunits {lunits} wrote {shown:?}, which does not read back")
+                });
                 assert!(
                     (read - value).abs() < 0.02,
                     "lunits {lunits}: {value} wrote {shown:?}, read back as {read}"
                 );
             }
         }
+    }
+
+    /// LUPREC / AUPREC reach the formatters straight from the header, where
+    /// `SETVAR` or a carried file can hold any `i16`. `format_area` already
+    /// caps itself at 15; `format_length` and `format_angle` printed the raw
+    /// count on every call, so precision 30_000 bloated each formatted value
+    /// to ~30 KB on the properties hot path.
+    #[test]
+    fn huge_precision_cannot_bloat_formatting_output() {
+        let original = unit_context();
+        let length = with_units(2, 30_000, 12.3456);
+        let mut ctx = unit_context();
+        ctx.aunits = 0;
+        ctx.auprec = 30_000;
+        set_unit_context(ctx);
+        let angle = format_angle(1.0);
+        let area = format_area(12.3456);
+        set_unit_context(original);
+        assert!(
+            length.len() < 64,
+            "format_length produced {} chars",
+            length.len()
+        );
+        assert!(
+            angle.len() < 64,
+            "format_angle produced {} chars",
+            angle.len()
+        );
+        assert!(area.len() < 64, "format_area produced {} chars", area.len());
     }
 }
 
@@ -1281,23 +1509,25 @@ mod angle_format_tests {
 
     #[test]
     fn degrees_minutes_seconds_carry() {
-        assert_eq!(shown(1, 0, 45.9999), "46d0'0\"");
-        assert_eq!(shown(1, 0, 89.99999), "90d0'0\"");
-        assert_eq!(shown(1, 0, 0.99999), "1d0'0\"");
-        assert_eq!(shown(1, 0, 45.5), "45d30'0\"");
-        assert_eq!(shown(1, 2, 45.9999), "45d59'59.64\"");
-        assert_eq!(shown(1, 2, 45.5), "45d30'0.00\"");
+        assert_eq!(shown(1, 0, 45.9999), "46d");
+        assert_eq!(shown(1, 0, 0.99999), "1d");
+        assert_eq!(shown(1, 2, 26.565051177), "26d34'");
+        assert_eq!(shown(1, 2, 45.99999), "46d0'");
+        assert_eq!(shown(1, 4, 45.5), "45d30'0\"");
+        assert_eq!(shown(1, 6, 45.9999), "45d59'59.64\"");
     }
 
     #[test]
     fn surveyor_bearings_stay_inside_a_quadrant() {
         assert_eq!(shown(4, 0, 359.99999), "E");
         assert_eq!(shown(4, 0, 89.99999), "N");
-        assert_eq!(shown(4, 0, 45.0), "N 45d0'0\" E");
+        assert_eq!(shown(4, 0, 45.0), "N 45d E");
         assert_eq!(shown(4, 0, 180.0), "W");
-        assert_ne!(shown(4, 8, 0.0000000005), "E");
+        assert_ne!(shown(4, 8, 0.00001), "E");
         for prec in [0, 2] {
-            for deg in [0.99999f64, 45.9999, 89.99999, 179.99999, 269.99999, 359.99999] {
+            for deg in [
+                0.99999f64, 45.9999, 89.99999, 179.99999, 269.99999, 359.99999,
+            ] {
                 let text = shown(4, prec, deg);
                 assert!(
                     !text.contains("90d"),
@@ -1314,7 +1544,9 @@ mod angle_format_tests {
                 for deg in [0.99999f64, 45.5, 45.9999, 89.99999, 200.25, 359.99999] {
                     let text = shown(aunits, prec, deg);
                     let read = parse_angle(&text).unwrap_or_else(|| {
-                        panic!("aunits {aunits} prec {prec} wrote {text:?}, which does not read back")
+                        panic!(
+                            "aunits {aunits} prec {prec} wrote {text:?}, which does not read back"
+                        )
                     });
                     let delta = (read.to_degrees().rem_euclid(360.0) - deg.rem_euclid(360.0))
                         .rem_euclid(360.0);
@@ -1365,8 +1597,8 @@ mod negative_zero_format_tests {
 
     #[test]
     fn an_angle_that_rounds_to_zero_has_no_sign() {
-        assert_eq!(angle(0, 0, ROTATION_NOISE), "0°");
-        assert_eq!(angle(1, 0, ROTATION_NOISE), "0d0'0\"");
+        assert_eq!(angle(0, 0, ROTATION_NOISE), "0");
+        assert_eq!(angle(1, 0, ROTATION_NOISE), "0d");
         assert_eq!(angle(2, 0, ROTATION_NOISE), "0g");
         assert_eq!(angle(3, 2, ROTATION_NOISE), "0.00r");
     }
@@ -1376,13 +1608,37 @@ mod negative_zero_format_tests {
     fn a_visible_negative_keeps_its_sign() {
         assert_eq!(length(2, 4, -2.5), "-2.5000");
         assert_eq!(length(2, 0, -0.6), "-1");
-        assert_eq!(angle(0, 0, -45f64.to_radians()), "-45°");
-        assert_eq!(angle(1, 1, -0.0001f64.to_radians()), "-0d0'0.4\"");
+        assert_eq!(angle(0, 0, -45f64.to_radians()), "-45");
+        assert_eq!(angle(1, 5, -0.0001f64.to_radians()), "-0d0'0.4\"");
     }
 
     #[test]
     fn a_negative_infinite_value_keeps_its_sign() {
         assert_eq!(length(2, 4, f64::NEG_INFINITY), "-inf");
-        assert_eq!(angle(0, 0, f64::NEG_INFINITY), "-inf°");
+        assert_eq!(angle(0, 0, f64::NEG_INFINITY), "-inf");
     }
+}
+
+/// An Enabled / Disabled list row (a polyline's linetype generation), as the
+/// reference shows it.
+pub(crate) fn enabled_choice(on: bool) -> crate::scene::model::object::PropValue {
+    crate::scene::model::object::PropValue::Choice {
+        selected: if on {
+            crate::t!("Enabled")
+        } else {
+            crate::t!("Disabled")
+        }
+        .into_owned(),
+        options: vec![
+            crate::t!("Enabled").into_owned(),
+            crate::t!("Disabled").into_owned(),
+        ],
+    }
+}
+
+/// Reads an Enabled / Disabled (or true / false) choice back.
+pub(crate) fn enabled_value(value: &str) -> bool {
+    value == "true"
+        || value.eq_ignore_ascii_case("enabled")
+        || value == crate::t!("Enabled").as_ref()
 }

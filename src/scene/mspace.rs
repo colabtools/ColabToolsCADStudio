@@ -14,7 +14,7 @@ impl Scene {
             None => return paper_pt,
         };
         let vp = match self.document.get_entity(vp_handle) {
-            Some(codec::EntityType::Viewport(vp)) => vp,
+            Some(document::EntityType::Viewport(vp)) => vp,
             _ => return paper_pt,
         };
         // Uses the viewport's own `view_target` — kept valid by
@@ -48,7 +48,7 @@ impl Scene {
             None => return model_pt,
         };
         let vp = match self.document.get_entity(vp_handle) {
-            Some(codec::EntityType::Viewport(vp)) => vp,
+            Some(document::EntityType::Viewport(vp)) => vp,
             _ => return model_pt,
         };
         let scale = vp_effective_scale(vp.custom_scale, vp.view_height, vp.height);
@@ -146,11 +146,68 @@ impl Scene {
         Some(ViewportFrame {
             viewport: vp_handle,
             paper_center,
-            model_target: glam::DVec2::new(cam.target.x as f64, cam.target.y as f64),
+            model_target: glam::DVec2::new(cam.target.x, cam.target.y),
             scale,
             twist,
             locked,
         })
+    }
+
+    /// ALIGNSPACE: move a plan-view viewport's view so `model[k]` shows at
+    /// `paper[k]`. One pair pans; two pairs also set the scale and twist.
+    /// Returns `false` for an unsupported or locked viewport, or coincident
+    /// points.
+    pub fn align_viewport_view(
+        &mut self,
+        vp_handle: Handle,
+        model: &[glam::DVec2],
+        paper: &[glam::DVec2],
+    ) -> bool {
+        use crate::scene::viewport_ref::ViewportFrame;
+        let Some(frame) = self.viewport_frame(vp_handle) else {
+            return false;
+        };
+        if frame.locked {
+            return false;
+        }
+        let (scale, twist) = match (model, paper) {
+            ([m1, m2], [p1, p2]) => {
+                let (dm, dp) = (*m2 - *m1, *p2 - *p1);
+                if dm.length() < 1e-12 || dp.length() < 1e-12 {
+                    return false;
+                }
+                (
+                    dp.length() / dm.length(),
+                    dp.y.atan2(dp.x) - dm.y.atan2(dm.x),
+                )
+            }
+            ([_], [_]) => (frame.scale, frame.twist),
+            _ => return false,
+        };
+        // The model point at the viewport centre, from a frame that shows
+        // model[0] at paper[0].
+        let target = ViewportFrame {
+            paper_center: paper[0],
+            model_target: model[0],
+            scale,
+            twist,
+            ..frame
+        }
+        .paper_to_model(frame.paper_center.extend(0.0));
+        let Some(EntityType::Viewport(vp)) = self.document.get_entity_mut(vp_handle) else {
+            return false;
+        };
+        vp.view_target.x = target.x;
+        vp.view_target.y = target.y;
+        vp.view_center = document::types::Vector3::ZERO;
+        vp.view_height = vp.height / scale;
+        vp.custom_scale = scale;
+        // A plan view's stored twist is the frame's twist.
+        vp.twist_angle = twist;
+        self.notify_viewport_changed(vp_handle);
+        self.resident_wire_sets.borrow_mut().clear();
+        self.bump_geometry();
+        true
     }
 
     /// Visible, supported content viewports at a sheet point, topmost first.
@@ -189,10 +246,12 @@ impl Scene {
         if (paper.x - vp.center.x).abs() > hw || (paper.y - vp.center.y).abs() > hh {
             return false;
         }
-        if vp.clip_boundary_handle.is_null() {
+        if !crate::entities::viewport::is_clipped(vp) {
             return true;
         }
-        let Some(boundary) = self.document.get_entity(vp.clip_boundary_handle)
+        let Some(boundary) = self
+            .document
+            .get_entity(vp.clip_boundary_handle)
             .and_then(crate::entities::curve::entity_curve)
         else {
             return false;
@@ -206,11 +265,105 @@ impl Scene {
         let Some(point) = boundary.plane.project([paper.x, paper.y, vp.center.z]) else {
             return false;
         };
-        kernel::geom2d::contains(
+        ocs_geom::geom2d::contains(
             &[boundary.curve],
             point,
-            kernel::geom2d::Tolerance::new(1e-9),
+            ocs_geom::geom2d::Tolerance::new(1e-9),
         )
+    }
+}
+
+/// What one zoom step does to a floating viewport's `view_height`: zooming
+/// in shrinks it, so the scale rises and the model inside appears larger.
+///
+/// Exponential for the same reason [`crate::scene::view::camera::Camera::zoom`]
+/// is. The subtraction this replaced (`1 - 0.15 * steps`) reached zero at
+/// 6.67 steps and went negative past it, so from ZOOMFACTOR 360 up every
+/// notch inside a viewport bottomed out on the clamp — a tenfold jump a
+/// notch, and a sensitivity setting that stopped doing anything over the top
+/// third of its range.
+///
+/// The base is 0.85 where the camera's is 0.9 only because 15% is what a
+/// notch has always moved a viewport: each surface keeps the feel it has
+/// rather than inheriting the other's. The clamp stays to bound what a
+/// single step can do.
+fn viewport_zoom_factor(steps: f64) -> f64 {
+    0.85_f64.powf(steps).clamp(0.1, 10.0)
+}
+
+#[cfg(test)]
+mod viewport_zoom_tests {
+    use super::*;
+
+    /// One notch, at each ZOOMFACTOR the application can hold (the step is
+    /// the factor over the default 60). Every one of them has to shrink the
+    /// view, and a higher setting has to shrink it further — which is exactly
+    /// what stopped being true above 360 while the factor was a subtraction.
+    #[test]
+    fn a_notch_shrinks_the_view_further_at_every_zoom_factor() {
+        let mut previous = 1.0;
+        for factor in [3.0, 60.0, 100.0, 250.0, 500.0] {
+            let f = viewport_zoom_factor(factor / 60.0);
+            assert!(f > 0.0 && f < 1.0, "ZOOMFACTOR {factor} gave {f}");
+            assert!(f < previous, "ZOOMFACTOR {factor} did not reach further");
+            previous = f;
+        }
+    }
+
+    /// The default notch still moves a viewport the 15% it always has.
+    #[test]
+    fn the_default_notch_is_what_it_always_was() {
+        assert!((viewport_zoom_factor(1.0) - 0.85).abs() < 1e-12);
+        // And no step at all leaves the viewport exactly where it is.
+        assert_eq!(viewport_zoom_factor(0.0), 1.0);
+    }
+
+    /// In and out cancel exactly, as they now do for the model-space camera.
+    #[test]
+    fn a_notch_in_and_a_notch_out_cancel() {
+        for factor in [3.0, 60.0, 500.0] {
+            let steps = factor / 60.0;
+            let round_trip = viewport_zoom_factor(steps) * viewport_zoom_factor(-steps);
+            assert!(
+                (round_trip - 1.0).abs() < 1e-12,
+                "ZOOMFACTOR {factor}: {round_trip}"
+            );
+        }
+    }
+
+    /// The same thing through the viewport the user is really zooming: at the
+    /// top of the range each notch keeps shrinking the view by the same
+    /// ratio, instead of every notch alike bottoming out on the clamp.
+    #[test]
+    fn a_hard_notch_keeps_shrinking_the_active_viewport() {
+        let mut scene = Scene::new();
+        let mut viewport = document::entities::Viewport::new();
+        viewport.center = document::types::Vector3::new(0.0, 0.0, 0.0);
+        viewport.width = 100.0;
+        viewport.height = 100.0;
+        viewport.view_height = 200.0;
+        let handle = scene.add_entity(EntityType::Viewport(Box::new(viewport)));
+        scene.active_viewport = Some(handle);
+
+        let view_height = |scene: &Scene| match scene.document.get_entity(handle) {
+            Some(EntityType::Viewport(vp)) => vp.view_height,
+            _ => panic!("the viewport is still there"),
+        };
+        let steps = 500.0 / 60.0; // one notch at ZOOMFACTOR 500
+        let mut heights = vec![view_height(&scene)];
+        for _ in 0..3 {
+            scene.zoom_active_viewport(steps, None);
+            heights.push(view_height(&scene));
+        }
+        for step in heights.windows(2) {
+            assert!(step[1] > 0.0 && step[1] < step[0], "{heights:?}");
+        }
+        let first = heights[1] / heights[0];
+        let last = heights[3] / heights[2];
+        assert!(
+            (first - last).abs() < 1e-9,
+            "the notch saturated: {heights:?}"
+        );
     }
 }
 
@@ -221,32 +374,43 @@ mod clip_tests {
     #[test]
     fn concave_clip_boundary_rejects_the_notch() {
         let mut scene = Scene::new();
-        let mut poly = codec::entities::LwPolyline::from_points(
-            [(0.0, 0.0), (10.0, 0.0), (10.0, 5.0), (5.0, 5.0), (5.0, 10.0), (0.0, 10.0)]
-                .map(|(x, y)| codec::types::Vector2::new(x, y))
-                .to_vec(),
+        let mut poly = document::entities::LwPolyline::from_points(
+            [
+                (0.0, 0.0),
+                (10.0, 0.0),
+                (10.0, 5.0),
+                (5.0, 5.0),
+                (5.0, 10.0),
+                (0.0, 10.0),
+            ]
+            .map(|(x, y)| document::types::Vector2::new(x, y))
+            .to_vec(),
         );
         poly.is_closed = true;
         let clip = scene.add_entity(EntityType::LwPolyline(poly));
-        let mut viewport = codec::entities::Viewport::new();
-        viewport.center = codec::types::Vector3::new(5.0, 5.0, 0.0);
+        let mut viewport = document::entities::Viewport::new();
+        viewport.center = document::types::Vector3::new(5.0, 5.0, 0.0);
         viewport.width = 20.0;
         viewport.height = 20.0;
         viewport.clip_boundary_handle = clip;
-        let viewport = scene.add_entity(EntityType::Viewport(viewport));
+        viewport.status.non_rectangular_clipping = true;
+        let viewport = scene.add_entity(EntityType::Viewport(Box::new(viewport)));
         for (x, y, inside) in [
-            (2.0, 2.0, true), (8.0, 2.0, true), (8.0, 8.0, false),
-            (-1.0, 5.0, false), (5.0, 7.0, true),
+            (2.0, 2.0, true),
+            (8.0, 2.0, true),
+            (8.0, 8.0, false),
+            (-1.0, 5.0, false),
+            (5.0, 7.0, true),
         ] {
             assert_eq!(
-                scene.viewport_displays_paper_point(viewport, glam::DVec2::new(x, y)), inside,
+                scene.viewport_displays_paper_point(viewport, glam::DVec2::new(x, y)),
+                inside,
             );
         }
     }
 }
 
 impl Scene {
-
     /// Fold the active viewport's saved view onto the effective camera (the
     /// auto-fit centre for stale UTM views) and persist it into `view_target` /
     /// `view_height`. Called on entering MSPACE so pan/zoom, paper↔model and the
@@ -261,7 +425,7 @@ impl Scene {
             return;
         };
         let eff_h = cam.ortho_size() as f64 * 2.0;
-        if let Some(codec::EntityType::Viewport(vp)) = self.document.get_entity_mut(vp_handle) {
+        if let Some(document::EntityType::Viewport(vp)) = self.document.get_entity_mut(vp_handle) {
             vp.view_target.x = cam.target.x;
             vp.view_target.y = cam.target.y;
             vp.view_center.x = 0.0;
@@ -275,16 +439,30 @@ impl Scene {
 
     /// Fit model-space bounds into the active floating viewport without moving
     /// the surrounding paper-space camera.
-    pub fn fit_active_viewport_to_bounds(
+    pub fn fit_active_viewport_to_bounds(&mut self, min: glam::Vec3, max: glam::Vec3) -> bool {
+        self.fit_active_viewport_bounds(min, max, true)
+    }
+
+    /// Zoom Window fits edge to edge, without the extents border.
+    pub(super) fn fit_active_viewport_to_window(
         &mut self,
         min: glam::Vec3,
         max: glam::Vec3,
+    ) -> bool {
+        self.fit_active_viewport_bounds(min, max, false)
+    }
+
+    fn fit_active_viewport_bounds(
+        &mut self,
+        min: glam::Vec3,
+        max: glam::Vec3,
+        bordered: bool,
     ) -> bool {
         let Some(viewport_handle) = self.active_viewport else {
             return false;
         };
         let (width, height, locked) = match self.document.get_entity(viewport_handle) {
-            Some(codec::EntityType::Viewport(viewport)) => {
+            Some(document::EntityType::Viewport(viewport)) => {
                 (viewport.width, viewport.height, viewport.status.locked)
             }
             _ => return false,
@@ -295,8 +473,14 @@ impl Scene {
         let Some(mut camera) = self.camera_for_viewport(viewport_handle) else {
             return false;
         };
-        camera.fit_to_bounds(min, max, (width / height.max(1e-9)) as f32);
-        if let Some(codec::EntityType::Viewport(viewport)) =
+        // The viewport's size on screen: its paper size over the paper
+        // camera's world-per-pixel.
+        let canvas_h = self.selection.borrow().view.vp_size.1;
+        let paper_wpp = 2.0 * f64::from(self.camera.borrow().ortho_size()) / f64::from(canvas_h);
+        let pixels = (bordered && paper_wpp.is_finite() && paper_wpp > 0.0)
+            .then(|| ((width / paper_wpp) as f32, (height / paper_wpp) as f32));
+        camera.fit_to_bounds_bordered_f32(min, max, (width / height.max(1e-9)) as f32, pixels);
+        if let Some(document::EntityType::Viewport(viewport)) =
             self.document.get_entity_mut(viewport_handle)
         {
             viewport.view_target.x = camera.target.x;
@@ -330,7 +514,7 @@ impl Scene {
 
         // Read viewport dims (immutable borrow ends here).
         let (view_height, vp_height, locked) = match self.document.get_entity(vp_handle) {
-            Some(codec::EntityType::Viewport(vp)) => {
+            Some(document::EntityType::Viewport(vp)) => {
                 (vp.view_height as f32, vp.height as f32, vp.status.locked)
             }
             _ => return,
@@ -356,7 +540,7 @@ impl Scene {
         let cam_up = vp_cam.rotation * glam::Vec3::Y;
         let model_delta = -(cam_right * screen_dx * speed) + (cam_up * screen_dy * speed);
 
-        if let Some(codec::EntityType::Viewport(vp)) = self.document.get_entity_mut(vp_handle) {
+        if let Some(document::EntityType::Viewport(vp)) = self.document.get_entity_mut(vp_handle) {
             vp.view_target.x += model_delta.x as f64;
             vp.view_target.y += model_delta.y as f64;
             vp.view_target.z += model_delta.z as f64;
@@ -370,17 +554,18 @@ impl Scene {
     /// model point under the cursor is kept stationary (AutoCAD-style zoom).
     /// No-op when there is no active viewport.
     pub fn zoom_active_viewport(&mut self, steps: f32, cursor_paper: Option<glam::Vec2>) {
+        self.scale_active_viewport(viewport_zoom_factor(steps as f64), cursor_paper);
+    }
+
+    pub(super) fn scale_active_viewport(&mut self, factor: f64, cursor_paper: Option<glam::Vec2>) {
         let vp_handle = match self.active_viewport {
             Some(h) => h,
             None => return,
         };
-        if let Some(codec::EntityType::Viewport(vp)) = self.document.get_entity_mut(vp_handle) {
+        if let Some(document::EntityType::Viewport(vp)) = self.document.get_entity_mut(vp_handle) {
             if vp.status.locked {
                 return;
             }
-            // Zoom in = shrink view_height → higher scale → objects appear larger.
-            let factor = (1.0_f64 - 0.15 * steps as f64).clamp(0.1, 10.0);
-
             if let Some(cp) = cursor_paper {
                 // Compute the model-space point under the cursor before zoom.
                 let scale_before =
@@ -434,7 +619,7 @@ impl Scene {
         // negating Y here made each drag step read back a Y-mirrored camera,
         // flipping the model between a rotation and its opposite every frame.
         let eye = cam.rotation * glam::Vec3::Z;
-        if let Some(codec::EntityType::Viewport(vp)) = self.document.get_entity_mut(vp_handle) {
+        if let Some(document::EntityType::Viewport(vp)) = self.document.get_entity_mut(vp_handle) {
             if vp.status.locked {
                 return;
             }
@@ -480,7 +665,7 @@ impl Scene {
             .normalize_or(glam::Vec3::Y);
         let roll = up0.cross(desired_up).dot(dir).atan2(up0.dot(desired_up));
         let twist = -roll as f64;
-        if let Some(codec::EntityType::Viewport(vp)) = self.document.get_entity_mut(vp_handle) {
+        if let Some(document::EntityType::Viewport(vp)) = self.document.get_entity_mut(vp_handle) {
             if vp.status.locked {
                 return;
             }
@@ -519,7 +704,7 @@ impl Scene {
         let roll = up0.cross(desired_up).dot(dir).atan2(up0.dot(desired_up));
         let twist = -roll as f64;
         let mut changed = false;
-        if let Some(codec::EntityType::Viewport(vp)) = self.document.get_entity_mut(vp_handle) {
+        if let Some(document::EntityType::Viewport(vp)) = self.document.get_entity_mut(vp_handle) {
             if vp.status.locked {
                 return false;
             }
@@ -527,10 +712,8 @@ impl Scene {
             vp.view_direction.y = dir.y as f64;
             vp.view_direction.z = dir.z as f64;
             vp.twist_angle = twist;
-            vp.status.perspective =
-                tmp.projection == view::camera::Projection::Perspective;
-            vp.lens_length =
-                (12.0 / (tmp.fov_y * 0.5).tan().max(1e-6)) as f64;
+            vp.status.perspective = tmp.projection == view::camera::Projection::Perspective;
+            vp.lens_length = tmp.lens as f64;
             changed = true;
         }
         if changed {
@@ -541,12 +724,10 @@ impl Scene {
 
     /// Render mode of the active paper-space viewport, or `None` when no
     /// viewport is active (PSPACE / model layout).
-    pub fn active_viewport_render_mode(
-        &self,
-    ) -> Option<codec::entities::ViewportRenderMode> {
+    pub fn active_viewport_render_mode(&self) -> Option<document::entities::ViewportRenderMode> {
         let h = self.active_viewport?;
         match self.document.get_entity(h) {
-            Some(codec::EntityType::Viewport(vp)) => Some(vp.render_mode),
+            Some(document::EntityType::Viewport(vp)) => Some(vp.render_mode),
             _ => None,
         }
     }
@@ -556,12 +737,12 @@ impl Scene {
     /// so the caller can fall back to the model-layout render mode.
     pub fn set_active_viewport_render_mode(
         &mut self,
-        mode: codec::entities::ViewportRenderMode,
+        mode: document::entities::ViewportRenderMode,
     ) -> bool {
         let Some(h) = self.active_viewport else {
             return false;
         };
-        if let Some(codec::EntityType::Viewport(vp)) = self.document.get_entity_mut(h) {
+        if let Some(document::EntityType::Viewport(vp)) = self.document.get_entity_mut(h) {
             vp.render_mode = mode;
             true
         } else {
@@ -570,24 +751,25 @@ impl Scene {
     }
 
     /// Visual style of the active Model tile (for the render-mode picker).
-    pub fn active_model_tile_render_mode(
-        &self,
-    ) -> codec::entities::ViewportRenderMode {
+    pub fn active_model_tile_render_mode(&self) -> document::entities::ViewportRenderMode {
         let tiles = self.model_tiles.borrow();
-        let active = self.active_model_tile.get().min(tiles.len().saturating_sub(1));
+        let active = self
+            .active_model_tile
+            .get()
+            .min(tiles.len().saturating_sub(1));
         tiles
             .get(active)
             .map(|t| t.render_mode)
-            .unwrap_or(codec::entities::ViewportRenderMode::Wireframe2D)
+            .unwrap_or(document::entities::ViewportRenderMode::Wireframe2D)
     }
 
     /// Set only the active Model tile's render mode. Other tiles keep theirs.
-    pub fn set_active_model_tile_render_mode(
-        &self,
-        mode: codec::entities::ViewportRenderMode,
-    ) {
+    pub fn set_active_model_tile_render_mode(&self, mode: document::entities::ViewportRenderMode) {
         let mut tiles = self.model_tiles.borrow_mut();
-        let active = self.active_model_tile.get().min(tiles.len().saturating_sub(1));
+        let active = self
+            .active_model_tile
+            .get()
+            .min(tiles.len().saturating_sub(1));
         if let Some(t) = tiles.get_mut(active) {
             t.render_mode = mode;
         }
@@ -625,7 +807,40 @@ impl Scene {
 
     pub(crate) fn navigation_locked(&self) -> bool {
         self.active_viewport.is_some_and(|h| {
-            !matches!(self.document.get_entity(h), Some(codec::EntityType::Viewport(v)) if !v.status.locked)
+            !matches!(self.document.get_entity(h), Some(document::EntityType::Viewport(v)) if !v.status.locked)
+        })
+    }
+
+    /// The viewports the status-bar lock acts on: the one entered, else the
+    /// selected viewports of the current layout.
+    pub(crate) fn lockable_viewports(&self) -> Vec<Handle> {
+        if self.current_layout == "Model" {
+            return Vec::new();
+        }
+        let is_viewport = |handle: &Handle| {
+            matches!(
+                self.document.get_entity(*handle),
+                Some(document::EntityType::Viewport(vp))
+                    if !Self::is_sheet_viewport(&self.document, vp)
+            )
+        };
+        match self.active_viewport.filter(is_viewport) {
+            Some(active) => vec![active],
+            None => self.selected.iter().copied().filter(is_viewport).collect(),
+        }
+    }
+
+    /// Display lock of [`Self::lockable_viewports`]: `Some(true)` when all
+    /// are locked, `None` when there is no viewport to lock.
+    pub fn viewports_display_locked(&self) -> Option<bool> {
+        let handles = self.lockable_viewports();
+        (!handles.is_empty()).then(|| {
+            handles.iter().all(|handle| {
+                matches!(
+                    self.document.get_entity(*handle),
+                    Some(document::EntityType::Viewport(vp)) if vp.status.locked
+                )
+            })
         })
     }
 
@@ -636,7 +851,7 @@ impl Scene {
             return false;
         }
         if let Some(handle) = self.active_viewport {
-            if let Some(codec::EntityType::Viewport(vp)) = self.document.get_entity_mut(handle) {
+            if let Some(document::EntityType::Viewport(vp)) = self.document.get_entity_mut(handle) {
                 vp.view_target.x = camera.target.x;
                 vp.view_target.y = camera.target.y;
                 vp.view_target.z = camera.target.z;
@@ -700,12 +915,7 @@ impl Scene {
     /// when it lands on the part the user can actually see — clicking the empty
     /// area beside a viewport that runs off-screen no longer matches its full
     /// (partly off-canvas) paper rect and switches to it by mistake.
-    pub fn viewport_at_screen_point(
-        &self,
-        px: f32,
-        py: f32,
-        canvas: (f32, f32),
-    ) -> Option<Handle> {
+    pub fn viewport_at_screen_point(&self, px: f32, py: f32, canvas: (f32, f32)) -> Option<Handle> {
         let (_, _, handles) = self.paper_viewport_handles();
         handles
             .iter()
@@ -713,7 +923,7 @@ impl Scene {
                 let Some(EntityType::Viewport(vp)) = self.document.get_entity(*handle) else {
                     return None;
                 };
-                if !vp.status.is_on {
+                if !vp.is_on() {
                     return None;
                 }
                 let rect = self.viewport_screen_rect(vp.common.handle, canvas)?;
@@ -750,7 +960,7 @@ impl Scene {
     pub fn viewport_displays_content(&self, vp_handle: Handle) -> bool {
         matches!(
             self.document.get_entity(vp_handle),
-            Some(EntityType::Viewport(vp)) if vp.status.is_on
+            Some(EntityType::Viewport(vp)) if vp.is_on()
         )
     }
 
@@ -762,7 +972,7 @@ impl Scene {
             let Some(EntityType::Viewport(vp)) = self.document.get_entity(*handle) else {
                 return None;
             };
-            if vp.status.is_on {
+            if vp.is_on() {
                 Some(vp.common.handle)
             } else {
                 None

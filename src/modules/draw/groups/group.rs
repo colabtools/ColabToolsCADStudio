@@ -13,9 +13,9 @@ pub fn tool() -> ToolDef {
 
 // ── CadCommand implementation ─────────────────────────────────────────────
 
-use codec::Handle;
-use glam::DVec3;
 use crate::t;
+use document::Handle;
+use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult};
 use crate::scene::model::wire_model::WireModel;

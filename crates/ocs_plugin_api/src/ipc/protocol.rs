@@ -17,13 +17,16 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::host::{CommandSource, CommandStep, HostSettingValue};
+use crate::host::{
+    CommandSource, CommandStep, CustomGripEvent, CustomGripResponse, GripInfo, HostSettingValue,
+    PluginConstraint, PluginGrip, XRecordEntry, XRecordRead, XRecordUpdate,
+};
 use crate::manifest::ApiVersion;
-use crate::ribbon::owned::{OwnedPluginManifest, OwnedRibbonGroup};
+use crate::ribbon::owned::{OwnedEntityClasses, OwnedPluginManifest, OwnedRibbonGroup};
 
-pub use codec::xdata::{ExtendedDataRecord, XDataValue};
-pub use codec::{CadDocument, EntityType, Handle};
 pub use crate::host::PreviewWire;
+pub use document::xdata::{ExtendedDataRecord, XDataValue};
+pub use document::{Document, EntityType, Handle};
 
 /// Events the host forwards to an active plugin `InteractiveCommand`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +39,10 @@ pub enum InteractiveEvent {
     ObjectPick { handle: Handle, pt: [f64; 3] },
     /// User cancelled the prompt (e.g. pressed ESC), resetting interactive collection.
     Cancel,
+    /// A set of entities selected during selection gathering mode.
+    SelectionComplete(Vec<Handle>),
+    /// V7 (additive): modal dialog submitted or cancelled.
+    DialogResponse(crate::dialog::DialogResponse),
 }
 
 /// Initial handshake sent by the plugin runner immediately after connecting.
@@ -50,7 +57,10 @@ pub enum InteractiveEvent {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RunnerHandshake {
     Token(String),
-    TokenV4 { token: String, protocol_version: u32 },
+    TokenV4 {
+        token: String,
+        protocol_version: u32,
+    },
 }
 
 /// Environment variable through which the host passes the pre-shared
@@ -83,11 +93,63 @@ pub enum HostRequest {
         tab_index: usize,
     },
     /// V7: release an interactive command after completion or cancellation.
-    DropInteractive { command_id: u64 },
+    DropInteractive {
+        command_id: u64,
+    },
     /// V7: cursor move preview update during an interactive command.
     CursorMove {
         command_id: u64,
         pt: [f64; 3],
+    },
+    /// V11: one drag event for a plugin-declared custom grip, delivered to
+    /// the owning plugin only. The runner passes the plugin a full HostApi
+    /// proxy, so the settle phase can perform writes (possibly nested, over
+    /// the multiplexed link) inside the plugin's own undo scope.
+    CustomGripEvent {
+        tab_index: usize,
+        event: CustomGripEvent,
+    },
+    /// V7 (additive): query if an interactive command is in selection-gathering mode (as for `ssget`).
+    IsSelectionGathering {
+        command_id: u64,
+    },
+    /// V7 (additive): query if an interactive command permits drag window/crossing box selections.
+    AcceptsDragSelection {
+        command_id: u64,
+    },
+    /// V7 (additive): query if an interactive command rejects locked layers during selection.
+    SelectionRejectsLockedLayers {
+        command_id: u64,
+    },
+    /// V7: query optional modal dialog for an interactive command.
+    GetModalDialog {
+        command_id: u64,
+    },
+    /// V19 (additive): an event (choice change, button, toggle, table row)
+    /// inside the interactive command's open modal dialog. The runner answers
+    /// with [`HostResponse::DialogAction`] carrying the command's
+    /// `on_dialog_action` result, so out-of-process plugins can replace,
+    /// submit or close their dialog like in-process ones.
+    DialogAction {
+        command_id: u64,
+        event: crate::dialog::DialogEvent,
+    },
+    /// V24 (additive): mid-command Ctrl+Z. The runner answers with
+    /// [`HostResponse::UndoStep`] carrying the command's `on_undo_step`
+    /// result. A v23 runner cannot decode this request: the host sends it
+    /// only to plugins whose manifest declares v24 or newer.
+    UndoStep {
+        command_id: u64,
+    },
+    /// V25 (additive): the plugin's AI tools. The runner answers with
+    /// [`HostResponse::Tools`]; sent only to plugins declaring v25 or newer.
+    ListTools,
+    /// V25 (additive): run one AI tool on the given tab. The runner answers
+    /// with [`HostResponse::ToolResult`].
+    CallTool {
+        tab_index: usize,
+        name: String,
+        arguments: String,
     },
 }
 
@@ -102,6 +164,20 @@ pub enum HostResponse {
     Error(String),
     CodeExecutionResult(crate::host::ExecutionResult),
     PreviewWires(Vec<PreviewWire>),
+    /// V11: the owning plugin's answer to a custom-grip drag event: the
+    /// preview wire set that replaces its previous live preview.
+    CustomGrip(CustomGripResponse),
+    ModalDialog(Option<crate::dialog::DialogDef>),
+    /// V19 (additive): answer to [`HostRequest::DialogAction`].
+    DialogAction(crate::dialog::DialogActionResponse),
+    /// V24 (additive): answer to [`HostRequest::UndoStep`]; `None` when the
+    /// command leaves Ctrl+Z to the document undo.
+    UndoStep(Option<Box<CommandStep>>),
+    /// V25 (additive): answer to [`HostRequest::ListTools`].
+    Tools(Vec<crate::host::PluginTool>),
+    /// V25 (additive): answer to [`HostRequest::CallTool`]: the result as
+    /// JSON text, or the plugin's error message.
+    ToolResult(Result<String, String>),
 }
 
 /// Requests the plugin runner sends to the host.
@@ -145,13 +221,19 @@ pub enum PluginRequest {
     AddEntities(Vec<EntityType>),
     /// V4: ask the host to create/refresh a tab-keyed shared-memory document
     /// view and return the file path + current version.
-    OpenDocumentViewV4 { tab_id: u64 },
+    OpenDocumentViewV4 {
+        tab_id: u64,
+    },
     /// V4: ask the host to close the tab-keyed shared-memory document view.
-    CloseDocumentViewV4 { tab_id: u64 },
+    CloseDocumentViewV4 {
+        tab_id: u64,
+    },
     /// V4: ask the host for the stable tab identifier of the active tab.
     GetTabId,
     /// V5: ask the host for the filesystem path of the document in `tab_id`.
-    DocumentPath { tab_id: u64 },
+    DocumentPath {
+        tab_id: u64,
+    },
     /// Add a layer to the active document with full initial properties.
     AddLayer(crate::host::LayerConfig),
     /// Modify specified properties of an existing layer in the active document.
@@ -159,20 +241,193 @@ pub enum PluginRequest {
     /// Run a command on the active document tab's command line (AutoLISP style).
     ExecuteCommand(String),
     /// Read a host-managed setting without nested command dispatch.
-    GetSystemVariable { name: String },
+    GetSystemVariable {
+        name: String,
+    },
     /// Change a host-managed setting without nested command dispatch.
-    SetSystemVariable { name: String, value: HostSettingValue },
+    SetSystemVariable {
+        name: String,
+        value: HostSettingValue,
+    },
     /// V7: validate and replace existing entities in a single undo step.
-    UpdateEntitiesTransaction { label: String, entities: Vec<EntityType> },
+    UpdateEntitiesTransaction {
+        label: String,
+        entities: Vec<EntityType>,
+    },
     /// V7: synchronous selection read/write for the dispatch tab.
     GetSelection,
-    SetSelection { handles: Vec<Handle> },
+    SetSelection {
+        handles: Vec<Handle>,
+    },
     /// V7 (additive): kernel-backed solid create or transform.
-    SolidOperation { operation: crate::host::SolidOperation },
+    SolidOperation {
+        operation: crate::host::SolidOperation,
+    },
     /// V7 (additive): drawing table record create/modify/rename/delete.
-    TableOperation { operation: crate::host::TableOperation },
+    TableOperation {
+        operation: crate::host::TableOperation,
+    },
     /// V7 (additive): drive an OCS command.
-    RunCommand { request: crate::host::CommandRequest },
+    RunCommand {
+        request: crate::host::CommandRequest,
+    },
+    /// V8 (additive): create an XRecord under a named-object-dictionary path.
+    CreateXRecord {
+        dictionary_path: Vec<String>,
+        name: String,
+        entries: Vec<crate::host::XRecordEntry>,
+    },
+    /// V8 (additive): read the entries of an existing XRecord.
+    ReadXRecord {
+        dictionary_path: Vec<String>,
+        name: String,
+    },
+    /// V8 (additive): replace the entries of an existing XRecord.
+    UpdateXRecord {
+        dictionary_path: Vec<String>,
+        name: String,
+        entries: Vec<crate::host::XRecordEntry>,
+    },
+    /// V8 (additive): delete an XRecord and its dictionary entry.
+    DeleteXRecord {
+        dictionary_path: Vec<String>,
+        name: String,
+    },
+    /// V8 (additive): list the XRecord names under a dictionary path.
+    ListXRecords {
+        dictionary_path: Vec<String>,
+    },
+    /// V9 (additive): mark an entity reference-only (plugin-owned display data).
+    SetReferenceOnly {
+        handle: Handle,
+        reference_only: bool,
+    },
+    /// V11 (additive): enumerate an entity's built-in grips with viewport
+    /// parity.
+    EntityGrips {
+        handle: Handle,
+    },
+    /// V11 (additive): perform the one-undo-step grip edit an interactive
+    /// drag performs.
+    GripDrag {
+        handle: Handle,
+        grip_id: usize,
+        to: [f64; 3],
+    },
+    /// V11 (additive): declare (or clear) the calling plugin's custom grip
+    /// points. The declaring plugin's identity is attached by the host from
+    /// the serving process's own manifest, never from the frame.
+    SetPluginGrips {
+        grips: Vec<PluginGrip>,
+    },
+    /// V12 (additive): read specific entities by handle — cheap per-entity
+    /// reads for refresh passes, so a plugin that writes and re-reads never
+    /// re-clones the full document snapshot (the v11.1 per-boundary cost:
+    /// every write invalidated the session snapshot).
+    GetEntitiesBatch {
+        handles: Vec<Handle>,
+    },
+    /// V13 (additive): create a parametric constraint directly (the
+    /// interactive COINCIDENT/TANGENT machinery, no command line, no echo;
+    /// joins the caller's open plugin scope).
+    CreateConstraint {
+        constraint: PluginConstraint,
+    },
+    /// V13 (additive): read several XRecords in one round trip.
+    ReadXRecords {
+        reads: Vec<XRecordRead>,
+    },
+    /// V13 (additive): replace the entries of several XRecords in one
+    /// round trip (one shared undo composition).
+    UpdateXRecords {
+        updates: Vec<XRecordUpdate>,
+    },
+    /// V13 (additive): list a dictionary's XRecords with their entries in
+    /// one answer.
+    ListXRecordsWithEntries {
+        dictionary_path: Vec<String>,
+    },
+    /// V14 (additive): turn a declared parametric chain into reference-only
+    /// display geometry (one publish, the entity-write undo contract).
+    StageParametricChain {
+        reference_name: String,
+        chain: crate::host::ParametricChain,
+        tolerance: f64,
+    },
+    /// V14 (additive): evaluate a declared chain at `s` — a pure read.
+    SampleParametric {
+        chain: crate::host::ParametricChain,
+        s: f64,
+    },
+    /// V14 (additive): register a plugin-scoped entity class — session
+    /// state; idempotent for an equal schema, refusing a mismatch.
+    RegisterPluginClass {
+        class: crate::host::PluginClassDeclaration,
+    },
+    /// V14 (additive): stage one instance of a registered plugin class —
+    /// identity plus a host-evaluated design descriptor (the entity-write
+    /// undo contract; reference-only; capped).
+    StagePluginClassInstance {
+        instance: crate::host::PluginClassInstance,
+    },
+    /// V14 (additive): read a registered class instance's declared
+    /// parameter rows — the read half of the session's properties pair
+    /// across the wire (the identity stamp resolves; the record row stays
+    /// the values' truth).
+    PluginClassInstanceProperties {
+        handle: Handle,
+    },
+    /// V7 (additive): modal form dialog request.
+    ShowDialog(crate::dialog::DialogDef),
+    /// V7 (additive): register a persistent dockable side panel.
+    RegisterPanel(crate::dialog::PanelDef),
+    /// V7 (additive): update control values in a persistent dockable side panel.
+    UpdatePanel {
+        panel_id: String,
+        values: std::collections::HashMap<String, crate::dialog::DialogValue>,
+    },
+    /// V7 (additive): toggle visibility or show/hide a persistent dockable side panel.
+    TogglePanel {
+        panel_id: String,
+        show: Option<bool>,
+    },
+    /// V14: open one undo step that later messages join until
+    /// [`PluginRequest::EndUndoGroup`].
+    BeginUndoGroup {
+        label: String,
+    },
+    /// V14: close the step [`PluginRequest::BeginUndoGroup`] opened.
+    EndUndoGroup,
+    /// V14: a page of the entities matching a control-API `query` JSON.
+    QueryEntities {
+        query: String,
+    },
+    /// V15 (additive): register the declarative quad cursor menu panels this
+    /// plugin contributes (mirrors `RegisterPanel`; the owning plugin's id
+    /// comes from the transport, never the wire).
+    RegisterQuadPanels {
+        panels: Vec<crate::dialog::QuadPanelDef>,
+    },
+    /// V15 (additive): remove the named quad panels the plugin owns (ids
+    /// owned by another plugin are refused in the response).
+    UnregisterQuadPanels {
+        panel_ids: Vec<String>,
+    },
+    /// Additive: audit a declared chain without staging or mutating host state.
+    ValidateParametricChain {
+        chain: crate::host::ParametricChain,
+        tolerance: f64,
+    },
+    /// Additive: read the current state of an owned dock panel.
+    PanelSnapshot {
+        panel_id: String,
+    },
+    /// V22 (additive): create or update the model-space GEODATA object.
+    SetGeoLocation {
+        location: crate::host::GeoLocation,
+    },
+    /// V22 (additive): remove the model-space GEODATA object.
+    RemoveGeoLocation,
 }
 
 /// Responses the host sends back for `PluginRequest`.
@@ -182,7 +437,7 @@ pub enum PluginResponse {
     Bool(bool),
     Handle(Handle),
     Record(Option<ExtendedDataRecord>),
-    Document(Box<CadDocument>),
+    Document(Box<Document>),
     Error(String),
     /// Path to the memory-mapped file and the current snapshot version.
     DocumentView {
@@ -209,6 +464,66 @@ pub enum PluginResponse {
     SolidResult(Result<Handle, String>),
     TableResult(Result<Handle, String>),
     CommandResult(Result<crate::host::CommandOutcome, String>),
+    /// V8 (additive): handle of a created XRecord.
+    XRecordCreateResult(Result<Handle, String>),
+    /// V8 (additive): entries of a read XRecord.
+    XRecordEntries(Result<Vec<crate::host::XRecordEntry>, String>),
+    /// V8 (additive): handle of an updated XRecord.
+    XRecordUpdateResult(Result<Handle, String>),
+    /// V8 (additive): the removed XRecord, with its prior content.
+    XRecordDeleteResult(Result<crate::host::XRecord, String>),
+    /// V8 (additive): XRecord names under a dictionary path.
+    XRecordNames(Result<Vec<String>, String>),
+    /// V9 (additive): outcome of the reference-only designation.
+    SetReferenceOnlyResult(Result<(), String>),
+    /// V11 (additive): an entity's built-in grip list.
+    EntityGripsResult(Result<Vec<GripInfo>, String>),
+    /// V11 (additive): outcome of a programmatic grip drag.
+    GripDragResult(Result<(), String>),
+    /// V11 (additive): outcome of a custom-grip declaration.
+    SetPluginGripsResult(Result<(), String>),
+    /// V12 (additive): per-entity reads by handle (None per unknown handle).
+    GetEntitiesBatchResult(Result<Vec<Option<EntityType>>, String>),
+    /// V13 (additive): outcome of a direct constraint creation.
+    CreateConstraintResult(Result<(), String>),
+    /// V13 (additive): batched XRecord reads (per-entry results).
+    ReadXRecordsResult(Result<Vec<Result<Vec<XRecordEntry>, String>>, String>),
+    /// V13 (additive): batched XRecord updates (per-entry results).
+    UpdateXRecordsResult(Result<Vec<Result<Handle, String>>, String>),
+    /// V13 (additive): dictionary XRecords with their entries.
+    ListXRecordsWithEntriesResult(Result<Vec<(String, Vec<XRecordEntry>)>, String>),
+    /// V14 (additive): handles of the staged display entities.
+    StageParametricChainResult(Result<Vec<Handle>, String>),
+    /// V14 (additive): the evaluated chain point, `None` outside the chain.
+    SampleParametricResult(Result<Option<crate::host::ParametricSample>, String>),
+    /// V14 (additive): outcome of a plugin class registration.
+    RegisterPluginClassResult(Result<(), String>),
+    /// V14 (additive): handles of the staged instance display set.
+    StagePluginClassInstanceResult(Result<Vec<Handle>, String>),
+    /// V14 (additive): a class instance's declared parameter rows (the
+    /// read half of the session's properties pair).
+    PluginClassInstancePropertiesResult(Result<Vec<crate::host::PluginClassParameterRow>, String>),
+    DialogResult(crate::dialog::DialogResponse),
+    PanelRegistered(bool),
+    PanelUpdated(bool),
+    PanelToggled(bool),
+    /// V14: answer to [`PluginRequest::QueryEntities`].
+    EntityPage(Result<crate::host::EntityPage, String>),
+    /// V15 (additive): outcome of a quad panel registration or removal —
+    /// one `ok` entry per request panel (request order), plus a short reason
+    /// string for each refused entry.
+    QuadPanelsRegistered {
+        ok: Vec<bool>,
+        errors: Vec<String>,
+    },
+    /// Additive: outcome of pure parametric-chain validation.
+    ValidateParametricChainResult(Result<(), String>),
+    /// Additive: current state of an owned dock panel.
+    PanelSnapshot(Result<crate::dialog::PanelSnapshot, String>),
+    /// V22 (additive): the GEODATA handle written by `SetGeoLocation`.
+    GeoLocationSet(Result<crate::host::Handle, String>),
+    /// V22 (additive): whether `RemoveGeoLocation` removed an object.
+    GeoLocationRemoved(Result<bool, String>),
 }
 
 /// Messages sent from the host to the plugin runner.
@@ -237,6 +552,24 @@ impl From<&'static crate::manifest::PluginManifest> for OwnedPluginManifest {
             ribbon_order: m.ribbon_order,
             xdata_apps: m.xdata_apps.iter().map(|s| s.to_string()).collect(),
             command_prefixes: m.command_prefixes.iter().map(|s| s.to_string()).collect(),
+            // The declaration does not live on the static manifest struct (its
+            // layout is frozen ABI, shared by pointer with older cdylibs); the
+            // runner folds the API-v10 trait accessor in after conversion.
+            entity_classes: None,
+        }
+    }
+}
+
+impl From<&'static crate::manifest::EntityClasses> for OwnedEntityClasses {
+    fn from(c: &'static crate::manifest::EntityClasses) -> Self {
+        Self {
+            app_id: c.app_id.to_string(),
+            class_prefix: c.class_prefix.to_string(),
+            labels: c
+                .labels
+                .iter()
+                .map(|(key, label)| (key.to_string(), label.to_string()))
+                .collect(),
         }
     }
 }
@@ -245,6 +578,130 @@ impl OwnedPluginManifest {
     pub fn api_version(&self) -> ApiVersion {
         ApiVersion {
             major: self.api_version,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn discriminant_of<T: Serialize>(value: &T) -> u32 {
+        let bytes = bincode::serialize(value).expect("serialize");
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    #[test]
+    fn plugin_request_v14_to_v16_discriminants_are_preserved() {
+        assert_eq!(
+            discriminant_of(&PluginRequest::ShowDialog(crate::dialog::DialogDef::new("T"))),
+            50
+        );
+        assert_eq!(
+            discriminant_of(&PluginRequest::RegisterPanel(
+                crate::dialog::PanelDef::new("id", "T")
+            )),
+            51
+        );
+        assert_eq!(
+            discriminant_of(&PluginRequest::UpdatePanel {
+                panel_id: "id".into(),
+                values: Default::default(),
+            }),
+            52
+        );
+        assert_eq!(
+            discriminant_of(&PluginRequest::TogglePanel {
+                panel_id: "id".into(),
+                show: None,
+            }),
+            53
+        );
+        assert_eq!(
+            discriminant_of(&PluginRequest::BeginUndoGroup {
+                label: "group".into(),
+            }),
+            54
+        );
+        assert_eq!(discriminant_of(&PluginRequest::EndUndoGroup), 55);
+        assert_eq!(
+            discriminant_of(&PluginRequest::QueryEntities {
+                query: "{}".into(),
+            }),
+            56
+        );
+        assert_eq!(
+            discriminant_of(&PluginRequest::RegisterQuadPanels { panels: vec![] }),
+            57
+        );
+        assert_eq!(
+            discriminant_of(&PluginRequest::UnregisterQuadPanels { panel_ids: vec![] }),
+            58
+        );
+        assert_eq!(
+            discriminant_of(&HostRequest::GetModalDialog { command_id: 1 }),
+            14
+        );
+        assert_eq!(
+            discriminant_of(&HostRequest::DialogAction {
+                command_id: 1,
+                event: crate::dialog::DialogEvent {
+                    control_id: String::new(),
+                    action: String::new(),
+                    value: None,
+                    current_values: Default::default(),
+                },
+            }),
+            15
+        );
+        assert_eq!(
+            discriminant_of(&HostRequest::UndoStep { command_id: 1 }),
+            16
+        );
+        assert_eq!(discriminant(&HostResponse::UndoStep(None)), 11);
+    }
+
+    fn discriminant<T: serde::Serialize>(value: &T) -> u32 {
+        let bytes = bincode::serialize(value).expect("serialize IPC variant");
+        u32::from_le_bytes(bytes[..4].try_into().expect("bincode enum discriminant"))
+    }
+
+    #[test]
+    fn panel_snapshot_variants_append_without_shifting_discriminants() {
+        let request = PluginRequest::PanelSnapshot {
+            panel_id: "alignment".to_owned(),
+        };
+        let response = PluginResponse::PanelSnapshot(Err("unsupported".to_owned()));
+
+        assert_eq!(discriminant(&PluginRequest::PushInfo(String::new())), 0);
+        assert_eq!(
+            discriminant(&PluginRequest::ValidateParametricChain {
+                chain: crate::host::ParametricChain {
+                    plane: crate::host::ParametricPlane::Plan,
+                    segments: Vec::new(),
+                    layer: String::new(),
+                },
+                tolerance: 1e-3,
+            }),
+            59
+        );
+        assert_eq!(discriminant(&request), 60);
+        assert_eq!(discriminant(&PluginResponse::Ok), 0);
+        assert_eq!(
+            discriminant(&PluginResponse::ValidateParametricChainResult(Ok(()))),
+            45
+        );
+        assert_eq!(discriminant(&response), 46);
+
+        let bytes = bincode::serialize(&request).expect("serialize panel snapshot request");
+        match bincode::deserialize::<PluginRequest>(&bytes).expect("deserialize request") {
+            PluginRequest::PanelSnapshot { panel_id } => assert_eq!(panel_id, "alignment"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let bytes = bincode::serialize(&response).expect("serialize panel snapshot response");
+        match bincode::deserialize::<PluginResponse>(&bytes).expect("deserialize response") {
+            PluginResponse::PanelSnapshot(Err(error)) => assert_eq!(error, "unsupported"),
+            other => panic!("unexpected: {other:?}"),
         }
     }
 }

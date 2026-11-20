@@ -20,6 +20,7 @@
 
 use super::OpenCADStudio;
 use rustc_hash::FxHashMap;
+mod pgp;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
@@ -79,8 +80,14 @@ const WEB_ALIAS_KEY: &str = "opencadstudio.aliases";
 /// defaults add aliases or change a default target, so existing profiles can be
 /// migrated forward (see `introduced_at` / `migrate_aliases`). Version 1 shipped
 /// the pre-REDRAW table; version 2 introduced the REDRAW-family aliases; version 3
-/// introduced HB (HATCHTOBACK); version 4 introduced ER (EXTERNALREFERENCES).
-const DEFAULT_ALIASES_VERSION: u32 = 4;
+/// introduced HB (HATCHTOBACK); version 4 introduced ER (EXTERNALREFERENCES);
+/// version 10 the block command-line forms and block editor shortcuts;
+/// version 11 IO (INSERTOBJ); version 12 DLU (DATALINKUPDATE); version 13 SP
+/// (SPELL); version 14 the multileader set (MLE, LEAD; LE and MLA retargeted,
+/// MLR / MLAL / QL dropped); version 15 TS (TABLESTYLE) and CT (CTABLESTYLE);
+/// version 16 dropped WO (WIPEOUT has no alias); version 17 DDLTYPE
+/// (LINETYPE); version 19 DST, DDIM and DIMSTY (DIMSTYLE).
+const DEFAULT_ALIASES_VERSION: u32 = 19;
 
 #[cfg(target_arch = "wasm32")]
 const WEB_ALIAS_VERSION_KEY: &str = "opencadstudio.aliases.version";
@@ -99,6 +106,45 @@ fn introduced_at(version: u32) -> &'static [(&'static str, &'static str)] {
         ],
         3 => &[("HB", "HATCHTOBACK")],
         4 => &[("ER", "EXTERNALREFERENCES")],
+        5 => &[("-ATT", "-ATTDEF")],
+        6 => &[("VV", "QLAYER")],
+        7 => &[("DV", "DVIEW")],
+        8 => &[("-XR", "-XREF"), ("XC", "XCLIP"), ("ICL", "IMAGECLIP")],
+        9 => &[("IAD", "IMAGEADJUST")],
+        10 => &[
+            ("-B", "-BLOCK"),
+            ("-W", "-WBLOCK"),
+            ("BC", "BCLOSE"),
+            ("BS", "BSAVE"),
+            ("BVS", "BVSTATE"),
+            ("-ATE", "-ATTEDIT"),
+            ("ATTE", "-ATTEDIT"),
+        ],
+        11 => &[("IO", "INSERTOBJ")],
+        12 => &[("DLU", "DATALINKUPDATE")],
+        13 => &[("SP", "SPELL")],
+        14 => &[("MLE", "MLEADEREDIT"), ("LEAD", "LEADER")],
+        15 => &[("TS", "TABLESTYLE"), ("CT", "CTABLESTYLE")],
+        17 => &[("DDLTYPE", "LINETYPE")],
+        19 => &[("DST", "DIMSTYLE"), ("DDIM", "DIMSTYLE"), ("DIMSTY", "DIMSTYLE")],
+        _ => &[],
+    }
+}
+
+/// Defaults a version changed: `(alias, old command, new command)`, an empty
+/// new command dropping the alias. Applied only where the profile still holds
+/// the old default.
+fn retargeted_at(version: u32) -> &'static [(&'static str, &'static str, &'static str)] {
+    match version {
+        14 => &[
+            ("LE", "LEADER", "QLEADER"),
+            ("MLA", "MLEADERADD", "MLEADERALIGN"),
+            ("MLR", "MLEADERREMOVE", ""),
+            ("MLAL", "MLEADERALIGN", ""),
+            ("QL", "QLEADER", ""),
+        ],
+        16 => &[("WO", "WIPEOUT", "")],
+        18 => &[("T", "TEXT", "MTEXT")],
         _ => &[],
     }
 }
@@ -113,6 +159,19 @@ fn migrate_aliases(stored: &mut FxHashMap<String, String>, from_version: u32) ->
     }
     let mut changed = false;
     for version in from_version + 1..=DEFAULT_ALIASES_VERSION {
+        for (alias, old, new) in retargeted_at(version) {
+            if stored
+                .get(*alias)
+                .is_some_and(|cmd| cmd.eq_ignore_ascii_case(old))
+            {
+                if new.is_empty() {
+                    stored.remove(*alias);
+                } else {
+                    stored.insert(alias.to_string(), new.to_string());
+                }
+                changed = true;
+            }
+        }
         for (alias, cmd) in introduced_at(version) {
             let key = alias.to_uppercase();
             if stored.contains_key(&key) {
@@ -129,23 +188,7 @@ fn migrate_aliases(stored: &mut FxHashMap<String, String>, from_version: u32) ->
 /// lines and `;` comments; tolerates a leading `*` on the command and arbitrary
 /// whitespace padding.
 fn parse_pgp(body: &str) -> FxHashMap<String, String> {
-    let mut map = FxHashMap::default();
-    for line in body.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with(';') {
-            continue;
-        }
-        let Some((alias, cmd)) = line.split_once(',') else {
-            continue;
-        };
-        let alias = alias.trim().to_uppercase();
-        let cmd = cmd.trim().trim_start_matches('*').trim().to_uppercase();
-        if alias.is_empty() || cmd.is_empty() {
-            continue;
-        }
-        map.insert(alias, cmd);
-    }
-    map
+    pgp::parse(body).into_iter().collect()
 }
 
 /// Serialize an `alias → command` map to `.pgp` text with a header and aligned
@@ -171,7 +214,7 @@ fn default_map() -> FxHashMap<String, String> {
 }
 
 /// Sorted factory-default rows for the ALIASEDIT reset action.
-pub(super) fn default_alias_rows() -> Vec<(String, String)> {
+pub(crate) fn default_alias_rows() -> Vec<(String, String)> {
     let mut rows: Vec<(String, String)> = default_map().into_iter().collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     rows
@@ -188,7 +231,7 @@ pub(super) fn load_aliases() -> FxHashMap<String, String> {
         let Some(path) = alias_file_path() else {
             return default_map();
         };
-        return match std::fs::read_to_string(&path) {
+        match std::fs::read_to_string(&path) {
             Ok(body) => {
                 let mut map = parse_pgp(&body);
                 let seen = alias_version_file_path()
@@ -222,7 +265,7 @@ pub(super) fn load_aliases() -> FxHashMap<String, String> {
                 }
                 default_map()
             }
-        };
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -241,23 +284,16 @@ pub(super) fn load_aliases() -> FxHashMap<String, String> {
                     // Only advance the version marker once the migrated table is
                     // actually stored, so a failed set_item leaves the marker
                     // behind and the merge is retried next launch.
-                    if storage
-                        .set_item(WEB_ALIAS_KEY, &to_pgp(&map))
-                        .is_ok()
-                    {
-                        let _ = storage.set_item(
-                            WEB_ALIAS_VERSION_KEY,
-                            &DEFAULT_ALIASES_VERSION.to_string(),
-                        );
+                    if storage.set_item(WEB_ALIAS_KEY, &to_pgp(&map)).is_ok() {
+                        let _ = storage
+                            .set_item(WEB_ALIAS_VERSION_KEY, &DEFAULT_ALIASES_VERSION.to_string());
                     }
                 }
                 map
             }
             None => {
-                let _ = storage.set_item(
-                    WEB_ALIAS_VERSION_KEY,
-                    &DEFAULT_ALIASES_VERSION.to_string(),
-                );
+                let _ =
+                    storage.set_item(WEB_ALIAS_VERSION_KEY, &DEFAULT_ALIASES_VERSION.to_string());
                 default_map()
             }
         };
@@ -274,7 +310,7 @@ pub(super) fn save_map(map: &FxHashMap<String, String>) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        return std::fs::write(path, to_pgp(map));
+        std::fs::write(path, to_pgp(map))
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -292,23 +328,78 @@ pub(super) fn save_map(map: &FxHashMap<String, String>) -> std::io::Result<()> {
 }
 
 impl OpenCADStudio {
+    /// Merge into the working buffer only. Apply persists; closing can discard.
+    pub(super) fn import_alias_pgp(&mut self, bytes: &[u8]) {
+        let parsed = pgp::parse(&pgp::decode(bytes));
+        let known = crate::command::all_registered_command_names();
+        let mut rows: FxHashMap<String, String> = self
+            .alias_editor_rows
+            .iter()
+            .filter(|(a, c)| !a.is_empty() && !c.is_empty())
+            .cloned()
+            .collect();
+        let mut imported = 0;
+        let mut unsupported = std::collections::BTreeSet::new();
+        for (alias, target) in parsed {
+            let command = pgp::canonical(&target);
+            if known.iter().any(|name| name.eq_ignore_ascii_case(&command)) {
+                rows.insert(alias, command);
+                imported += 1;
+            } else {
+                unsupported.insert(target);
+            }
+        }
+        if imported > 0 {
+            self.alias_editor_rows = rows.into_iter().collect();
+            self.alias_editor_rows.sort_by(|a, b| a.0.cmp(&b.0));
+            self.alias_pending_add = false;
+            self.alias_reset_confirm = false;
+            self.alias_close_confirm = false;
+        }
+        self.alias_import_report = if imported == 0 && unsupported.is_empty() {
+            crate::t!("PGP: no valid aliases found. The working rows were not changed.")
+                .into_owned()
+        } else {
+            crate::tf!(
+                "PGP: {} alias(es) loaded for review; {} unsupported command(s) skipped. No changes activated. Apply to save.",
+                imported,
+                unsupported.len()
+            )
+            .into_owned()
+        };
+        self.command_line.push_info(&self.alias_import_report);
+        // Unsupported AutoCAD/Civil 3D commands are an expected compatibility
+        // limitation, not import errors. Keep full diagnostics out of the UI.
+        log::info!("PGP import: {imported} aliases; unsupported targets: {unsupported:?}");
+    }
+
     /// Rewrite the leading command token through the alias table, leaving any
     /// arguments after the first whitespace untouched. Returns `None` when the
     /// verb is not an alias, so the caller passes the original string through
     /// unchanged. Keyed uppercase so lowercase aliases from scripts/plugins
     /// (which bypass the command line's verb-uppercasing) still resolve.
     pub(super) fn resolve_alias(&self, cmd: &str) -> Option<String> {
-        if self.command_aliases.is_empty() {
-            return None;
-        }
         let (verb, rest) = match cmd.split_once(char::is_whitespace) {
             Some((v, r)) => (v, Some(r)),
             None => (cmd, None),
         };
-        let canon = self.command_aliases.get(&verb.to_uppercase())?;
+        let upper = verb.to_uppercase();
+        let canon = match self.command_aliases.get(&upper) {
+            Some(canon) => canon.clone(),
+            // Localized command names (LINEA, CIRCULO, -CAPA…) type straight in,
+            // keeping any `_` / `.` prefix for the dispatch below.
+            None => {
+                let name = upper.trim_start_matches(['_', '.']);
+                let english = pgp::canonical(name);
+                if english == name {
+                    return None;
+                }
+                format!("{}{english}", &upper[..upper.len() - name.len()])
+            }
+        };
         Some(match rest {
             Some(r) => format!("{canon} {r}"),
-            None => canon.clone(),
+            None => canon,
         })
     }
 
@@ -328,12 +419,7 @@ impl OpenCADStudio {
             .alias_editor_rows
             .iter()
             .filter(|(a, c)| !a.trim().is_empty() && !c.trim().is_empty())
-            .map(|(a, c)| {
-                (
-                    a.trim().to_uppercase(),
-                    c.trim().to_uppercase(),
-                )
-            })
+            .map(|(a, c)| (a.trim().to_uppercase(), c.trim().to_uppercase()))
             .collect();
         self.set_command_aliases(map);
     }
@@ -369,9 +455,8 @@ impl OpenCADStudio {
             );
         }
         self.apply_alias_editor_rows();
-        self.command_line.push_info(
-            crate::tf!("{} alias(es) applied.", self.command_aliases.len()).as_ref(),
-        );
+        self.command_line
+            .push_info(crate::tf!("{} alias(es) applied.", self.command_aliases.len()).as_ref());
     }
 
     /// Reset the working rows and live table to the shipped defaults.
@@ -415,6 +500,41 @@ impl OpenCADStudio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_merges_supported_aliases_without_activating_them() {
+        let mut app = OpenCADStudio::new_for_test();
+        let original = app.command_aliases.clone();
+        app.alias_editor_rows = vec![("KEEP".into(), "LINE".into()), ("E".into(), "ERASE".into())];
+        app.import_alias_pgp(
+            concat!(
+                "E,*BORRA\n",
+                "E,*EMPALME\n",
+                "SQ,*SCP\n",
+                "CIVIL,*AECCUNSUPPORTED\n",
+                "NOTEPAD,START NOTEPAD,1,,\n",
+            )
+            .as_bytes(),
+        );
+        assert!(app
+            .alias_editor_rows
+            .contains(&("E".into(), "FILLET".into())));
+        assert!(app.alias_editor_rows.contains(&("SQ".into(), "UCS".into())));
+        assert!(app
+            .alias_editor_rows
+            .contains(&("KEEP".into(), "LINE".into())));
+        assert!(!app
+            .alias_editor_rows
+            .iter()
+            .any(|(a, _)| a == "CIVIL" || a == "NOTEPAD"));
+        assert_eq!(
+            app.command_aliases, original,
+            "import must not activate or persist aliases"
+        );
+        let staged = app.alias_editor_rows.clone();
+        app.import_alias_pgp(b"; no aliases\n");
+        assert_eq!(app.alias_editor_rows, staged);
+    }
 
     fn map(pairs: &[(&str, &str)]) -> FxHashMap<String, String> {
         pairs

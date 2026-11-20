@@ -1,12 +1,12 @@
-use codec::objects::{Material, MaterialColor, MaterialMap, ObjectType};
-use codec::xdata::XDataValue;
-use codec::{CadDocument, EntityType, Handle};
+use document::objects::{Material, MaterialColor, MaterialMap, ObjectType};
+use document::xdata::XDataValue;
+use document::{Document, EntityType, Handle};
 use std::path::Path;
 use std::sync::Arc;
 
 /// Render-ready subset of an AcDbMaterial.
 ///
-/// The complete decoded object stays authoritative in `CadDocument`; this
+/// The complete decoded object stays authoritative in `Document`; this
 /// compact copy travels with a tessellated mesh so the GPU path does not need
 /// to look back into the document. Map metadata is retained even when the
 /// referenced image cannot be resolved, allowing a later texture upload to
@@ -17,6 +17,9 @@ pub struct MeshMaterial {
     pub name: String,
     pub description: String,
     pub diffuse: [f32; 4],
+    /// The diffuse colour is the object's own (no colour of its own stored):
+    /// a block child taking an inherited material keeps its own colour.
+    pub diffuse_by_object: bool,
     pub ambient: [f32; 3],
     pub specular: [f32; 3],
     pub gloss: f32,
@@ -89,8 +92,7 @@ impl MeshMaterialMapper {
                 + self.normal_basis[2][1] * normal[1] as f64
                 + self.normal_basis[2][2] * normal[2] as f64,
         ];
-        let length =
-            (mapped[0] * mapped[0] + mapped[1] * mapped[1] + mapped[2] * mapped[2]).sqrt();
+        let length = (mapped[0] * mapped[0] + mapped[1] * mapped[1] + mapped[2] * mapped[2]).sqrt();
         if length > f64::EPSILON {
             [
                 (mapped[0] / length) as f32,
@@ -183,14 +185,14 @@ impl MeshTextureMap {
             source: map.source,
             file_name: map.file_name.clone(),
             procedural: map.texture.is_some(),
-            image: load_map_image(map, base_dir)
-                .or_else(|| procedural_map_image(map)),
+            image: load_map_image(map, base_dir).or_else(|| procedural_map_image(map)),
         }
     }
 
     pub fn has_content(&self) -> bool {
-        (self.source == 1 && !self.file_name.trim().is_empty())
-            || (self.source == 2 && self.procedural)
+        // A procedural texture counts whatever the native source says: a
+        // checker asset attaches its texture without rewriting the source.
+        (self.source == 1 && !self.file_name.trim().is_empty()) || self.procedural
     }
 }
 
@@ -201,9 +203,12 @@ impl MeshMaterial {
             name: String::new(),
             description: String::new(),
             diffuse: color,
+            diffuse_by_object: true,
             ambient: [color[0], color[1], color[2]],
-            specular: [0.08; 3],
-            gloss: 0.5,
+            // A dull, broad highlight: an object's colour is not a polished
+            // material.
+            specular: [0.03; 3],
+            gloss: 0.25,
             reflectivity: 0.0,
             self_illumination: 0.0,
             translucence: 0.0,
@@ -254,7 +259,9 @@ impl MeshMaterial {
         // the missing asset's intended appearance.
         let diffuse = material_color(&material.diffuse_color, entity_color);
         let ambient = material_color(&material.ambient_color, entity_color);
-        let specular = material_color(&material.specular_color, [1.0; 4]);
+        // Without its own specular colour a material gets a soft sheen, not a
+        // white hotspot.
+        let specular = material_color(&material.specular_color, [0.2, 0.2, 0.2, 1.0]);
         let opacity = material.opacity_percent.clamp(0.0, 1.0) as f32;
         Self {
             handle: Some(handle),
@@ -266,6 +273,8 @@ impl MeshMaterial {
                 diffuse[2],
                 entity_color[3] * opacity,
             ],
+            diffuse_by_object: material.diffuse_color.flag != 1
+                || material.diffuse_color.rgb.is_none(),
             ambient: [ambient[0], ambient[1], ambient[2]],
             specular: [specular[0], specular[1], specular[2]],
             gloss: material.specular_gloss_factor.clamp(0.0, 1.0) as f32,
@@ -301,6 +310,10 @@ impl MeshMaterial {
     }
 
     pub fn apply_to(&self, set: &mut super::mesh_model::MeshLodSet) {
+        // The material colours the faces; the edges keep the object's colour.
+        if set.edge_color.is_none() {
+            set.edge_color = set.display_color();
+        }
         if set.instance_source.is_some() {
             set.instance_color = Some(self.diffuse);
         } else {
@@ -314,7 +327,7 @@ impl MeshMaterial {
     pub fn apply_to_with_face_overrides(
         &self,
         set: &mut super::mesh_model::MeshLodSet,
-        document: &CadDocument,
+        document: &Document,
         base_dir: Option<&Path>,
     ) {
         self.apply_to(set);
@@ -325,8 +338,7 @@ impl MeshMaterial {
             .flat_map(|lod| lod.triangle_material_handles.iter().flatten().copied())
             .collect();
         for handle in handles {
-            let material =
-                resolve_material_handle_with_base(document, handle, self, base_dir);
+            let material = resolve_material_handle_with_base(document, handle, self, base_dir);
             set.face_materials.insert(handle, material);
         }
     }
@@ -368,9 +380,7 @@ fn procedural_map_image(map: &MaterialMap) -> Option<Arc<MaterialImage>> {
             } else {
                 color2
             };
-            rgba.extend(color.map(|channel| {
-                (channel.clamp(0.0, 1.0) * 255.0).round() as u8
-            }));
+            rgba.extend(color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8));
         }
     }
     Some(Arc::new(MaterialImage {
@@ -387,7 +397,7 @@ fn procedural_map_image(map: &MaterialMap) -> Option<Arc<MaterialImage>> {
 /// Outside a block a ByBlock material has no owner source and falls back to
 /// the entity colour, matching the existing ByBlock colour behaviour.
 pub fn resolve_material_with_base(
-    document: &CadDocument,
+    document: &Document,
     entity: &EntityType,
     entity_color: [f32; 4],
     by_block: Option<&MeshMaterial>,
@@ -443,21 +453,9 @@ fn entity_material_mapper(entity: &EntityType) -> Option<MeshMaterialMapper> {
     let y = positions.next()?;
     let z = positions.next()?;
     let basis = glam::DMat3::from_cols(
-        glam::DVec3::from_array([
-            x[0] - origin[0],
-            x[1] - origin[1],
-            x[2] - origin[2],
-        ]),
-        glam::DVec3::from_array([
-            y[0] - origin[0],
-            y[1] - origin[1],
-            y[2] - origin[2],
-        ]),
-        glam::DVec3::from_array([
-            z[0] - origin[0],
-            z[1] - origin[1],
-            z[2] - origin[2],
-        ]),
+        glam::DVec3::from_array([x[0] - origin[0], x[1] - origin[1], x[2] - origin[2]]),
+        glam::DVec3::from_array([y[0] - origin[0], y[1] - origin[1], y[2] - origin[2]]),
+        glam::DVec3::from_array([z[0] - origin[0], z[1] - origin[1], z[2] - origin[2]]),
     );
     if basis.determinant().abs() <= f64::EPSILON {
         return None;
@@ -479,7 +477,7 @@ fn entity_material_mapper(entity: &EntityType) -> Option<MeshMaterialMapper> {
 }
 
 pub fn resolve_layer_material_with_base(
-    document: &CadDocument,
+    document: &Document,
     layer_name: &str,
     layer_color: [f32; 4],
     base_dir: Option<&Path>,
@@ -504,7 +502,7 @@ pub fn resolve_layer_material_with_base(
 }
 
 pub fn resolve_material_handle_with_base(
-    document: &CadDocument,
+    document: &Document,
     handle: Handle,
     fallback: &MeshMaterial,
     base_dir: Option<&Path>,
@@ -525,13 +523,27 @@ pub fn resolve_material_handle_with_base(
     }
 }
 
+/// Decoded material textures are resident for the whole process lifetime;
+/// past the budget the least recently used ones are dropped and re-decoded
+/// on demand. Tunable with `OCS_MATERIAL_CACHE_MB`.
+#[cfg(not(target_arch = "wasm32"))]
+fn material_cache_budget_bytes() -> usize {
+    const DEFAULT_MIB: usize = 64;
+    std::env::var("OCS_MATERIAL_CACHE_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MIB)
+        .saturating_mul(1024 * 1024)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn load_map_image(map: &MaterialMap, base_dir: Option<&Path>) -> Option<Arc<MaterialImage>> {
-    use std::collections::HashMap;
+    use super::pdf_raster::BudgetedRasterCache;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
 
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<MaterialImage>>>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<BudgetedRasterCache<PathBuf, Option<Arc<MaterialImage>>>>> =
+        OnceLock::new();
 
     if map.source != 1 || map.file_name.trim().is_empty() {
         return None;
@@ -553,8 +565,8 @@ fn load_map_image(map: &MaterialMap, base_dir: Option<&Path>) -> Option<Arc<Mate
     }
     let path = candidates.into_iter().find(|path| path.is_file())?;
     let path = path.canonicalize().unwrap_or(path);
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(hit) = cache.lock().ok()?.get(&path).cloned() {
+    let cache = CACHE.get_or_init(|| Mutex::new(BudgetedRasterCache::new()));
+    if let Some(hit) = cache.lock().ok()?.get(&path) {
         return hit;
     }
     let loaded = std::fs::read(&path)
@@ -569,7 +581,17 @@ fn load_map_image(map: &MaterialMap, base_dir: Option<&Path>) -> Option<Arc<Mate
                 path: path.to_string_lossy().into_owned(),
             })
         });
-    cache.lock().ok()?.insert(path, loaded.clone());
+    // The pixel buffer dominates; per-entry Arc/struct overhead is left uncharged.
+    let cost = std::mem::size_of::<MaterialImage>()
+        + path.as_os_str().len()
+        + loaded.as_ref().map_or(0, |image| image.rgba.capacity());
+    let budget = material_cache_budget_bytes();
+    if cost <= budget {
+        cache
+            .lock()
+            .ok()?
+            .insert_with_budget(path, loaded.clone(), cost, budget);
+    }
     loaded
 }
 
@@ -581,10 +603,10 @@ fn load_map_image(_map: &MaterialMap, _base_dir: Option<&Path>) -> Option<Arc<Ma
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::Line;
-    use codec::objects::MaterialTexture;
-    use codec::types::Vector3;
-    use codec::xdata::{ExtendedDataRecord, XDataValue};
+    use document::entities::Line;
+    use document::objects::MaterialTexture;
+    use document::types::Vector3;
+    use document::xdata::{ExtendedDataRecord, XDataValue};
 
     #[test]
     fn procedural_checker_is_one_repeatable_two_by_two_tile() {
@@ -627,6 +649,202 @@ mod tests {
         line.common.extended_data.add_record(record);
         let mapper = entity_material_mapper(&EntityType::Line(line)).expect("valid mapper");
 
-        assert_eq!(mapper.map_position([4.0, 22.0, 42.0], [0.0; 3]), [1.0, 2.0, 3.0]);
+        assert_eq!(
+            mapper.map_position([4.0, 22.0, 42.0], [0.0; 3]),
+            [1.0, 2.0, 3.0]
+        );
+    }
+
+    // ── Material texture cache byte budgets ──────────────────────────────
+
+    /// Serialises the tests that shrink the process-wide material budget:
+    /// the env override is shared by every test thread in this process.
+    static MATERIAL_BUDGET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct MaterialBudgetEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl MaterialBudgetEnvGuard {
+        fn set(mib: &str) -> Self {
+            let previous = std::env::var_os("OCS_MATERIAL_CACHE_MB");
+            std::env::set_var("OCS_MATERIAL_CACHE_MB", mib);
+            Self { previous }
+        }
+    }
+
+    impl Drop for MaterialBudgetEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("OCS_MATERIAL_CACHE_MB", value),
+                None => std::env::remove_var("OCS_MATERIAL_CACHE_MB"),
+            }
+        }
+    }
+
+    /// A registered 256×256 texture decodes to 256 KiB of RGBA, so a handful
+    /// of distinct files passes a 1 MiB budget.
+    fn budget_texture(tag: &str, side: u32) -> (MaterialMap, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let img = image::RgbaImage::from_fn(side, side, |x, y| {
+            image::Rgba([x as u8, y as u8, 0x7f, 0xff])
+        });
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode budget texture");
+        let path = std::env::temp_dir().join(format!(
+            "ocs-material-budget-{tag}-{}-{}.png",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).expect("write budget texture");
+        let map = MaterialMap {
+            source: 1,
+            file_name: path.to_string_lossy().into_owned(),
+            ..MaterialMap::default()
+        };
+        (map, path)
+    }
+
+    fn load_texture(map: &MaterialMap) -> Option<Arc<MaterialImage>> {
+        load_map_image(map, None)
+    }
+
+    #[test]
+    fn texture_sweep_past_budget_evicts_the_oldest() {
+        let _lock = MATERIAL_BUDGET_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _budget = MaterialBudgetEnvGuard::set("1");
+        let (a, pa) = budget_texture("sweep-a", 256);
+        let (b, pb) = budget_texture("sweep-b", 256);
+        let (c, pc) = budget_texture("sweep-c", 256);
+        let (d, pd) = budget_texture("sweep-d", 256);
+        let (e, pe) = budget_texture("sweep-e", 256);
+        let oldest = load_texture(&a).expect("decode A");
+        for map in [&b, &c, &d, &e] {
+            drop(load_texture(map).expect("sweep decode"));
+        }
+        let again = load_texture(&a).expect("re-decode A");
+        assert!(
+            !Arc::ptr_eq(&oldest, &again),
+            "the oldest texture must be evicted once the sweep passes the budget"
+        );
+        for path in [pa, pb, pc, pd, pe] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A cache hit must promote the entry: a re-touched older texture survives
+    /// a sweep that evicts an untouched newer one. Two 256 KiB decodes fit the
+    /// 1 MiB budget before the sweep pushes past it.
+    #[test]
+    fn re_touching_an_older_texture_keeps_it_cached_past_the_budget() {
+        let _lock = MATERIAL_BUDGET_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _budget = MaterialBudgetEnvGuard::set("1");
+        let (a, pa) = budget_texture("recency-a", 256);
+        let (b, pb) = budget_texture("recency-b", 256);
+        let (c, pc) = budget_texture("recency-c", 256);
+        let (d, pd) = budget_texture("recency-d", 256);
+        let oldest = load_texture(&a).expect("decode A");
+        let middle = load_texture(&b).expect("decode B");
+        let touched = load_texture(&a).expect("re-touch A");
+        assert!(
+            Arc::ptr_eq(&oldest, &touched),
+            "re-touch reads the cached decode"
+        );
+        drop(touched);
+        for map in [&c, &d] {
+            drop(load_texture(map).expect("push decode"));
+        }
+        let b_again = load_texture(&b).expect("re-decode B");
+        let b_cached = Arc::ptr_eq(&middle, &b_again);
+        let a_again = load_texture(&a).expect("re-decode A");
+        let a_cached = Arc::ptr_eq(&oldest, &a_again);
+        // Recency under a shared budget: A must outlive B, not absolutely
+        // survive — probing B re-inserts it and may evict A in turn.
+        assert!(
+            a_cached || !b_cached,
+            "the re-touched texture outlives the untouched one under eviction"
+        );
+        for path in [pa, pb, pc, pd] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn recent_texture_survives_a_sweep_within_budget() {
+        let _lock = MATERIAL_BUDGET_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _budget = MaterialBudgetEnvGuard::set("128");
+        let (a, pa) = budget_texture("within-a", 256);
+        let (b, pb) = budget_texture("within-b", 256);
+        let first = load_texture(&a).expect("decode A");
+        drop(load_texture(&b).expect("decode B"));
+        let again = load_texture(&a).expect("re-read A");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "a texture within the budget stays cached across a sweep"
+        );
+        for path in [pa, pb] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn a_texture_larger_than_the_budget_is_not_retained() {
+        let _lock = MATERIAL_BUDGET_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _budget = MaterialBudgetEnvGuard::set("1");
+        let (big, path) = budget_texture("oversized", 1024);
+        let first = load_texture(&big).expect("decode oversized");
+        let again = load_texture(&big).expect("re-decode oversized");
+        assert!(
+            !Arc::ptr_eq(&first, &again),
+            "a decode larger than the budget must not be retained"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A memoised decode failure must not outlive its eviction: a corrupt file
+    /// caches `None`, and once the budget sweeps that entry away a file that
+    /// has since been fixed decodes instead of staying broken.
+    #[test]
+    fn an_evicted_decode_failure_retries_when_the_file_is_fixed() {
+        let _lock = MATERIAL_BUDGET_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _budget = MaterialBudgetEnvGuard::set("1");
+        let (broken, path) = budget_texture("late-arrival", 256);
+        // The file exists but is not an image, so the decode fails and the
+        // `None` is memoised (a missing file would never reach the cache).
+        std::fs::write(&path, b"not an image").expect("write corrupt texture");
+        assert!(load_texture(&broken).is_none(), "corrupt file stays None");
+        for i in 0..5 {
+            let (push, p) = budget_texture(&format!("late-push-{i}"), 256);
+            drop(load_texture(&push).expect("push decode"));
+            let _ = std::fs::remove_file(p);
+        }
+        let img = image::RgbaImage::from_fn(8, 8, |_, _| image::Rgba([1, 2, 3, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode late texture");
+        std::fs::write(&path, bytes).expect("write fixed texture");
+        let loaded = load_texture(&broken).expect("the evicted failure must retry");
+        assert_eq!((loaded.width, loaded.height), (8, 8));
+        let _ = std::fs::remove_file(path);
     }
 }

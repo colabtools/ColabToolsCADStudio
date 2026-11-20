@@ -1,14 +1,12 @@
-use codec::{CadDocument, EntityType};
+use document::{Document, EntityType};
 
-use crate::command::EntityTransform;
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::RenderEntity;
-use crate::scene::model::object::{
-    GripApply, GripDef, GripMenuAction, GripMenuItem, PropSection,
-};
 use crate::scene::convert::tess_util::FallbackGeometry;
+use crate::scene::model::object::{GripApply, GripDef, GripMenuAction, GripMenuItem, PropSection};
 
 pub trait RenderConvertible {
-    fn to_render(&self, document: &CadDocument) -> Option<RenderEntity>;
+    fn to_render(&self, document: &Document) -> Option<RenderEntity>;
 }
 
 /// Fallback geometry for entities not routed through the render
@@ -28,7 +26,10 @@ pub trait Grippable {
     /// per entity to add Add Vertex / Convert to Arc / Reverse Arrows /
     /// etc.
     fn grip_menu(&self, _grip_id: usize) -> Vec<GripMenuItem> {
-        vec![GripMenuItem { label: "Stretch", action: GripMenuAction::Stretch }]
+        vec![GripMenuItem {
+            label: "Stretch",
+            action: GripMenuAction::Stretch,
+        }]
     }
     /// React to a popup-menu commit. Default no-op — `Stretch` is the
     /// "do nothing extra" path, the normal drag still happens on click.
@@ -39,12 +40,7 @@ pub trait Grippable {
     /// follow-up (Lengthen / Radius / Arc Length / Rotate Text / …).
     /// The app prompts the user for a value on the command line and
     /// calls this with the parsed `f64`.
-    fn apply_grip_menu_value(
-        &mut self,
-        _grip_id: usize,
-        _action: GripMenuAction,
-        _value: f64,
-    ) {}
+    fn apply_grip_menu_value(&mut self, _grip_id: usize, _action: GripMenuAction, _value: f64) {}
     /// If the popup action this entity defines for `grip_id` needs a
     /// numeric prompt, return the prompt string and the action so the
     /// app can stash a pending-value state and route the next typed
@@ -81,6 +77,63 @@ pub trait Transformable {
     fn apply_transform(&mut self, t: &EntityTransform);
 }
 
+// The codec boxes its rare wide entity kinds (Surface, Table, MultiLeader,
+// Helix, Extended) so every other entity is stored narrow; the boxed ones
+// answer through their contents.
+impl<T: RenderConvertible + ?Sized> RenderConvertible for Box<T> {
+    fn to_render(&self, document: &Document) -> Option<RenderEntity> {
+        (**self).to_render(document)
+    }
+}
+
+impl<T: Grippable + ?Sized> Grippable for Box<T> {
+    fn grips(&self) -> Vec<GripDef> {
+        (**self).grips()
+    }
+    fn apply_grip(&mut self, grip_id: usize, apply: GripApply) {
+        (**self).apply_grip(grip_id, apply)
+    }
+    fn grip_menu(&self, grip_id: usize) -> Vec<GripMenuItem> {
+        (**self).grip_menu(grip_id)
+    }
+    fn apply_grip_menu(&mut self, grip_id: usize, action: GripMenuAction) {
+        (**self).apply_grip_menu(grip_id, action)
+    }
+    fn apply_grip_menu_value(&mut self, grip_id: usize, action: GripMenuAction, value: f64) {
+        (**self).apply_grip_menu_value(grip_id, action, value)
+    }
+    fn grip_menu_value_prompt(
+        &self,
+        grip_id: usize,
+        action: GripMenuAction,
+    ) -> Option<&'static str> {
+        (**self).grip_menu_value_prompt(grip_id, action)
+    }
+    fn grip_menu_point_value(
+        &self,
+        grip_id: usize,
+        action: GripMenuAction,
+        point: glam::DVec3,
+    ) -> Option<f64> {
+        (**self).grip_menu_point_value(grip_id, action, point)
+    }
+}
+
+impl<T: PropertyEditable + ?Sized> PropertyEditable for Box<T> {
+    fn geometry_properties(&self, text_style_names: &[String]) -> Vec<PropSection> {
+        (**self).geometry_properties(text_style_names)
+    }
+    fn apply_geom_prop(&mut self, field: &str, value: &str) {
+        (**self).apply_geom_prop(field, value)
+    }
+}
+
+impl<T: Transformable + ?Sized> Transformable for Box<T> {
+    fn apply_transform(&mut self, t: &EntityTransform) {
+        (**self).apply_transform(t)
+    }
+}
+
 /// Inquiry-time mass / area / perimeter properties for entities whose
 /// 2D footprint has a meaningful area or perimeter (Circle, Arc, Line,
 /// LwPolyline, Ellipse). Entities outside this set get `None` via the
@@ -105,6 +158,16 @@ pub trait TextContent {
     fn replace_text(&mut self, search: &str, rep: &str);
 }
 
+/// Entity variants holding their entity boxed (MTEXT) dispatch through here.
+impl<T: TextContent + ?Sized> TextContent for Box<T> {
+    fn text_content(&self) -> Option<String> {
+        (**self).text_content()
+    }
+    fn replace_text(&mut self, search: &str, rep: &str) {
+        (**self).replace_text(search, rep)
+    }
+}
+
 /// Human-readable variant name used by Quick Select / Select Similar
 /// filtering. Stable across releases — the strings here are the canonical
 /// type identifiers throughout the UI.
@@ -112,18 +175,14 @@ pub fn entity_type_name(et: &EntityType) -> &str {
     match et {
         EntityType::Point(_) => "Point",
         EntityType::Line(line)
-            if codec::entities::CenterMarkAssociation::read(
-                &line.common.extended_data,
-            )
-            .is_some() =>
+            if document::entities::CenterMarkAssociation::read(&line.common.extended_data)
+                .is_some() =>
         {
             "CenterMark"
         }
         EntityType::Line(line)
-            if codec::entities::CenterLineAssociation::read(
-                &line.common.extended_data,
-            )
-            .is_some() =>
+            if document::entities::CenterLineAssociation::read(&line.common.extended_data)
+                .is_some() =>
         {
             "CenterLine"
         }
@@ -183,7 +242,7 @@ pub fn entity_type_name(et: &EntityType) -> &str {
 }
 
 pub trait EntityTypeOps {
-    fn to_render_entity(&self, document: &CadDocument) -> Option<RenderEntity>;
+    fn to_render_entity(&self, document: &Document) -> Option<RenderEntity>;
     fn grips(&self) -> Vec<GripDef>;
     fn grip_menu(&self, grip_id: usize) -> Vec<GripMenuItem>;
     fn geometry_properties(&self, text_style_names: &[String]) -> Vec<PropSection>;
@@ -201,12 +260,7 @@ pub trait EntityTypeOps {
         action: GripMenuAction,
         point: glam::DVec3,
     ) -> Option<f64>;
-    fn apply_grip_menu_value(
-        &mut self,
-        grip_id: usize,
-        action: GripMenuAction,
-        value: f64,
-    );
+    fn apply_grip_menu_value(&mut self, grip_id: usize, action: GripMenuAction, value: f64);
     fn apply_transform(&mut self, t: &EntityTransform);
     fn mass_props(&self) -> Option<MassProps>;
     fn text_content(&self) -> Option<String>;
@@ -260,7 +314,7 @@ macro_rules! impl_entity_basics {
             }
         }
         impl $crate::entities::traits::Transformable for $T {
-            fn apply_transform(&mut self, t: &$crate::command::EntityTransform) {
+            fn apply_transform(&mut self, t: &$crate::entities::transform::EntityTransform) {
                 apply_transform(self, t);
             }
         }
@@ -297,7 +351,7 @@ macro_rules! impl_entity_basics_with_text_styles {
             }
         }
         impl $crate::entities::traits::Transformable for $T {
-            fn apply_transform(&mut self, t: &$crate::command::EntityTransform) {
+            fn apply_transform(&mut self, t: &$crate::entities::transform::EntityTransform) {
                 apply_transform(self, t);
             }
         }
@@ -305,7 +359,7 @@ macro_rules! impl_entity_basics_with_text_styles {
 }
 
 impl EntityTypeOps for EntityType {
-    fn to_render_entity(&self, document: &CadDocument) -> Option<RenderEntity> {
+    fn to_render_entity(&self, document: &Document) -> Option<RenderEntity> {
         dispatch!(self,
             |e| RenderConvertible::to_render(e, document),
             [
@@ -465,12 +519,7 @@ impl EntityTypeOps for EntityType {
         )
     }
 
-    fn apply_grip_menu_value(
-        &mut self,
-        grip_id: usize,
-        action: GripMenuAction,
-        value: f64,
-    ) {
+    fn apply_grip_menu_value(&mut self, grip_id: usize, action: GripMenuAction, value: f64) {
         dispatch!(self,
             |e| Grippable::apply_grip_menu_value(e, grip_id, action, value),
             [
@@ -500,7 +549,20 @@ impl EntityTypeOps for EntityType {
                 ViewBorder, Extended,
             ],
             _ => {},
-        )
+        );
+        // XDATA world points follow the entity, as in document's
+        // `EntityType` transforms; the verbatim record would write the old
+        // values back. Section marks / view borders stay with their view.
+        if !matches!(
+            self,
+            EntityType::SectionSymbol(_) | EntityType::ViewBorder(_) | EntityType::Unknown(_)
+        ) && self
+            .common_mut()
+            .extended_data
+            .apply_transform(&crate::scene::view::transform::codec_transform(t))
+        {
+            self.common_mut().raw_record = None;
+        }
     }
 
     fn mass_props(&self) -> Option<MassProps> {
@@ -525,5 +587,84 @@ impl EntityTypeOps for EntityType {
             [Text, MText, AttributeDefinition, AttributeEntity],
             _ => {},
         )
+    }
+}
+
+#[cfg(test)]
+mod xdata_transform_tests {
+    use super::*;
+    use document::entities::Insert;
+    use document::types::Vector3;
+    use document::xdata::{ExtendedDataRecord, XDataValue};
+    use glam::DVec3;
+
+    fn insert_with_xdata() -> EntityType {
+        let mut insert = Insert::new("B", Vector3::new(100.0, 100.0, 0.0));
+        let mut record = ExtendedDataRecord::new("APP");
+        record.add_value(XDataValue::Position3D(Vector3::new(100.0, 100.0, 0.0)));
+        record.add_value(XDataValue::Distance(10.0));
+        insert.common.extended_data.add_record(record);
+        EntityType::Insert(insert)
+    }
+
+    fn xdata(entity: &EntityType) -> (Vector3, f64) {
+        let values = &entity.common().extended_data.records()[0].values;
+        let (XDataValue::Position3D(p), XDataValue::Distance(d)) =
+            (values[0].clone(), values[1].clone())
+        else {
+            panic!("unexpected XDATA {values:?}");
+        };
+        (p, d)
+    }
+
+    fn assert_near(got: Vector3, x: f64, y: f64) {
+        assert!(
+            (got.x - x).abs() < 1e-9 && (got.y - y).abs() < 1e-9 && got.z.abs() < 1e-9,
+            "got {got:?}, expected ({x}, {y}, 0)"
+        );
+    }
+
+    #[test]
+    fn xdata_points_follow_move_rotate_scale_mirror() {
+        let mut moved = insert_with_xdata();
+        EntityTypeOps::apply_transform(
+            &mut moved,
+            &EntityTransform::Translate(DVec3::new(50.0, 0.0, 0.0)),
+        );
+        assert_near(xdata(&moved).0, 150.0, 100.0);
+        assert_eq!(xdata(&moved).1, 10.0);
+
+        let mut rotated = insert_with_xdata();
+        EntityTypeOps::apply_transform(
+            &mut rotated,
+            &EntityTransform::Rotate {
+                center: DVec3::ZERO,
+                axis: DVec3::Z,
+                angle_rad: std::f64::consts::FRAC_PI_2,
+            },
+        );
+        assert_near(xdata(&rotated).0, -100.0, 100.0);
+
+        let mut scaled = insert_with_xdata();
+        EntityTypeOps::apply_transform(
+            &mut scaled,
+            &EntityTransform::Scale {
+                center: DVec3::ZERO,
+                factor: 2.0,
+            },
+        );
+        assert_near(xdata(&scaled).0, 200.0, 200.0);
+        assert!((xdata(&scaled).1 - 20.0).abs() < 1e-9);
+
+        let mut mirrored = insert_with_xdata();
+        EntityTypeOps::apply_transform(
+            &mut mirrored,
+            &EntityTransform::Mirror {
+                p1: DVec3::ZERO,
+                p2: DVec3::new(0.0, 100.0, 0.0),
+                working_normal: DVec3::Z,
+            },
+        );
+        assert_near(xdata(&mirrored).0, -100.0, 100.0);
     }
 }

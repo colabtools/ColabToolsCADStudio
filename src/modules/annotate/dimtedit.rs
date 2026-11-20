@@ -1,7 +1,7 @@
 // DIMTEDIT — reposition, justify, home or rotate existing dimension text.
 
-use codec::entities::{AttachmentPointType, Dimension};
-use codec::{EntityType, Handle};
+use document::entities::{AttachmentPointType, Dimension};
+use document::{EntityType, Handle};
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind};
@@ -35,6 +35,8 @@ enum Step {
 pub struct DimTeditCommand {
     step: Step,
     picked_entity: Option<EntityType>,
+    /// The option a ribbon button chose before the pick (L, R, C or A).
+    preset: Option<&'static str>,
 }
 
 #[derive(Clone, Copy)]
@@ -45,11 +47,27 @@ enum Placement {
     Home,
 }
 
+impl Default for DimTeditCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DimTeditCommand {
     pub fn new() -> Self {
         Self {
             step: Step::PickDim,
             picked_entity: None,
+            preset: None,
+        }
+    }
+
+    /// DIMTEDIT that takes `option` (L, R, C or A) once the dimension is
+    /// picked, as the Dimensions panel's text buttons run it.
+    pub fn with_option(option: &'static str) -> Self {
+        Self {
+            preset: Some(option),
+            ..Self::new()
         }
     }
 
@@ -125,14 +143,15 @@ impl CadCommand for DimTeditCommand {
         }
         if !matches!(self.picked_entity.as_ref(), Some(EntityType::Dimension(_))) {
             self.picked_entity = None;
-            return CmdResult::ReportError(
-                t!("DIMTEDIT: select a dimension.").into_owned(),
-            );
+            return CmdResult::ReportError(t!("DIMTEDIT: select a dimension.").into_owned());
         }
         self.step = Step::PickTextPos {
             handle,
             entity: self.picked_entity.take(),
         };
+        if let Some(option) = self.preset.take() {
+            return self.on_text_input(option).unwrap_or(CmdResult::NeedPoint);
+        }
         CmdResult::NeedPoint
     }
 
@@ -141,12 +160,8 @@ impl CadCommand for DimTeditCommand {
         match &mut self.step {
             Step::PickTextPos { handle, entity } => match keyword.as_str() {
                 "L" | "LEFT" => Some(Self::finish_placement(*handle, entity, Placement::Left)),
-                "R" | "RIGHT" => {
-                    Some(Self::finish_placement(*handle, entity, Placement::Right))
-                }
-                "C" | "CENTER" => {
-                    Some(Self::finish_placement(*handle, entity, Placement::Center))
-                }
+                "R" | "RIGHT" => Some(Self::finish_placement(*handle, entity, Placement::Right)),
+                "C" | "CENTER" => Some(Self::finish_placement(*handle, entity, Placement::Center)),
                 "H" | "HOME" => Some(Self::finish_placement(*handle, entity, Placement::Home)),
                 "A" | "ANGLE" => {
                     let handle = *handle;
@@ -184,7 +199,7 @@ impl CadCommand for DimTeditCommand {
         let EntityType::Dimension(dimension) = &mut entity else {
             return CmdResult::Cancel;
         };
-        let point = codec::types::Vector3::new(point.x, point.y, point.z);
+        let point = document::types::Vector3::new(point.x, point.y, point.z);
         let base = dimension.base_mut();
         base.text_middle_point = point;
         base.insertion_point = point;
@@ -203,20 +218,19 @@ impl CadCommand for DimTeditCommand {
         if !matches!(self.step, Step::PickTextPos { .. }) {
             return None;
         }
-        let point = point.as_vec3();
-        let d = 0.2_f32;
-        Some(WireModel {
-            name: "dimtedit_preview".into(),
-            points: vec![
+        let d = 0.2_f64;
+        Some(WireModel::solid_f64(
+            "dimtedit_preview".into(),
+            vec![
                 [point.x - d, point.y - d, point.z],
                 [point.x + d, point.y - d, point.z],
                 [point.x + d, point.y + d, point.z],
                 [point.x - d, point.y + d, point.z],
                 [point.x - d, point.y - d, point.z],
             ],
-            color: WireModel::CYAN,
-            ..WireModel::default()
-        })
+            WireModel::CYAN,
+            false,
+        ))
     }
 
     fn inject_picked_entity(&mut self, entity: EntityType) {
@@ -259,9 +273,7 @@ fn dimension_line_endpoints(dimension: &Dimension) -> Option<(DVec3, DVec3)> {
     let second = DVec3::new(second.x, second.y, second.z);
     let definition = DVec3::new(definition.x, definition.y, definition.z);
     let perpendicular = DVec3::new(-axis.y, axis.x, 0.0);
-    let project = |point: DVec3| {
-        point + perpendicular * (definition - point).dot(perpendicular)
-    };
+    let project = |point: DVec3| point + perpendicular * (definition - point).dot(perpendicular);
     let first = project(first);
     let second = project(second);
     if first.dot(axis) <= second.dot(axis) {
@@ -274,8 +286,8 @@ fn dimension_line_endpoints(dimension: &Dimension) -> Option<(DVec3, DVec3)> {
 fn apply_placement(dimension: &mut Dimension, placement: Placement) {
     if matches!(placement, Placement::Home) {
         let base = dimension.base_mut();
-        base.text_middle_point = codec::types::Vector3::ZERO;
-        base.insertion_point = codec::types::Vector3::ZERO;
+        base.text_middle_point = document::types::Vector3::ZERO;
+        base.insertion_point = document::types::Vector3::ZERO;
         base.text_user_positioned = false;
         base.attachment_point = AttachmentPointType::MiddleCenter;
         return;
@@ -289,7 +301,7 @@ fn apply_placement(dimension: &mut Dimension, placement: Placement) {
         Placement::Center => ((left + right) * 0.5, AttachmentPointType::MiddleCenter),
         Placement::Home => unreachable!(),
     };
-    let point = codec::types::Vector3::new(point.x, point.y, point.z);
+    let point = document::types::Vector3::new(point.x, point.y, point.z);
     let base = dimension.base_mut();
     base.text_middle_point = point;
     base.insertion_point = point;
@@ -297,4 +309,6 @@ fn apply_placement(dimension: &mut Dimension, placement: Placement) {
     base.attachment_point = attachment;
 }
 
-inventory::submit!(crate::command::CommandRegistration { names: &["DIMTED", "DIMTEDIT"] });
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["DIMTED", "DIMTEDIT"]
+});

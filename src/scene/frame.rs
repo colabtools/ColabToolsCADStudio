@@ -1,5 +1,5 @@
-use codec::objects::{ObjectType, RasterVariables, WipeoutVariables};
-use codec::{CadDocument, EntityType, Handle};
+use document::objects::{ObjectType, RasterVariables, WipeoutVariables};
+use document::{Document, EntityType, Handle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FrameKind {
@@ -48,10 +48,14 @@ fn image_mode_from_flags(flags: i16) -> Option<i16> {
 }
 
 fn image_flags_from_mode(mode: i16) -> i16 {
-    if mode == 2 { 3 } else { mode }
+    if mode == 2 {
+        3
+    } else {
+        mode
+    }
 }
 
-fn root_entry(document: &CadDocument, name: &str) -> Option<Handle> {
+fn root_entry(document: &Document, name: &str) -> Option<Handle> {
     let from_dictionary = |handle| match document.objects.get(&handle) {
         Some(ObjectType::Dictionary(dictionary)) => dictionary
             .entries
@@ -70,24 +74,32 @@ fn root_entry(document: &CadDocument, name: &str) -> Option<Handle> {
     })
 }
 
-fn raster_variables_handle(document: &CadDocument) -> Option<Handle> {
-    root_entry(document, "ACAD_IMAGE_VARS")
-        .filter(|handle| matches!(document.objects.get(handle), Some(ObjectType::RasterVariables(_))))
+fn raster_variables_handle(document: &Document) -> Option<Handle> {
+    root_entry(document, "ACAD_IMAGE_VARS").filter(|handle| {
+        matches!(
+            document.objects.get(handle),
+            Some(ObjectType::RasterVariables(_))
+        )
+    })
 }
 
-fn wipeout_variables_handle(document: &CadDocument) -> Option<Handle> {
-    root_entry(document, "ACAD_WIPEOUT_VARS")
-        .filter(|handle| matches!(document.objects.get(handle), Some(ObjectType::WipeoutVariables(_))))
+fn wipeout_variables_handle(document: &Document) -> Option<Handle> {
+    root_entry(document, "ACAD_WIPEOUT_VARS").filter(|handle| {
+        matches!(
+            document.objects.get(handle),
+            Some(ObjectType::WipeoutVariables(_))
+        )
+    })
 }
 
-fn drawing_mode(document: &CadDocument, name: &str, default: i16) -> i16 {
+fn drawing_mode(document: &Document, name: &str, default: i16) -> i16 {
     crate::io::drawing_variable(document, name)
         .and_then(|value| value.parse::<i16>().ok())
         .unwrap_or(default)
         .clamp(0, 2)
 }
 
-pub(crate) fn mode(document: &CadDocument, kind: FrameKind) -> i16 {
+pub(crate) fn mode(document: &Document, kind: FrameKind) -> i16 {
     match kind {
         FrameKind::Image => raster_variables_handle(document)
             .and_then(|handle| match document.objects.get(&handle) {
@@ -117,17 +129,20 @@ pub(crate) fn mode(document: &CadDocument, kind: FrameKind) -> i16 {
     }
 }
 
-pub(crate) fn master_mode(document: &CadDocument) -> i16 {
+pub(crate) fn master_mode(document: &Document) -> i16 {
     let first = mode(document, ALL_KINDS[0]);
-    ALL_KINDS
+    if ALL_KINDS
         .iter()
         .skip(1)
         .all(|kind| mode(document, *kind) == first)
-        .then_some(first)
-        .unwrap_or(3)
+    {
+        first
+    } else {
+        3
+    }
 }
 
-fn attach_root_entry(document: &mut CadDocument, name: &str, handle: Handle) {
+fn attach_root_entry(document: &mut Document, name: &str, handle: Handle) {
     let root = crate::scene::annotative::root_named_dict_handle(document);
     if let Some(ObjectType::Dictionary(dictionary)) = document.objects.get_mut(&root) {
         dictionary
@@ -137,7 +152,7 @@ fn attach_root_entry(document: &mut CadDocument, name: &str, handle: Handle) {
     }
 }
 
-fn set_image_mode(document: &mut CadDocument, value: i16) {
+fn set_image_mode(document: &mut Document, value: i16) {
     let owner = crate::scene::annotative::root_named_dict_handle(document);
     let handle = raster_variables_handle(document).unwrap_or_else(|| {
         let handle = document.allocate_handle();
@@ -157,7 +172,7 @@ fn set_image_mode(document: &mut CadDocument, value: i16) {
     attach_root_entry(document, "ACAD_IMAGE_VARS", handle);
 }
 
-fn set_wipeout_mode(document: &mut CadDocument, value: i16) {
+fn set_wipeout_mode(document: &mut Document, value: i16) {
     crate::io::set_drawing_variable(document, "WIPEOUTFRAME", &value.to_string());
     let owner = crate::scene::annotative::root_named_dict_handle(document);
     let handle = wipeout_variables_handle(document).unwrap_or_else(|| {
@@ -177,7 +192,7 @@ fn set_wipeout_mode(document: &mut CadDocument, value: i16) {
     attach_root_entry(document, "ACAD_WIPEOUT_VARS", handle);
 }
 
-pub(crate) fn set_mode(document: &mut CadDocument, kind: FrameKind, value: i16) {
+pub(crate) fn set_mode(document: &mut Document, kind: FrameKind, value: i16) {
     let value = value.clamp(0, 2);
     match kind {
         FrameKind::Image => set_image_mode(document, value),
@@ -186,15 +201,13 @@ pub(crate) fn set_mode(document: &mut CadDocument, kind: FrameKind, value: i16) 
         FrameKind::Dgn => document.header.dgn_frame = value,
         FrameKind::Wipeout => set_wipeout_mode(document, value),
         FrameKind::Xclip => document.header.xclip_frame = value,
-        FrameKind::PointCloudClip => crate::io::set_drawing_variable(
-            document,
-            "POINTCLOUDCLIPFRAME",
-            &value.to_string(),
-        ),
+        FrameKind::PointCloudClip => {
+            crate::io::set_drawing_variable(document, "POINTCLOUDCLIPFRAME", &value.to_string())
+        }
     }
 }
 
-pub(crate) fn set_master_mode(document: &mut CadDocument, value: i16) {
+pub(crate) fn set_master_mode(document: &mut Document, value: i16) {
     let value = value.clamp(0, 2);
     for kind in ALL_KINDS {
         if mode(document, kind) != value {
@@ -225,11 +238,11 @@ pub(crate) fn entity_kind(entity: &EntityType) -> Option<FrameKind> {
     }
 }
 
-fn underlay_kind(underlay: &codec::entities::Underlay) -> FrameKind {
+fn underlay_kind(underlay: &document::entities::Underlay) -> FrameKind {
     match underlay.underlay_type {
-        codec::entities::UnderlayType::Pdf => FrameKind::Pdf,
-        codec::entities::UnderlayType::Dwf => FrameKind::Dwf,
-        codec::entities::UnderlayType::Dgn => FrameKind::Dgn,
+        document::entities::UnderlayType::Pdf => FrameKind::Pdf,
+        document::entities::UnderlayType::Dwf => FrameKind::Dwf,
+        document::entities::UnderlayType::Dgn => FrameKind::Dgn,
     }
 }
 
@@ -247,8 +260,8 @@ pub(crate) fn affected(entity: &EntityType, kind: FrameKind) -> bool {
             EntityType::Extended(extended)
                 if matches!(
                     &extended.data,
-                    codec::entities::ExtendedEntityData::PointCloud(_)
-                        | codec::entities::ExtendedEntityData::PointCloudEx(_)
+                    document::entities::ExtendedEntityData::PointCloud(_)
+                        | document::entities::ExtendedEntityData::PointCloudEx(_)
                 )
         ),
     }

@@ -1,14 +1,14 @@
-use codec::entities::{mesh::Mesh, polygon_mesh::PolygonMesh, Face3D, PolyfaceMesh};
-use kernel::geom2d::{triangulate, Tolerance};
-use kernel::space::{polygon, NurbsSurface3, Plane, Vec3 as KernelVec3};
+use document::entities::{mesh::Mesh, polygon_mesh::PolygonMesh, Face3D, PolyfaceMesh};
 use glam::Vec3;
+use ocs_geom::geom2d::{triangulate, Tolerance};
+use ocs_geom::space::{polygon, NurbsSurface3, Plane, Vec3 as KernelVec3};
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
-    edit_prop as edit, edit_scalar_prop as edit_scalar, parse_f64, ro_prop as ro,
-    square_grip, stepper_prop as stepper,
+    edit_prop as edit, edit_scalar_prop as edit_scalar, parse_f64, ro_prop as ro, square_grip,
+    stepper_prop as stepper,
 };
 use crate::entities::traits::{Grippable, PropertyEditable, RenderConvertible, Transformable};
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::model::wire_model::SnapHint;
@@ -66,15 +66,15 @@ pub(crate) fn triangulate_planar_indices(poly: &[[f64; 3]]) -> Vec<[usize; 3]> {
 
 // ── Face3D ────────────────────────────────────────────────────────────────────
 
-fn v3(v: &codec::types::Vector3) -> [f64; 3] {
+fn v3(v: &document::types::Vector3) -> [f64; 3] {
     [v.x, v.y, v.z]
 }
 
-fn dvec3(v: &codec::types::Vector3) -> glam::DVec3 {
+fn dvec3(v: &document::types::Vector3) -> glam::DVec3 {
     glam::DVec3::new(v.x, v.y, v.z)
 }
 
-fn v3f32(v: &codec::types::Vector3) -> [f32; 3] {
+fn v3f32(v: &document::types::Vector3) -> [f32; 3] {
     [v.x as f32, v.y as f32, v.z as f32]
 }
 
@@ -83,8 +83,7 @@ fn face3d_fill(corners: [[f64; 3]; 4]) -> Vec<[f64; 3]> {
     let mut ring = Vec::with_capacity(4);
     for corner in corners {
         if ring.last().is_none_or(|previous| {
-            KernelVec3::from(*previous).distance(KernelVec3::from(corner))
-                > tolerance.linear()
+            KernelVec3::from(*previous).distance(KernelVec3::from(corner)) > tolerance.linear()
         }) {
             ring.push(corner);
         }
@@ -103,7 +102,7 @@ fn face3d_fill(corners: [[f64; 3]; 4]) -> Vec<[f64; 3]> {
 }
 
 impl RenderConvertible for Face3D {
-    fn to_render(&self, _document: &codec::CadDocument) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         let p0 = v3(&self.first_corner);
         let p1 = v3(&self.second_corner);
         let p2 = v3(&self.third_corner);
@@ -200,8 +199,7 @@ impl PropertyEditable for Face3D {
     fn geometry_properties(&self, _text_style_names: &[String]) -> Vec<PropSection> {
         let was_triangle = self.is_triangle();
         let vertex_count = if was_triangle { 3 } else { 4 };
-        let current = crate::scene::view::dispatch::prop_current_vertex()
-            .min(vertex_count - 1);
+        let current = crate::scene::view::dispatch::prop_current_vertex().min(vertex_count - 1);
         let corner = match current {
             0 => &self.first_corner,
             1 => &self.second_corner,
@@ -263,8 +261,7 @@ impl PropertyEditable for Face3D {
         };
         let was_triangle = self.is_triangle();
         let vertex_count = if was_triangle { 3 } else { 4 };
-        let current = crate::scene::view::dispatch::prop_current_vertex()
-            .min(vertex_count - 1);
+        let current = crate::scene::view::dispatch::prop_current_vertex().min(vertex_count - 1);
         let corner = match current {
             0 => &mut self.first_corner,
             1 => &mut self.second_corner,
@@ -285,23 +282,32 @@ impl PropertyEditable for Face3D {
 
 impl Transformable for Face3D {
     fn apply_transform(&mut self, t: &EntityTransform) {
-        crate::scene::view::transform::apply_standard_entity_transform(self, t, |entity, p1, p2| {
-            for corner in [
-                &mut entity.first_corner,
-                &mut entity.second_corner,
-                &mut entity.third_corner,
-                &mut entity.fourth_corner,
-            ] {
-                crate::scene::view::transform::reflect_xy_point(&mut corner.x, &mut corner.y, p1, p2);
-            }
-        });
+        crate::scene::view::transform::apply_standard_entity_transform(
+            self,
+            t,
+            |entity, p1, p2| {
+                for corner in [
+                    &mut entity.first_corner,
+                    &mut entity.second_corner,
+                    &mut entity.third_corner,
+                    &mut entity.fourth_corner,
+                ] {
+                    crate::scene::view::transform::reflect_xy_point(
+                        &mut corner.x,
+                        &mut corner.y,
+                        p1,
+                        p2,
+                    );
+                }
+            },
+        );
     }
 }
 
 // ── PolygonMesh (N×M grid) ────────────────────────────────────────────────────
 
 fn polygon_mesh_display(mesh: &PolygonMesh) -> (Vec<[f64; 3]>, usize, usize) {
-    use codec::entities::polygon_mesh::SurfaceSmoothType;
+    use document::entities::polygon_mesh::SurfaceSmoothType;
 
     let m = mesh.m_vertex_count.max(0) as usize;
     let n = mesh.n_vertex_count.max(0) as usize;
@@ -363,7 +369,7 @@ fn polygon_mesh_display(mesh: &PolygonMesh) -> (Vec<[f64; 3]>, usize, usize) {
 }
 
 impl RenderConvertible for PolygonMesh {
-    fn to_render(&self, _document: &codec::CadDocument) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         let (vertices, m, n) = polygon_mesh_display(self);
         if m == 0 || n == 0 || vertices.len() < m * n {
             return None;
@@ -381,8 +387,16 @@ impl RenderConvertible for PolygonMesh {
             lines.push(b);
         };
 
-        let m_segments = if self.is_closed_m() { m } else { m.saturating_sub(1) };
-        let n_segments = if self.is_closed_n() { n } else { n.saturating_sub(1) };
+        let m_segments = if self.is_closed_m() {
+            m
+        } else {
+            m.saturating_sub(1)
+        };
+        let n_segments = if self.is_closed_n() {
+            n
+        } else {
+            n.saturating_sub(1)
+        };
         for row in 0..m {
             for column in 0..n_segments {
                 add_segment(row * n + column, row * n + (column + 1) % n);
@@ -448,7 +462,7 @@ impl Grippable for PolygonMesh {
 
 impl PropertyEditable for PolygonMesh {
     fn geometry_properties(&self, _text_style_names: &[String]) -> Vec<PropSection> {
-        use codec::entities::polygon_mesh::SurfaceSmoothType;
+        use document::entities::polygon_mesh::SurfaceSmoothType;
 
         let smooth = match self.smooth_type {
             SurfaceSmoothType::NoSmooth => "None",
@@ -457,8 +471,8 @@ impl PropertyEditable for PolygonMesh {
             SurfaceSmoothType::Bezier => "Bezier",
         };
         let vertex_count = self.vertices.len();
-        let current = crate::scene::view::dispatch::prop_current_vertex()
-            .min(vertex_count.saturating_sub(1));
+        let current =
+            crate::scene::view::dispatch::prop_current_vertex().min(vertex_count.saturating_sub(1));
         let vertex = self.vertices.get(current);
         let current_vertex = if vertex_count == 0 { 0 } else { current + 1 };
         vec![
@@ -470,15 +484,18 @@ impl PropertyEditable for PolygonMesh {
                         "pm_current_vertex",
                         current_vertex as f64,
                     ),
-                    edit(t!("Vertex X").as_ref(),
+                    edit(
+                        t!("Vertex X").as_ref(),
                         "pm_vx",
                         vertex.map_or(0.0, |vertex| vertex.location.x),
                     ),
-                    edit(t!("Vertex Y").as_ref(),
+                    edit(
+                        t!("Vertex Y").as_ref(),
                         "pm_vy",
                         vertex.map_or(0.0, |vertex| vertex.location.y),
                     ),
-                    edit(t!("Vertex Z").as_ref(),
+                    edit(
+                        t!("Vertex Z").as_ref(),
                         "pm_vz",
                         vertex.map_or(0.0, |vertex| vertex.location.z),
                     ),
@@ -508,8 +525,16 @@ impl PropertyEditable for PolygonMesh {
                         "pm_smooth_n",
                         self.n_smooth_density as f64,
                     ),
-                    ro(t!("M vertex count").as_ref(), "pm_m", self.m_vertex_count.to_string()),
-                    ro(t!("N vertex count").as_ref(), "pm_n", self.n_vertex_count.to_string()),
+                    ro(
+                        t!("M vertex count").as_ref(),
+                        "pm_m",
+                        self.m_vertex_count.to_string(),
+                    ),
+                    ro(
+                        t!("N vertex count").as_ref(),
+                        "pm_n",
+                        self.n_vertex_count.to_string(),
+                    ),
                 ],
             },
             PropSection {
@@ -532,18 +557,14 @@ impl PropertyEditable for PolygonMesh {
     }
 
     fn apply_geom_prop(&mut self, field: &str, value: &str) {
-        use codec::entities::polygon_mesh::{PolygonMeshFlags, SurfaceSmoothType};
+        use document::entities::polygon_mesh::{PolygonMeshFlags, SurfaceSmoothType};
 
         let bool_value = |current: bool| {
             if value == "toggle" {
                 Some(!current)
-            } else if value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("yes")
-            {
+            } else if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") {
                 Some(true)
-            } else if value.eq_ignore_ascii_case("false")
-                || value.eq_ignore_ascii_case("no")
-            {
+            } else if value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("no") {
                 Some(false)
             } else {
                 None
@@ -610,23 +631,27 @@ impl PropertyEditable for PolygonMesh {
 
 impl Transformable for PolygonMesh {
     fn apply_transform(&mut self, t: &EntityTransform) {
-        crate::scene::view::transform::apply_standard_entity_transform(self, t, |entity, p1, p2| {
-            for v in &mut entity.vertices {
-                crate::scene::view::transform::reflect_xy_point(
-                    &mut v.location.x,
-                    &mut v.location.y,
-                    p1,
-                    p2,
-                );
-            }
-        });
+        crate::scene::view::transform::apply_standard_entity_transform(
+            self,
+            t,
+            |entity, p1, p2| {
+                for v in &mut entity.vertices {
+                    crate::scene::view::transform::reflect_xy_point(
+                        &mut v.location.x,
+                        &mut v.location.y,
+                        p1,
+                        p2,
+                    );
+                }
+            },
+        );
     }
 }
 
 // ── PolyfaceMesh (arbitrary faces with 1-based vertex indices) ────────────────
 
 impl RenderConvertible for PolyfaceMesh {
-    fn to_render(&self, _document: &codec::CadDocument) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         if self.vertices.is_empty() || self.faces.is_empty() {
             return None;
         }
@@ -660,14 +685,14 @@ impl Grippable for PolyfaceMesh {
         if let Some(v) = self.vertices.get_mut(grip_id) {
             match apply {
                 GripApply::Translate(d) => {
-                    v.location.x += d.x as f64;
-                    v.location.y += d.y as f64;
-                    v.location.z += d.z as f64;
+                    v.location.x += d.x;
+                    v.location.y += d.y;
+                    v.location.z += d.z;
                 }
                 GripApply::Absolute(p) => {
-                    v.location.x = p.x as f64;
-                    v.location.y = p.y as f64;
-                    v.location.z = p.z as f64;
+                    v.location.x = p.x;
+                    v.location.y = p.y;
+                    v.location.z = p.z;
                 }
             }
         }
@@ -677,10 +702,10 @@ impl Grippable for PolyfaceMesh {
 impl PropertyEditable for PolyfaceMesh {
     fn geometry_properties(&self, _text_style_names: &[String]) -> Vec<PropSection> {
         let smooth = match self.smooth_surface {
-            codec::entities::PolyfaceSmoothType::None => "None",
-            codec::entities::PolyfaceSmoothType::Quadratic => "Quadratic",
-            codec::entities::PolyfaceSmoothType::Cubic => "Cubic",
-            codec::entities::PolyfaceSmoothType::Bezier => "Bezier",
+            document::entities::PolyfaceSmoothType::None => "None",
+            document::entities::PolyfaceSmoothType::Quadratic => "Quadratic",
+            document::entities::PolyfaceSmoothType::Cubic => "Cubic",
+            document::entities::PolyfaceSmoothType::Bezier => "Bezier",
         };
         let first = self.vertices.first();
         vec![
@@ -688,17 +713,26 @@ impl PropertyEditable for PolyfaceMesh {
                 title: t!("Geometry").into_owned(),
                 props: vec![
                     ro(t!("Vertex").as_ref(), "pfm_vertex", String::new()),
-                    ro(t!("Vertex X").as_ref(),
+                    ro(
+                        t!("Vertex X").as_ref(),
                         "pfm_vx",
-                        first.map(|v| format!("{:.4}", v.location.x)).unwrap_or_default(),
+                        first
+                            .map(|v| format!("{:.4}", v.location.x))
+                            .unwrap_or_default(),
                     ),
-                    ro(t!("Vertex Y").as_ref(),
+                    ro(
+                        t!("Vertex Y").as_ref(),
                         "pfm_vy",
-                        first.map(|v| format!("{:.4}", v.location.y)).unwrap_or_default(),
+                        first
+                            .map(|v| format!("{:.4}", v.location.y))
+                            .unwrap_or_default(),
                     ),
-                    ro(t!("Vertex Z").as_ref(),
+                    ro(
+                        t!("Vertex Z").as_ref(),
                         "pfm_vz",
-                        first.map(|v| format!("{:.4}", v.location.z)).unwrap_or_default(),
+                        first
+                            .map(|v| format!("{:.4}", v.location.z))
+                            .unwrap_or_default(),
                     ),
                     // Polyface meshes store an explicit vertex/face list rather
                     // than an M×N grid, so the grid-only rows are not applicable.
@@ -708,8 +742,16 @@ impl PropertyEditable for PolyfaceMesh {
                     ro(t!("N closed").as_ref(), "pfm_closed_n", String::new()),
                     ro(t!("M density").as_ref(), "pfm_density_m", String::new()),
                     ro(t!("N density").as_ref(), "pfm_density_n", String::new()),
-                    ro(t!("Vertex count").as_ref(), "pfm_v", self.vertices.len().to_string()),
-                    ro(t!("Face count").as_ref(), "pfm_f", self.faces.len().to_string()),
+                    ro(
+                        t!("Vertex count").as_ref(),
+                        "pfm_v",
+                        self.vertices.len().to_string(),
+                    ),
+                    ro(
+                        t!("Face count").as_ref(),
+                        "pfm_f",
+                        self.faces.len().to_string(),
+                    ),
                 ],
             },
             PropSection {
@@ -724,16 +766,20 @@ impl PropertyEditable for PolyfaceMesh {
 
 impl Transformable for PolyfaceMesh {
     fn apply_transform(&mut self, t: &EntityTransform) {
-        crate::scene::view::transform::apply_standard_entity_transform(self, t, |entity, p1, p2| {
-            for v in &mut entity.vertices {
-                crate::scene::view::transform::reflect_xy_point(
-                    &mut v.location.x,
-                    &mut v.location.y,
-                    p1,
-                    p2,
-                );
-            }
-        });
+        crate::scene::view::transform::apply_standard_entity_transform(
+            self,
+            t,
+            |entity, p1, p2| {
+                for v in &mut entity.vertices {
+                    crate::scene::view::transform::reflect_xy_point(
+                        &mut v.location.x,
+                        &mut v.location.y,
+                        p1,
+                        p2,
+                    );
+                }
+            },
+        );
     }
 }
 
@@ -751,7 +797,11 @@ struct RefinedMesh {
 }
 
 fn edge_key(a: usize, b: usize) -> (usize, usize) {
-    if a < b { (a, b) } else { (b, a) }
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 fn add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -859,21 +909,25 @@ fn subdivide_catmull_clark(mesh: &RefinedMesh, blend_crease: bool) -> RefinedMes
             continue;
         }
 
-        let face_average =
-            mean_points(incident_faces.iter().filter_map(|&index| face_points.get(index)));
+        let face_average = mean_points(
+            incident_faces
+                .iter()
+                .filter_map(|&index| face_points.get(index)),
+        );
         let edge_midpoints: Vec<[f64; 3]> = incident_edges
             .iter()
             .filter_map(|&(a, b)| {
                 let other = if a == vertex_index { b } else { a };
-                mesh.vertices
-                    .get(other)
-                    .map(|&p| mul3(add3(point, p), 0.5))
+                mesh.vertices.get(other).map(|&p| mul3(add3(point, p), 0.5))
             })
             .collect();
         let edge_average = mean_points(edge_midpoints.iter());
         let n = incident_faces.len() as f64;
         let smooth = mul3(
-            add3(add3(face_average, mul3(edge_average, 2.0)), mul3(point, n - 3.0)),
+            add3(
+                add3(face_average, mul3(edge_average, 2.0)),
+                mul3(point, n - 3.0),
+            ),
             1.0 / n,
         );
 
@@ -896,10 +950,9 @@ fn subdivide_catmull_clark(mesh: &RefinedMesh, blend_crease: bool) -> RefinedMes
         sharp_neighbours.sort_by(|a, b| b.0.total_cmp(&a.0));
 
         let crease_point = match sharp_neighbours.as_slice() {
-            [(_, first), (_, second), ..] => mul3(
-                add3(add3(mul3(point, 6.0), *first), *second),
-                1.0 / 8.0,
-            ),
+            [(_, first), (_, second), ..] => {
+                mul3(add3(add3(mul3(point, 6.0), *first), *second), 1.0 / 8.0)
+            }
             _ => smooth,
         };
         let corner_point = if sharp_neighbours.len() >= 3 {
@@ -907,10 +960,7 @@ fn subdivide_catmull_clark(mesh: &RefinedMesh, blend_crease: bool) -> RefinedMes
         } else {
             crease_point
         };
-        let sharpness = sharp_neighbours
-            .get(1)
-            .map(|item| item.0)
-            .unwrap_or(0.0);
+        let sharpness = sharp_neighbours.get(1).map(|item| item.0).unwrap_or(0.0);
         let amount = if blend_crease {
             sharpness.clamp(0.0, 1.0)
         } else if sharpness > 0.0 {
@@ -1003,16 +1053,27 @@ fn display_mesh(mesh: &Mesh) -> RefinedMesh {
 /// Convert a closed indexed mesh entity to an exact planar-faced B-rep.
 /// Open, non-manifold, non-planar, and degenerate meshes return `None` so a
 /// modelling command can leave the source untouched.
-pub(crate) fn closed_mesh_body(entity: &codec::EntityType) -> Option<kernel::brep::Body> {
-    match entity {
-        codec::EntityType::Mesh(mesh) => {
-            let base = base_refined_mesh(mesh);
-            kernel::brep::make::faceted_solid(&base.vertices, &base.faces)
+pub(crate) fn closed_mesh_body(entity: &document::EntityType) -> Option<ocs_solid::model::Brep> {
+    if let document::EntityType::PolygonMesh(mesh) = entity {
+        if !mesh.is_closed_m() || !mesh.is_closed_n() {
+            return None;
         }
-        codec::EntityType::PolygonMesh(mesh) => {
-            if !mesh.is_closed_m() || !mesh.is_closed_n() {
-                return None;
-            }
+    }
+    let (vertices, faces) = mesh_polygons(entity)?;
+    ocs_solid::model::faceted_solid(&vertices, &faces)
+}
+
+/// The vertices and face loops (vertex indices) of a MESH, polygon mesh or
+/// polyface mesh, as drawn without smoothing.
+pub(crate) fn mesh_polygons(
+    entity: &document::EntityType,
+) -> Option<(Vec<[f64; 3]>, Vec<Vec<usize>>)> {
+    match entity {
+        document::EntityType::Mesh(mesh) => {
+            let base = base_refined_mesh(mesh);
+            Some((base.vertices, base.faces))
+        }
+        document::EntityType::PolygonMesh(mesh) => {
             let m = mesh.m_vertex_count.max(0) as usize;
             let n = mesh.n_vertex_count.max(0) as usize;
             let vertices = mesh
@@ -1024,9 +1085,11 @@ pub(crate) fn closed_mesh_body(entity: &codec::EntityType) -> Option<kernel::bre
             if m < 2 || n < 2 || vertices.len() != m.saturating_mul(n) {
                 return None;
             }
-            let mut faces = Vec::with_capacity(m.saturating_mul(n));
-            for row in 0..m {
-                for column in 0..n {
+            let rows = if mesh.is_closed_m() { m } else { m - 1 };
+            let columns = if mesh.is_closed_n() { n } else { n - 1 };
+            let mut faces = Vec::with_capacity(rows.saturating_mul(columns));
+            for row in 0..rows {
+                for column in 0..columns {
                     faces.push(vec![
                         row * n + column,
                         ((row + 1) % m) * n + column,
@@ -1035,9 +1098,9 @@ pub(crate) fn closed_mesh_body(entity: &codec::EntityType) -> Option<kernel::bre
                     ]);
                 }
             }
-            kernel::brep::make::faceted_solid(&vertices, &faces)
+            Some((vertices, faces))
         }
-        codec::EntityType::PolyfaceMesh(mesh) => {
+        document::EntityType::PolyfaceMesh(mesh) => {
             let vertices = mesh
                 .vertices
                 .iter()
@@ -1055,16 +1118,65 @@ pub(crate) fn closed_mesh_body(entity: &codec::EntityType) -> Option<kernel::bre
                     (indices.len() >= 3).then_some(indices)
                 })
                 .collect::<Vec<_>>();
-            kernel::brep::make::faceted_solid(&vertices, &faces)
+            Some((vertices, faces))
         }
         _ => None,
     }
 }
 
-fn face_triangle_indices(
+/// The part of a mesh on one side of a cut: every face loop clipped to where
+/// `side` is positive (`keep_positive`) or negative, rebuilt as a MESH with
+/// `common`. The mesh stays open where the cut crossed it. `None` when no face
+/// reaches that side.
+pub(crate) fn clipped_mesh(
     vertices: &[[f64; 3]],
     faces: &[Vec<usize>],
-) -> (Vec<u32>, Vec<usize>) {
+    side: impl Fn([f64; 3]) -> f64,
+    keep_positive: bool,
+    common: &document::entities::EntityCommon,
+) -> Option<Mesh> {
+    let sign = if keep_positive { 1.0 } else { -1.0 };
+    let distances: Vec<f64> = vertices.iter().map(|&point| sign * side(point)).collect();
+    let mut mesh = Mesh::new();
+    mesh.common = common.clone();
+    let mut welded: std::collections::HashMap<[u64; 3], usize> = Default::default();
+    let mut index_of = |mesh: &mut Mesh, point: [f64; 3]| {
+        *welded.entry(point.map(f64::to_bits)).or_insert_with(|| {
+            mesh.add_vertex(document::types::Vector3::new(point[0], point[1], point[2]))
+        })
+    };
+    for face in faces {
+        if face.iter().any(|&index| index >= vertices.len()) {
+            continue;
+        }
+        let mut loop_points = Vec::with_capacity(face.len() + 2);
+        for (k, &a) in face.iter().enumerate() {
+            let b = face[(k + 1) % face.len()];
+            let (da, db) = (distances[a], distances[b]);
+            if da >= 0.0 {
+                loop_points.push(vertices[a]);
+            }
+            if (da > 0.0 && db < 0.0) || (da < 0.0 && db > 0.0) {
+                let t = da / (da - db);
+                let (pa, pb) = (vertices[a], vertices[b]);
+                loop_points.push(std::array::from_fn(|axis| {
+                    pa[axis] + (pb[axis] - pa[axis]) * t
+                }));
+            }
+        }
+        if loop_points.len() < 3 {
+            continue;
+        }
+        let indices = loop_points
+            .into_iter()
+            .map(|point| index_of(&mut mesh, point))
+            .collect::<Vec<_>>();
+        mesh.add_face(document::entities::MeshFace::new(indices));
+    }
+    (!mesh.faces.is_empty()).then_some(mesh)
+}
+
+fn face_triangle_indices(vertices: &[[f64; 3]], faces: &[Vec<usize>]) -> (Vec<u32>, Vec<usize>) {
     let mut indices = Vec::new();
     let mut triangle_faces = Vec::new();
     for (face_index, face) in faces.iter().enumerate() {
@@ -1079,7 +1191,8 @@ fn face_triangle_indices(
             let mut mapped = [0u32; 3];
             let mut valid = true;
             for corner in 0..3 {
-                let Some(local) = polygon.iter().position(|point| *point == triangle[corner]) else {
+                let Some(local) = polygon.iter().position(|point| *point == triangle[corner])
+                else {
                     valid = false;
                     break;
                 };
@@ -1156,6 +1269,73 @@ fn append_feature_edge(
     }
 }
 
+static EDGE_SMOOTH_DEGREES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x3f80_0000);
+
+/// VSEDGESMOOTH: the crease angle in degrees (default 1). A mesh edge whose
+/// two faces meet flatter than this is not drawn in the shaded-with-edges
+/// modes, so smooth curved meshes show their outline, not every facet.
+pub fn edge_smooth_degrees() -> f32 {
+    f32::from_bits(EDGE_SMOOTH_DEGREES.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+pub fn set_edge_smooth_degrees(degrees: f32) {
+    EDGE_SMOOTH_DEGREES.store(
+        degrees.clamp(0.0, 180.0).to_bits(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The edges of `edges` worth drawing: boundary edges, edges shared by
+/// more than two faces, and those whose two faces meet at more than the
+/// VSEDGESMOOTH angle.
+fn crease_edges(
+    vertices: &[[f64; 3]],
+    faces: &[Vec<usize>],
+    edges: std::collections::HashSet<(usize, usize)>,
+) -> std::collections::HashSet<(usize, usize)> {
+    let crease = f64::from(edge_smooth_degrees()).to_radians();
+    if crease <= 0.0 {
+        return edges;
+    }
+    // Newell normals: right for any planar polygon, sane for a warped one.
+    let normal = |face: &Vec<usize>| {
+        let mut n = glam::DVec3::ZERO;
+        for (k, &a) in face.iter().enumerate() {
+            let (Some(p), Some(q)) = (vertices.get(a), vertices.get(face[(k + 1) % face.len()]))
+            else {
+                continue;
+            };
+            n.x += (p[1] - q[1]) * (p[2] + q[2]);
+            n.y += (p[2] - q[2]) * (p[0] + q[0]);
+            n.z += (p[0] - q[0]) * (p[1] + q[1]);
+        }
+        n.normalize_or_zero()
+    };
+    let mut adjacent: std::collections::HashMap<(usize, usize), Vec<glam::DVec3>> =
+        std::collections::HashMap::new();
+    for face in faces {
+        let n = normal(face);
+        for k in 0..face.len() {
+            let key = edge_key(face[k], face[(k + 1) % face.len()]);
+            if edges.contains(&key) {
+                adjacent.entry(key).or_default().push(n);
+            }
+        }
+    }
+    let cos_crease = crease.cos();
+    edges
+        .into_iter()
+        .filter(|key| match adjacent.get(key).map(Vec::as_slice) {
+            Some([a, b]) if *a != glam::DVec3::ZERO && *b != glam::DVec3::ZERO => {
+                // Faces wound either way: the fold is the smaller angle.
+                a.dot(*b).abs() < cos_crease
+            }
+            _ => true,
+        })
+        .collect()
+}
+
 fn make_mesh_lod_set(
     name: String,
     color: [f32; 4],
@@ -1164,6 +1344,7 @@ fn make_mesh_lod_set(
     visible_edges: std::collections::HashSet<(usize, usize)>,
     face_colors: &[Option<[f32; 4]>],
 ) -> Option<crate::scene::model::mesh_model::MeshLodSet> {
+    let visible_edges = crease_edges(&vertices, &faces, visible_edges);
     let (indices, triangle_faces) = face_triangle_indices(&vertices, &faces);
     if indices.is_empty() {
         return None;
@@ -1200,13 +1381,13 @@ fn make_mesh_lod_set(
 /// pipeline. The retained wire entity carries snaps/grips only; fill, normals,
 /// depth, materials and face colours live in `MeshLodSet`.
 pub(crate) fn tessellate_shaded_mesh(
-    entity: &codec::EntityType,
+    entity: &document::EntityType,
     color: [f32; 4],
 ) -> Option<crate::scene::model::mesh_model::MeshLodSet> {
     use std::collections::HashSet;
 
     match entity {
-        codec::EntityType::Mesh(mesh) => {
+        document::EntityType::Mesh(mesh) => {
             let display = display_mesh(mesh);
             let mut edges = HashSet::new();
             for face in &display.faces {
@@ -1223,7 +1404,7 @@ pub(crate) fn tessellate_shaded_mesh(
                 &[],
             )
         }
-        codec::EntityType::PolygonMesh(mesh) => {
+        document::EntityType::PolygonMesh(mesh) => {
             let (vertices, m, n) = polygon_mesh_display(mesh);
             if m == 0 || n == 0 || vertices.len() < m.saturating_mul(n) {
                 return None;
@@ -1257,17 +1438,11 @@ pub(crate) fn tessellate_shaded_mesh(
                 &[],
             )
         }
-        codec::EntityType::PolyfaceMesh(mesh) => {
+        document::EntityType::PolyfaceMesh(mesh) => {
             let vertices: Vec<[f64; 3]> = mesh
                 .vertices
                 .iter()
-                .map(|vertex| {
-                    [
-                        vertex.location.x,
-                        vertex.location.y,
-                        vertex.location.z,
-                    ]
-                })
+                .map(|vertex| [vertex.location.x, vertex.location.y, vertex.location.z])
                 .collect();
             let mut faces = Vec::new();
             let mut face_colors = Vec::new();
@@ -1285,11 +1460,18 @@ pub(crate) fn tessellate_shaded_mesh(
                 }
                 for corner in 0..indices.len() {
                     if raw[corner] > 0 {
-                        edges.insert(edge_key(indices[corner], indices[(corner + 1) % indices.len()]));
+                        edges.insert(edge_key(
+                            indices[corner],
+                            indices[(corner + 1) % indices.len()],
+                        ));
                     }
                 }
                 faces.push(indices);
-                face_colors.push(face.color.as_ref().map(crate::scene::convert::tess_util::aci_to_rgba));
+                face_colors.push(
+                    face.color
+                        .as_ref()
+                        .map(crate::scene::convert::tess_util::aci_to_rgba),
+                );
             }
             make_mesh_lod_set(
                 mesh.common.handle.value().to_string(),
@@ -1305,7 +1487,7 @@ pub(crate) fn tessellate_shaded_mesh(
 }
 
 impl RenderConvertible for Mesh {
-    fn to_render(&self, _document: &codec::CadDocument) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         if self.vertices.is_empty() {
             return None;
         }
@@ -1348,14 +1530,14 @@ impl Grippable for Mesh {
         if let Some(v) = self.vertices.get_mut(grip_id) {
             match apply {
                 GripApply::Translate(d) => {
-                    v.x += d.x as f64;
-                    v.y += d.y as f64;
-                    v.z += d.z as f64;
+                    v.x += d.x;
+                    v.y += d.y;
+                    v.z += d.z;
                 }
                 GripApply::Absolute(p) => {
-                    v.x = p.x as f64;
-                    v.y = p.y as f64;
-                    v.z = p.z as f64;
+                    v.x = p.x;
+                    v.y = p.y;
+                    v.z = p.z;
                 }
             }
         }
@@ -1377,8 +1559,7 @@ impl PropertyEditable for Mesh {
                 *edge_use.entry(key).or_insert(0) += 1;
             }
         }
-        let watertight =
-            !self.faces.is_empty() && edge_use.values().all(|&c| c == 2);
+        let watertight = !self.faces.is_empty() && edge_use.values().all(|&c| c == 2);
         vec![PropSection {
             title: t!("Geometry").into_owned(),
             props: vec![
@@ -1395,10 +1576,23 @@ impl PropertyEditable for Mesh {
                         value: self.blend_crease,
                     },
                 },
-                ro(t!("Number of Faces").as_ref(), "msh_f", self.faces.len().to_string()),
-                ro(t!("Number of Vertices").as_ref(), "msh_v", self.vertices.len().to_string()),
-                ro(t!("Number of Edges").as_ref(), "msh_e", self.edges.len().to_string()),
-                ro(t!("Creased Edges").as_ref(),
+                ro(
+                    t!("Number of Faces").as_ref(),
+                    "msh_f",
+                    self.faces.len().to_string(),
+                ),
+                ro(
+                    t!("Number of Vertices").as_ref(),
+                    "msh_v",
+                    self.vertices.len().to_string(),
+                ),
+                ro(
+                    t!("Number of Edges").as_ref(),
+                    "msh_e",
+                    self.edges.len().to_string(),
+                ),
+                ro(
+                    t!("Creased Edges").as_ref(),
                     "msh_creased",
                     self.edges
                         .iter()
@@ -1406,12 +1600,18 @@ impl PropertyEditable for Mesh {
                         .count()
                         .to_string(),
                 ),
-                ro(t!("Override Option").as_ref(),
+                ro(
+                    t!("Override Option").as_ref(),
                     "msh_override",
                     self.override_option.to_string(),
                 ),
-                ro(t!("Number of Grips").as_ref(), "msh_grips", self.vertices.len().to_string()),
-                ro(t!("Watertight").as_ref(),
+                ro(
+                    t!("Number of Grips").as_ref(),
+                    "msh_grips",
+                    self.vertices.len().to_string(),
+                ),
+                ro(
+                    t!("Watertight").as_ref(),
                     "msh_watertight",
                     if watertight { "Yes" } else { "No" },
                 ),
@@ -1441,10 +1641,57 @@ impl PropertyEditable for Mesh {
 
 impl Transformable for Mesh {
     fn apply_transform(&mut self, t: &EntityTransform) {
-        crate::scene::view::transform::apply_standard_entity_transform(self, t, |entity, p1, p2| {
-            for v in &mut entity.vertices {
-                crate::scene::view::transform::reflect_xy_point(&mut v.x, &mut v.y, p1, p2);
+        crate::scene::view::transform::apply_standard_entity_transform(
+            self,
+            t,
+            |entity, p1, p2| {
+                for v in &mut entity.vertices {
+                    crate::scene::view::transform::reflect_xy_point(&mut v.x, &mut v.y, p1, p2);
+                }
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod crease_edge_tests {
+    use super::*;
+
+    /// #1860: an edge between coplanar faces is not drawn; one at a fold is.
+    #[test]
+    fn flat_shared_edges_hide_and_folds_show() {
+        let edges_of = |faces: &[Vec<usize>]| {
+            let mut edges = std::collections::HashSet::new();
+            for face in faces {
+                for k in 0..face.len() {
+                    edges.insert(edge_key(face[k], face[(k + 1) % face.len()]));
+                }
             }
-        });
+            edges
+        };
+        // Two quads side by side in one plane share edge 1–4.
+        let flat = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+        ];
+        let faces = vec![vec![0, 1, 4, 3], vec![1, 2, 5, 4]];
+        let kept = crease_edges(&flat, &faces, edges_of(&faces));
+        assert!(!kept.contains(&edge_key(1, 4)));
+        assert_eq!(kept.len(), 6, "the outline stays");
+        // The second quad folded up by 90° keeps the shared edge.
+        let folded = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 1.0],
+        ];
+        let kept = crease_edges(&folded, &faces, edges_of(&faces));
+        assert!(kept.contains(&edge_key(1, 4)));
     }
 }

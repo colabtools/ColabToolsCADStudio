@@ -7,12 +7,13 @@ use crate::command::CmdOption;
 use crate::t;
 use iced::widget::{
     button, column, container, opaque, row, rule, scrollable, stack, text, text_editor, text_input,
-    tooltip, Space,
+    Space,
 };
 use iced::{Background, Border, Color, Element, Length, Padding, Theme};
 use std::ops::Range;
 
 use crate::ui::style::common::accessible_accent_threshold;
+use crate::ui::style::{kit_metrics as km, text as ui_text};
 
 /// Maximum entries kept for the context menu's "Recent Input" list.
 pub const RECENT_INPUT_CAP: usize = 10;
@@ -25,7 +26,7 @@ pub const HISTORY_SCROLL_ID: &str = "command_history_scroll";
 /// Default for `COMMANDLINEFADETIME` (ms); the live value lives on
 /// [`CommandLine::fade_ms`] so it can be changed via SETVAR.
 pub const DEFAULT_COMMANDLINE_FADE_MS: u32 = 3000;
-/// COMMANDLINEFADETIME bounds in milliseconds: 0 skips the overlay entirely,
+/// COMMANDLINEFADETIME bounds in milliseconds: 0 means never fade,
 /// 60000 keeps lines for a full minute.
 pub const COMMANDLINE_FADE_MIN_MS: u32 = 0;
 pub const COMMANDLINE_FADE_MAX_MS: u32 = 60000;
@@ -47,6 +48,28 @@ pub fn history_max_height(window_height: f32) -> f32 {
 /// How many autocomplete matches the suggestion popup shows at once.
 const AUTOCOMPLETE_LIMIT: usize = 8;
 
+// ── The bar's sizes ────────────────────────────────────────────────────────
+/// A history line's padding, and a suggestion row's.
+const LINE_PAD: [f32; 2] = [km::LINE, km::GRID_INSET_L];
+const ROW_PAD: [f32; 2] = [2.0 * km::LINE, km::GRID_INSET_L];
+/// An option pill's padding, and a small button's.
+const PILL_PAD: [f32; 2] = [km::LINE, crate::ui::style::kit_metrics::DROPDOWN_ITEM_PAD_X];
+const BUTTON_PAD: [f32; 2] = [
+    2.0 * km::LINE,
+    crate::ui::style::kit_metrics::DROPDOWN_ITEM_PAD_X,
+];
+/// Around the "Command:" prompt, and around the autocomplete list.
+const PROMPT_PAD: [f32; 2] = [5.0, km::GRID_INSET_L];
+const LIST_PAD: [f32; 2] = [km::TOOL_GAP, km::GRID_INSET_L];
+/// Between a row's parts, and between the bar's buttons.
+const ITEM_GAP: f32 = km::TAB_INNER_GAP;
+const BUTTON_GAP: f32 = 2.0 * km::LINE;
+/// A colour swatch in a suggestion row, and the slot its icon takes.
+const SWATCH: f32 = 12.0;
+const ICON_SLOT: f32 = km::CHECK;
+/// The input row: the drawing tab bar's and status bar's height.
+const BAR_H: f32 = 30.0;
+
 fn cmd_input_id() -> iced::widget::Id {
     iced::widget::Id::new(CMD_INPUT_ID)
 }
@@ -55,27 +78,20 @@ fn cmd_input_id() -> iced::widget::Id {
 /// `user_select` / `getpoint` is parked and the person at the screen must
 /// answer — outranks `busy`: the screen has to say "act now", not just
 /// "something is running".
-fn mcp_status(enabled: bool, busy: bool, waiting: bool) -> (&'static str, Color) {
+fn mcp_status(enabled: bool, busy: bool, waiting: bool) -> (&'static str, fn(&Theme) -> Color) {
     if !enabled {
-        (
-            "MCP control is off",
-            Color::from_rgb(0.90, 0.35, 0.35),
-        )
+        ("MCP control is off", crate::ui::style::chrome::danger)
     } else if waiting {
         (
             "MCP is waiting for you to pick — Enter confirms, Esc cancels",
-            Color::from_rgb(0.30, 0.55, 0.98),
+            crate::ui::style::chrome::accent,
         )
     } else if busy {
-        (
-            "MCP is handling a request",
-            Color::from_rgb(0.95, 0.72, 0.25),
-        )
+        ("MCP is handling a request", |theme: &Theme| {
+            theme.palette().warning.base.color
+        })
     } else {
-        (
-            "MCP control is ready",
-            Color::from_rgb(0.35, 0.85, 0.55),
-        )
+        ("MCP control is ready", crate::ui::style::chrome::success)
     }
 }
 
@@ -96,9 +112,9 @@ fn strip_option_listing(s: &str, options: &[CmdOption]) -> String {
     let is_listing = inner.contains('/')
         || inner.contains('|')
         || inner.contains('=')
-        || options.iter().any(|o| {
-            o.label.eq_ignore_ascii_case(inner) || o.keyword.eq_ignore_ascii_case(inner)
-        });
+        || options
+            .iter()
+            .any(|o| o.label.eq_ignore_ascii_case(inner) || o.keyword.eq_ignore_ascii_case(inner));
     if !is_listing {
         return s.to_string();
     }
@@ -107,6 +123,46 @@ fn strip_option_listing(s: &str, options: &[CmdOption]) -> String {
         out = out.replace("  ", " ");
     }
     out.replace(" :", ":").trim().to_string()
+}
+
+/// Whether pasted command-line text holds SVG markup, which the copy commands
+/// put on the system clipboard beside their own copy.
+fn is_svg_markup(text: &str) -> bool {
+    text.contains("<svg")
+}
+
+/// An option label split around the letters typed to pick it: the capitals
+/// (`T` in `Ttr`, `RE` in `REpeat`, `X` in `eXit`), or the whole label when
+/// it has no lower case (`3P`).
+fn option_shortcut(label: &str) -> (&str, &str, &str) {
+    if !label.chars().any(char::is_lowercase) {
+        return ("", label, "");
+    }
+    let Some(start) = label.find(|c: char| c.is_uppercase() || c.is_ascii_digit()) else {
+        return (label, "", "");
+    };
+    let len = label[start..]
+        .find(|c: char| c.is_lowercase() || c.is_whitespace())
+        .unwrap_or(label.len() - start);
+    (
+        &label[..start],
+        &label[start..start + len],
+        &label[start + len..],
+    )
+}
+
+#[cfg(test)]
+mod option_shortcut_tests {
+    #[test]
+    fn the_capitals_are_the_shortcut() {
+        use super::option_shortcut as split;
+        assert_eq!(split("Ttr"), ("", "T", "tr"));
+        assert_eq!(split("REpeat"), ("", "RE", "peat"));
+        assert_eq!(split("eXit"), ("e", "X", "it"));
+        assert_eq!(split("3P"), ("", "3P", ""));
+        assert_eq!(split("2Point"), ("", "2P", "oint"));
+        assert_eq!(split("by line"), ("by line", "", ""));
+    }
 }
 
 // Font swaps must preserve U+276F, U+24D8, and U+2715.
@@ -128,9 +184,17 @@ fn format_error(msg: &str) -> String {
 
 const MAX_HISTORY: usize = 64;
 
+/// Opacity of the accent behind selected history text.
+const HISTORY_SELECTION_ALPHA: f32 = 0.5;
+
 #[derive(Clone)]
 pub struct CommandLine {
     pub input: String,
+    /// Depth of active QUIET MACHINE REPLAYS (`CommandRequest::RunQuiet`,
+    /// API v13): while > 0, `push` suppresses Command/Output/Info echo so a
+    /// plugin's constraint/SETVAR replays leave no machinery noise in the
+    /// user-visible history. Errors always surface.
+    pub(crate) quiet_replay: usize,
     /// Persistent literal-space mode (the `>` toggle button): while on, every
     /// line behaves as if it started with `>` — Space stays in the input
     /// instead of submitting. Saved in the user config.
@@ -164,10 +228,17 @@ pub struct CommandLine {
     pub history_open: bool,
     /// Persisted height of the full-history editor in logical pixels.
     pub history_height: f32,
+    /// Offset of the floating command line from its docked spot (bottom
+    /// centre of the drawing area), in logical pixels. Zero is docked.
+    pub float_offset: iced::Vector,
     /// Index of the currently-highlighted autocomplete suggestion. `None`
     /// means the first match is pre-selected (highlighted) before keyboard
     /// navigation begins. Reset when input changes.
     pub autocomplete_cursor: Option<usize>,
+    /// Suggestions supplied by the active CAD command. When non-empty these
+    /// replace normal command-name autocomplete, allowing commands to offer
+    /// drawing-specific values such as layers, blocks or styles.
+    pub contextual_suggestions: Vec<crate::command::CommandSuggestion>,
     /// Command names contributed by loaded plugins, refreshed whenever the
     /// enabled-plugin set changes. Merged into autocomplete alongside the
     /// compile-time command registry, so runtime plugin commands are typeable
@@ -190,14 +261,25 @@ pub struct CommandLine {
     /// are displayed above the command window (0–50, default 3).
     cliprompt_lines: u8,
     /// COMMANDLINEFADETIME: how long overlay history lines stay visible,
-    /// in milliseconds (0–60000, default 3000). 0 skips drawing transient
-    /// lines entirely; the pinned step prompt still shows.
+    /// in milliseconds (0–60000, default 3000). 0 means history never fades;
+    /// the pinned step prompt still shows.
     fade_ms: u32,
+    /// COMMANDLINEOPACITY: how opaque the command line's panels are, in
+    /// percent (20–100, default 80), so the drawing shows through.
+    opacity_percent: u8,
+    /// The family and size the history, prompt and input are written in.
+    font_family: String,
+    font: iced::Font,
+    font_size: f32,
+    /// Since when the pointer rests on the overlay history: lines still
+    /// showing then stay until it leaves, and fade from that moment.
+    hover_since: Option<Instant>,
 }
 
 impl Default for CommandLine {
     fn default() -> Self {
         Self {
+            quiet_replay: 0,
             input: String::new(),
             literal_spaces: false,
             history: Vec::new(),
@@ -211,13 +293,20 @@ impl Default for CommandLine {
             recall_draft: String::new(),
             history_open: false,
             history_height: 0.0,
+            float_offset: iced::Vector::ZERO,
             autocomplete_cursor: None,
+            contextual_suggestions: Vec::new(),
             dynamic_commands: Vec::new(),
             command_aliases: rustc_hash::FxHashMap::default(),
             step_prompt: None,
             step_options: Vec::new(),
             cliprompt_lines: 3,
             fade_ms: DEFAULT_COMMANDLINE_FADE_MS,
+            opacity_percent: 80,
+            font_family: String::new(),
+            font: iced::Font::DEFAULT,
+            font_size: 11.0,
+            hover_since: None,
         }
     }
 }
@@ -241,7 +330,11 @@ pub enum EntryKind {
     Command,
     Output,
     Error,
+    Warning,
     Info,
+    /// A row of a listing (`?` tables): drawn in a fixed-width font so its
+    /// space-padded columns line up.
+    Table,
 }
 
 /// Per-logical-line entry kinds for the selectable full-history editor.
@@ -412,13 +505,49 @@ impl CommandLine {
             format!("{COMMAND_PREFIX}{} {cmd}", t!("Command:")),
         );
     }
+    /// The latest command echo shows only `cmd`: a value typed on the same
+    /// line as a variable belongs to its prompt, not to the command line.
+    pub fn restate_last_command(&mut self, cmd: &str) {
+        if let Some(entry) = self
+            .history
+            .iter_mut()
+            .rev()
+            .find(|e| e.kind == EntryKind::Command)
+        {
+            entry.text = format!("{COMMAND_PREFIX}{} {cmd}", t!("Command:"));
+        }
+    }
+    /// An answer given to the prompt just shown is written after it on the
+    /// same line (`Enter new value for X <1>: 0`), as the reference echoes it.
+    pub fn answer_last_prompt(&mut self, answer: &str) {
+        if let Some(entry) = self
+            .history
+            .last_mut()
+            .filter(|e| e.text.trim_end().ends_with(':'))
+        {
+            entry.text = format!("{} {answer}", entry.text.trim_end());
+        }
+    }
     pub fn push_output(&mut self, msg: &str) {
         self.push(EntryKind::Output, msg.to_string());
+    }
+    /// One row of a space-aligned listing (`?` tables); see [`EntryKind::Table`].
+    pub fn push_table(&mut self, row: &str) {
+        self.push(EntryKind::Table, row.to_string());
     }
     pub fn push_error(&mut self, msg: &str) {
         self.error_revision = self.error_revision.wrapping_add(1);
         self.last_error = Some(msg.to_owned());
         self.push(EntryKind::Error, format_error(msg));
+    }
+    /// A typed value or keyword the prompt refused (`Requires 0 or 1 only.`,
+    /// `Invalid option keyword.`): a plain line, as the reference prints it
+    /// before asking again. It still counts as a failed input for automation
+    /// (`last_error` / `error_revision`).
+    pub fn push_rejection(&mut self, msg: &str) {
+        self.error_revision = self.error_revision.wrapping_add(1);
+        self.last_error = Some(msg.to_owned());
+        self.push(EntryKind::Output, msg.to_string());
     }
     /// Append an error unless it is already the latest history line. Repeated
     /// retry failures should refresh the concise message, not flood history
@@ -438,18 +567,35 @@ impl CommandLine {
         }
         self.push(EntryKind::Error, text);
     }
-    /// Append a warning about the session that no command caused (the
-    /// renderer fell back to the CPU, say). Styled like an error so it is
-    /// seen, but it must not touch `last_error` / `error_revision`:
-    /// automation reads those to decide whether the command it just ran
-    /// failed, and a warning is not a failed command.
+    /// Append a warning without marking the command as failed. Automation
+    /// reads `last_error` / `error_revision`, which warnings never touch.
     pub fn push_warning(&mut self, msg: &str) {
-        self.push(EntryKind::Error, format!("*{}*  {msg}", t!("Warning")));
+        self.push(EntryKind::Warning, format!("*{}*  {msg}", t!("Warning")));
     }
     pub fn push_info(&mut self, msg: &str) {
         self.push(EntryKind::Info, format_info(msg));
     }
+
+    /// Enter a quiet machine replay scope (API v13): command-line echo is
+    /// suppressed until the matching [`Self::end_quiet_replay`]. Depth-
+    /// counted so nested quiet replays unwind correctly; errors always
+    /// surface through `push_error`.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn begin_quiet_replay(&mut self) {
+        self.quiet_replay = self.quiet_replay.saturating_add(1);
+    }
+
+    /// Leave one quiet machine replay scope (API v13).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn end_quiet_replay(&mut self) {
+        self.quiet_replay = self.quiet_replay.saturating_sub(1);
+    }
     fn push(&mut self, kind: EntryKind, text: String) {
+        if self.quiet_replay > 0 && !matches!(kind, EntryKind::Error | EntryKind::Warning) {
+            // A quiet machine replay (API v13) leaves no echo; errors pass.
+            return;
+        }
+        crate::app::commands::write_log_line(&text);
         self.history.push(HistoryEntry {
             kind,
             text,
@@ -496,12 +642,17 @@ impl CommandLine {
         self.step_options = opts;
     }
 
+    #[cfg(test)]
+    pub fn step_options(&self) -> &[CmdOption] {
+        &self.step_options
+    }
+
     pub fn set_cliprompt_lines(&mut self, n: u8) {
         self.cliprompt_lines = n.min(50);
     }
 
-    /// COMMANDLINEFADETIME mirror (ms, 0–60000). `0` skips transient overlay
-    /// lines entirely; the pinned step prompt still shows.
+    /// COMMANDLINEFADETIME mirror (ms, 0–60000). `0` means overlay history
+    /// lines never fade; the pinned step prompt still shows.
     pub fn set_commandline_fade_ms(&mut self, ms: u32) {
         self.fade_ms = ms.min(COMMANDLINE_FADE_MAX_MS);
     }
@@ -510,12 +661,72 @@ impl CommandLine {
         self.fade_ms
     }
 
+    /// COMMANDLINEOPACITY mirror (percent, 20–100).
+    pub fn set_opacity_percent(&mut self, percent: u8) {
+        self.opacity_percent = percent.clamp(20, 100);
+    }
+
+    pub fn opacity_percent(&self) -> u8 {
+        self.opacity_percent
+    }
+
+    /// The command line font: a family name (empty for the interface font)
+    /// and a size in pixels, clamped to 8–24.
+    pub fn set_font(&mut self, family: &str, size: u16) {
+        if family != self.font_family {
+            self.font_family = family.to_owned();
+            self.font = if family.is_empty() {
+                iced::Font::DEFAULT
+            } else {
+                iced::Font::with_family(iced::font::Family::name(family))
+            };
+        }
+        self.font_size = f32::from(size.clamp(8, 24));
+    }
+
+    pub fn font_family(&self) -> &str {
+        &self.font_family
+    }
+
+    pub fn font_size(&self) -> u16 {
+        self.font_size as u16
+    }
+
     fn fade_secs(&self) -> f32 {
         self.fade_ms as f32 / 1000.0
     }
 
     fn entry_visible(&self, e: &HistoryEntry) -> bool {
-        e.pinned || (self.fade_ms > 0 && e.created_at.elapsed().as_secs_f32() < self.fade_secs())
+        let held = self.hover_since.is_some_and(|since| {
+            since.saturating_duration_since(e.created_at).as_secs_f32() < self.fade_secs()
+        });
+        e.pinned
+            || self.fade_ms == 0
+            || held
+            || e.created_at.elapsed().as_secs_f32() < self.fade_secs()
+    }
+
+    /// The pointer entered or left the overlay history. Leaving restarts the
+    /// fade of every line it held.
+    pub fn set_history_hover(&mut self, hovered: bool) {
+        if hovered {
+            self.hover_since.get_or_insert_with(Instant::now);
+            return;
+        }
+        let Some(since) = self.hover_since.take() else {
+            return;
+        };
+        let fade = self.fade_secs();
+        let now = Instant::now();
+        for entry in &mut self.history {
+            if since
+                .saturating_duration_since(entry.created_at)
+                .as_secs_f32()
+                < fade
+            {
+                entry.created_at = now;
+            }
+        }
     }
 
     /// Height of the overlaid prompt lines currently shown above the input
@@ -542,20 +753,34 @@ impl CommandLine {
         if self.cliprompt_lines == 0 {
             return 0;
         }
-        let visible: Vec<&HistoryEntry> =
-            self.history.iter().filter(|e| self.entry_visible(e)).collect();
+        let visible: Vec<&HistoryEntry> = self
+            .history
+            .iter()
+            .filter(|e| self.entry_visible(e))
+            .collect();
         visible.len().min(self.cliprompt_lines as usize)
     }
 
-    /// `true` while at least one history entry is still within the
-    /// visible window — the host app uses this to drive a low-frequency
-    /// tick subscription so the overlay re-renders and fades the entry
-    /// once it expires.
+    /// `true` while at least one history entry is currently visible in the
+    /// overlay area (subject to CLIPROMPTLINES).
     pub fn has_visible_history(&self) -> bool {
         if self.cliprompt_lines == 0 {
             return false;
         }
         self.history.iter().any(|e| self.entry_visible(e))
+    }
+
+    /// `true` while at least one visible history entry is waiting to fade out.
+    /// Used by the host app to drive an animation frame subscription only when
+    /// an entry actually needs to be removed after its visible window expires.
+    /// When `fade_ms == 0` (never fade) or entries are pinned, no tick is needed.
+    pub fn has_expiring_history(&self) -> bool {
+        if self.cliprompt_lines == 0 || self.fade_ms == 0 {
+            return false;
+        }
+        self.history
+            .iter()
+            .any(|e| !e.pinned && e.created_at.elapsed().as_secs_f32() < self.fade_secs())
     }
 
     pub fn toggle_history(&mut self) {
@@ -583,7 +808,7 @@ impl CommandLine {
             .history
             .iter()
             .flat_map(|entry| {
-                std::iter::repeat(entry.kind.clone()).take(entry.text.split('\n').count())
+                std::iter::repeat_n(entry.kind.clone(), entry.text.split('\n').count())
             })
             .collect();
         HistoryHighlightSettings { line_kinds }
@@ -594,6 +819,34 @@ impl CommandLine {
     pub fn clear_history(&mut self) {
         self.history.clear();
         self.step_prompt = None;
+    }
+
+    /// Replace the active command's context-sensitive suggestions.
+    /// A new result set always resets keyboard navigation to the first item.
+    pub fn set_contextual_suggestions(
+        &mut self,
+        suggestions: Vec<crate::command::CommandSuggestion>,
+    ) {
+        let changed = self
+            .contextual_suggestions
+            .iter()
+            .map(|entry| entry.value.as_str())
+            .ne(suggestions.iter().map(|entry| entry.value.as_str()));
+
+        self.contextual_suggestions = suggestions;
+
+        if changed {
+            self.autocomplete_cursor = None;
+        }
+    }
+
+    pub fn clear_contextual_suggestions(&mut self) {
+        self.contextual_suggestions.clear();
+        self.autocomplete_cursor = None;
+    }
+
+    pub fn has_contextual_suggestions(&self) -> bool {
+        !self.contextual_suggestions.is_empty()
     }
 
     /// Move the autocomplete highlight up one entry. Wraps to the last match.
@@ -627,20 +880,95 @@ impl CommandLine {
         if matches.is_empty() {
             return None;
         }
-        let index = self
-            .autocomplete_cursor
-            .unwrap_or(0)
-            .min(matches.len() - 1);
+        let index = self.autocomplete_cursor.unwrap_or(0).min(matches.len() - 1);
         matches.get(index).cloned()
     }
 
     /// Autocomplete suggestions for the current input — see
     /// [`ranked_matches`]. Includes loaded plugins' commands (#272).
     pub fn autocomplete_matches(&self) -> Vec<String> {
+        if !self.contextual_suggestions.is_empty() {
+            return self
+                .contextual_suggestions
+                .iter()
+                .map(|entry| entry.value.clone())
+                .collect();
+        }
+
         ranked_matches(
             self.input.trim(),
             &self.dynamic_commands,
             &self.command_aliases,
+        )
+    }
+
+    /// The Command History pallet: the whole log in one read-only editor
+    /// (select across lines, Ctrl+C), with Copy and Clear, filling the
+    /// pallet. It stays open beside the drawing or in a window of its own.
+    /// The Command History palette: a toolbar (copy, clear) over the log.
+    pub fn history_panel<'a>(
+        &'a self,
+        history_content: &'a text_editor::Content,
+        width: f32,
+        chrome: crate::ui::dock::Chrome,
+    ) -> Element<'a, Message> {
+        let title_bar = crate::ui::dock::title_bar(
+            crate::ui::dock::PanelId::CommandHistory,
+            t!("Command History").into_owned(),
+            chrome,
+        );
+        use crate::ui::kit;
+        use crate::ui::style::{chrome, kit_metrics as km};
+        let log = text_editor(history_content)
+            .on_action(Message::CommandHistoryEdit)
+            .size(crate::ui::style::text::UI)
+            .line_height(crate::ui::style::text::line())
+            .padding(0)
+            .height(Length::Shrink)
+            .highlight_with::<HistoryHighlighter>(
+                self.history_highlight_settings(),
+                history_highlight_format,
+            )
+            .style(|theme: &Theme, _status| text_editor::Style {
+                background: Background::Color(chrome::surface(theme)),
+                border: Border::default(),
+                placeholder: chrome::muted(theme),
+                value: chrome::text(theme),
+                selection: chrome::accent(theme).scale_alpha(HISTORY_SELECTION_ALPHA),
+            });
+        // The log scrolls like a palette's grid, kept at its newest line.
+        let log = scrollable(container(log).padding(iced::Padding {
+            left: km::GRID_INSET_L,
+            right: km::GRID_INSET_R,
+            ..iced::Padding::ZERO
+        }))
+        .height(Length::Fill)
+        .direction(scrollable::Direction::Vertical(
+            scrollable::Scrollbar::new()
+                .width(km::SCROLLBAR_W)
+                .scroller_width(km::SCROLL_THUMB_W)
+                .margin(0),
+        ))
+        .style(kit::scroll_style)
+        .anchor_bottom();
+        let tools = kit::toolbar(vec![
+            kit::tool_button(
+                kit::tool_icon(crate::ui::icons::COPY),
+                t!("Copy").into_owned(),
+                Some(Message::CommandHistoryCopy),
+                false,
+            ),
+            kit::tool_button(
+                kit::tool_icon(crate::ui::icons::TRASH),
+                t!("Clear").into_owned(),
+                Some(Message::CommandHistoryClear),
+                false,
+            ),
+        ]);
+        kit::palette(
+            title_bar,
+            column![tools, Space::new().height(km::TOOL_GAP), log],
+            width,
         )
     }
 
@@ -656,10 +984,13 @@ impl CommandLine {
         graph_open: bool,
     ) -> Element<'a, Message> {
         // Only the most recent entries pushed within COMMANDLINEFADETIME
-        // show on the overlay (0 skips transient lines). The dropdown button
+        // show on the overlay (0 means never fade). The dropdown button
         // keeps the full backlog reachable when the user actually wants it.
-        let mut visible: Vec<&HistoryEntry> =
-            self.history.iter().filter(|e| self.entry_visible(e)).collect();
+        let mut visible: Vec<&HistoryEntry> = self
+            .history
+            .iter()
+            .filter(|e| self.entry_visible(e))
+            .collect();
         // Keep the active prompt/options immediately above the input. Commands
         // may emit informational lines while waiting for the next option; those
         // lines belong above the pinned interaction row, not below it.
@@ -678,16 +1009,21 @@ impl CommandLine {
             .iter()
             .fold(column![].spacing(0), |col, entry| {
                 let kind = entry.kind.clone();
-                let is_error = kind == EntryKind::Error;
+                let is_emphasized = matches!(kind, EntryKind::Error | EntryKind::Warning);
                 let entry_text = |value: String| {
-                    let mut txt = text(value).size(11).style({
+                    let mut txt = text(value).size(self.font_size).font(self.font).style({
                         let kind = kind.clone();
                         move |theme: &Theme| iced::widget::text::Style {
                             color: Some(history_color(theme, &kind)),
                         }
                     });
-                    if is_error {
-                        txt = txt.font(iced::Font::DEFAULT.weight(iced::font::Weight::Bold));
+                    if is_emphasized {
+                        txt = txt.font(iced::Font {
+                            weight: iced::font::Weight::Bold,
+                            ..self.font
+                        });
+                    } else if kind == EntryKind::Table {
+                        txt = txt.font(iced::Font::MONOSPACE);
                     }
                     txt
                 };
@@ -699,27 +1035,64 @@ impl CommandLine {
                 // listing is dropped here (the history log keeps the full text).
                 if entry.pinned && !self.step_options.is_empty() {
                     let shown = strip_option_listing(&entry.text, &self.step_options);
-                    let mut r = row![entry_text(shown)].spacing(6).align_y(iced::Center);
+                    let mut r = row![entry_text(shown)]
+                        .spacing(ITEM_GAP)
+                        .align_y(iced::Center);
                     for opt in &self.step_options {
-                        let btn = button(text(opt.label.to_uppercase()).size(11))
+                        // The letters to type are drawn in the accent colour,
+                        // so the short form of each option can be seen.
+                        let (before, short, after) = option_shortcut(&opt.label);
+                        let part = |s: &str| {
+                            text(s.to_string())
+                                .size(ui_text::UI)
+                                .wrapping(iced::widget::text::Wrapping::None)
+                        };
+                        let accent = |theme: &Theme| iced::widget::text::Style {
+                            color: Some(crate::ui::style::chrome::accent(theme)),
+                        };
+                        // A translated label whose capitals are not what is
+                        // typed shows the keyword itself instead.
+                        let keyword = opt.keyword.to_uppercase();
+                        let short_upper = short.to_uppercase();
+                        // A finishing button (Enter) has nothing to type,
+                        // so no letters are marked.
+                        let label = if keyword.is_empty() {
+                            row![part(&opt.label)]
+                        } else if !short.is_empty()
+                            && (keyword.starts_with(&short_upper)
+                                || short_upper.starts_with(&keyword))
+                        {
+                            row![part(before), part(short).style(accent), part(after)]
+                        } else {
+                            row![
+                                part(&opt.label),
+                                part(&format!(" ({keyword})")).style(accent)
+                            ]
+                        };
+                        let btn = button(label)
                             .on_press(Message::CommandOptionPick(opt.keyword.clone()))
-                            .padding([1, 6])
+                            .padding(PILL_PAD)
                             .style(|theme: &Theme, status| {
-                                let palette = theme.palette();
                                 let pair = if matches!(
                                     status,
                                     button::Status::Hovered | button::Status::Pressed
                                 ) {
-                                    palette.primary.weak
+                                    iced::theme::palette::Pair::new(
+                                        crate::ui::style::chrome::lit(theme),
+                                        crate::ui::style::chrome::strong(theme),
+                                    )
                                 } else {
-                                    palette.background.weakest
+                                    iced::theme::palette::Pair::new(
+                                        crate::ui::style::chrome::surface_raised(theme),
+                                        crate::ui::style::chrome::text(theme),
+                                    )
                                 };
                                 button::Style {
                                     background: Some(Background::Color(pair.color)),
                                     text_color: pair.text,
                                     border: Border {
-                                        color: palette.background.neutral.color,
-                                        width: 1.0,
+                                        color: crate::ui::style::chrome::border(theme),
+                                        width: km::line(),
                                         radius: 3.0.into(),
                                     },
                                     ..Default::default()
@@ -727,59 +1100,73 @@ impl CommandLine {
                             });
                         r = r.push(btn);
                     }
-                    col.push(container(r).padding([1, 8]))
+                    // Labels stay on one line and the row wraps instead, so a
+                    // long option ("Select Multiple Text") moves to the next
+                    // line rather than being squeezed until its text spills
+                    // out of its border.
+                    col.push(container(r.wrap().vertical_spacing(BUTTON_GAP)).padding(LINE_PAD))
                 } else {
-                    col.push(container(entry_text(entry.text.clone())).padding([1, 8]))
+                    col.push(container(entry_text(entry.text.clone())).padding(LINE_PAD))
                 }
             });
-        let prompt = container(text(crate::tr!("command-line", "label")).size(11).style(
-            |theme: &Theme| {
-                let p = theme.palette();
-                let color = accessible_accent_threshold(
-                    p.success.base.color,
-                    p.background.base.color,
-                    p.background.base.text,
-                    4.5,
-                );
-                iced::widget::text::Style {
-                    color: Some(color),
-                }
-            },
-        ))
-        .padding([5, 8]);
+        let prompt = container(
+            text(crate::tr!("command-line", "label"))
+                .size(self.font_size)
+                .font(self.font)
+                .style(|theme: &Theme| {
+                    let p = theme.palette();
+                    let color = accessible_accent_threshold(
+                        p.success.base.color,
+                        crate::ui::style::chrome::surface(theme),
+                        crate::ui::style::chrome::text(theme),
+                        4.5,
+                    );
+                    iced::widget::text::Style { color: Some(color) }
+                }),
+        )
+        .padding(PROMPT_PAD);
         // Literal-space toggle: while active, every line behaves as if it
         // started with `>` — Space stays in the line instead of submitting, so
         // arguments with spaces (text strings, paths, `UCS Z 90` as one line)
         // can be typed. Persists until toggled off; a hand-typed leading `>`
         // lights the button too (same mode, one line only).
         let literal_active = self.literal_spaces || self.input.starts_with('>');
-        let literal_btn = button(text(">").size(11))
+        let literal_btn = button(text(">").size(ui_text::UI))
             .on_press(Message::CommandLiteralToggle)
-            .padding([2, 6])
+            .padding(BUTTON_PAD)
             .style(move |theme: &Theme, status| {
-                let palette = theme.palette();
                 let pair = if literal_active {
-                    palette.primary.weak
+                    iced::theme::palette::Pair::new(
+                        crate::ui::style::chrome::lit(theme),
+                        crate::ui::style::chrome::strong(theme),
+                    )
                 } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-                    palette.background.weak
+                    iced::theme::palette::Pair::new(
+                        crate::ui::style::chrome::hover(theme),
+                        crate::ui::style::chrome::strong(theme),
+                    )
                 } else {
-                    palette.background.weakest
+                    iced::theme::palette::Pair::new(
+                        crate::ui::style::chrome::surface_raised(theme),
+                        crate::ui::style::chrome::text(theme),
+                    )
                 };
                 button::Style {
                     background: Some(Background::Color(pair.color)),
                     text_color: pair.text,
                     border: Border {
-                        color: palette.background.neutral.color,
-                        width: 1.0,
+                        color: crate::ui::style::chrome::border(theme),
+                        width: km::line(),
                         radius: 3.0.into(),
                     },
                     ..Default::default()
                 }
             });
-        let literal_tip = container(text(crate::tr!("command-line", "literal-spaces")).size(11))
-            .padding([3, 6])
-            .style(container::bordered_box);
-        let literal_btn = tooltip(literal_btn, literal_tip, tooltip::Position::Top).gap(4);
+        let literal_btn = crate::ui::kit::tooltip(
+            literal_btn,
+            crate::tr!("command-line", "literal-spaces"),
+            crate::ui::kit::TipPosition::Top,
+        );
         // While dynamic input is capturing keystrokes, the command-line
         // text field is left without an `on_input` handler so it can't
         // grab focus or swallow numeric keys — those flow through the
@@ -788,14 +1175,28 @@ impl CommandLine {
         if !dyn_capturing {
             input = input
                 .on_input(Message::CommandInput)
+                .on_paste(|buffer| {
+                    if is_svg_markup(&buffer) {
+                        Message::CommandPasteMarkup
+                    } else {
+                        Message::CommandInput(buffer)
+                    }
+                })
                 .on_submit(Message::CommandSubmit);
         }
-        let input = input.size(11).padding(Padding {
-            top: 4.0,
-            right: 30.0,
-            bottom: 4.0,
-            left: 6.0,
-        });
+        let input = input
+            .size(self.font_size)
+            .font(self.font)
+            .padding(Padding {
+                top: 4.0,
+                right: 30.0,
+                bottom: 4.0,
+                left: 6.0,
+            })
+            .style(|theme: &Theme, status| text_input::Style {
+                value: text_color(theme),
+                ..text_input::default(theme, status)
+            });
         // Autocomplete suggestions panel, shown above the input row
         // when the user has typed a prefix that matches at least one
         // command. Each row is a button — clicking it dispatches the
@@ -809,30 +1210,115 @@ impl CommandLine {
                 let mut col = column![].spacing(0).width(Length::Fill);
                 for (idx, cmd) in matches.iter().enumerate() {
                     let is_selected = idx == cursor;
-                    // Every row keeps the icon's width so names line up.
-                    let icon: Element<'_, Message> =
-                        match crate::modules::registry::command_icon(cmd) {
+                    let details = self.contextual_suggestions.get(idx);
+
+                    let mut label = row![].spacing(ITEM_GAP).align_y(iced::Center);
+
+                    if let Some(details) = details {
+                        if let Some(visible) = details.visible {
+                            label = label.push(crate::ui::icons::semantic(
+                                crate::ui::icons::layer_visible(visible),
+                                14.0,
+                            ));
+                        }
+
+                        if let Some(frozen) = details.frozen {
+                            label = label.push(crate::ui::icons::semantic(
+                                crate::ui::icons::layer_freeze(frozen),
+                                14.0,
+                            ));
+                        }
+
+                        if let Some(locked) = details.locked {
+                            label = label.push(crate::ui::icons::semantic(
+                                crate::ui::icons::layer_lock(locked),
+                                14.0,
+                            ));
+                        }
+
+                        if let Some(color) = details.color {
+                            let swatch_color =
+                                crate::ui::window::layers::iced_color_from_acad(&color);
+
+                            let swatch = container(text(""))
+                                .style(move |theme: &Theme| container::Style {
+                                    background: Some(Background::Color(swatch_color)),
+                                    border: Border {
+                                        color: crate::ui::style::chrome::border(theme),
+                                        width: km::line(),
+                                        radius: 1.0.into(),
+                                    },
+                                    ..Default::default()
+                                })
+                                .width(SWATCH)
+                                .height(SWATCH);
+
+                            label = label.push(swatch);
+                        }
+                    } else {
+                        // Normal command autocomplete keeps its existing command icon,
+                        // falling back to the target command's icon for aliases.
+                        let icon_bytes =
+                            crate::modules::registry::command_icon(cmd).or_else(|| {
+                                self.command_aliases.get(cmd.as_str()).and_then(|target| {
+                                    crate::modules::registry::command_icon(target)
+                                })
+                            });
+                        let icon: Element<'_, Message> = match icon_bytes {
                             Some(bytes) => crate::ui::icons::semantic(bytes, 14.0),
-                            None => Space::new().width(14.0).into(),
+                            None => Space::new().width(ICON_SLOT).into(),
                         };
-                    let label = row![icon, text(cmd.clone()).size(11)]
-                        .spacing(6)
-                        .align_y(iced::Center);
+
+                        label = label.push(icon);
+                    }
+
+                    label = label.push(text(cmd.clone()).size(ui_text::UI));
+                    if details.is_none() {
+                        let target = self.command_aliases.get(cmd.as_str()).map(String::as_str);
+                        if let Some(summary) =
+                            crate::command::command_summary(target.unwrap_or(cmd))
+                        {
+                            label = label.push(
+                                text(summary)
+                                    .size(ui_text::UI)
+                                    .wrapping(iced::widget::text::Wrapping::None)
+                                    .style(move |theme: &Theme| {
+                                        let base = if is_selected {
+                                            crate::ui::style::chrome::strong(theme)
+                                        } else {
+                                            crate::ui::style::chrome::text(theme)
+                                        };
+                                        iced::widget::text::Style {
+                                            color: Some(Color { a: 0.7, ..base }),
+                                        }
+                                    }),
+                            );
+                        }
+                    }
+
                     let row = button(label)
                         .on_press(Message::CommandSuggestionPick(cmd.clone()))
                         .width(Length::Fill)
-                        .padding([2, 8])
+                        .padding(ROW_PAD)
                         .style(move |theme: &Theme, status| {
-                            let palette = theme.palette();
                             let pair = if is_selected {
-                                palette.primary.weak
+                                iced::theme::palette::Pair::new(
+                                    crate::ui::style::chrome::lit(theme),
+                                    crate::ui::style::chrome::strong(theme),
+                                )
                             } else if matches!(
                                 status,
                                 button::Status::Hovered | button::Status::Pressed
                             ) {
-                                palette.background.weak
+                                iced::theme::palette::Pair::new(
+                                    crate::ui::style::chrome::hover(theme),
+                                    crate::ui::style::chrome::strong(theme),
+                                )
                             } else {
-                                palette.background.base
+                                iced::theme::palette::Pair::new(
+                                    crate::ui::style::chrome::surface(theme),
+                                    crate::ui::style::chrome::text(theme),
+                                )
                             };
                             button::Style {
                                 background: Some(Background::Color(pair.color)),
@@ -864,7 +1350,7 @@ impl CommandLine {
         let dropdown_btn = button(dropdown_icon)
             .on_press(Message::CommandHistoryToggle)
             .style(button::text)
-            .padding([4, 8]);
+            .padding(LIST_PAD);
         let input_with_history = stack![
             input,
             container(dropdown_btn)
@@ -875,44 +1361,89 @@ impl CommandLine {
         ]
         .width(Length::Fill);
         let (mcp_tooltip, mcp_color) = mcp_status(control_enabled, control_busy, pick_pending);
-        let mcp_btn = button(text("MCP").size(11))
+        let mcp_btn = button(text("MCP").size(ui_text::UI))
             .on_press(Message::ControlToggle)
             .style(move |theme: &Theme, status| {
+                let mcp_color = mcp_color(theme);
                 let mut style = button::subtle(theme, status);
                 style.background = Some(Background::Color(mcp_color));
                 style.text_color = Color::from_rgb(0.08, 0.08, 0.10);
                 style.border.color = mcp_color;
-                style.border.width = 1.0;
+                style.border.width = km::line();
                 style
             })
-            .padding([2, 6]);
-        let mcp_tip = container(text(t!(mcp_tooltip)).size(11))
-            .padding([3, 6])
-            .style(container::bordered_box);
-        let mcp_btn = container(tooltip(mcp_btn, mcp_tip, tooltip::Position::Top).gap(4))
-            .padding(Padding {
-                top: 0.0,
-                right: 6.0,
-                bottom: 0.0,
-                left: 0.0,
-            });
-        let graph_btn = button(crate::ui::icons::themed(crate::ui::icons::NODE_GRAPH, 13.0))
-            .on_press(Message::Graph(crate::ui::node_graph::GraphMsg::Toggle))
-            .style(move |theme: &Theme, status| {
-                if graph_open {
-                    button::primary(theme, status)
-                } else {
-                    button::subtle(theme, status)
-                }
-            })
-            .padding([2, 6]);
-        let graph_tip = container(text(t!("Node graph")).size(11))
-            .padding([3, 6])
-            .style(container::bordered_box);
-        let graph_btn = tooltip(graph_btn, graph_tip, tooltip::Position::Top).gap(4);
-        let input_row = row![prompt, literal_btn, input_with_history, graph_btn, mcp_btn]
-            .spacing(4)
-            .align_y(iced::Center);
+            .padding(BUTTON_PAD);
+        let mcp_btn =
+            crate::ui::kit::tooltip(mcp_btn, t!(mcp_tooltip), crate::ui::kit::TipPosition::Top);
+        let mcp_copy_btn = button(crate::ui::icons::themed(
+            crate::ui::icons::COPY,
+            km::BAR_ICON,
+        ))
+        .on_press(Message::ControlCopySetup)
+        .style(crate::ui::kit::flat_button_style(false))
+        .padding([km::LINE * 2.0, km::TOOL_GAP]);
+        let mcp_copy_btn = crate::ui::kit::tooltip(
+            mcp_copy_btn,
+            t!("Copy MCP client setup"),
+            crate::ui::kit::TipPosition::Top,
+        );
+        let mcp_btn = container(
+            row![mcp_btn, mcp_copy_btn]
+                .spacing(BUTTON_GAP)
+                .align_y(iced::Center),
+        )
+        .padding(Padding {
+            top: 0.0,
+            right: 6.0,
+            bottom: 0.0,
+            left: 0.0,
+        });
+        let graph_btn = button(crate::ui::icons::themed(
+            crate::ui::icons::NODE_GRAPH,
+            km::BAR_ICON,
+        ))
+        .on_press(Message::Graph(crate::ui::node_graph::GraphMsg::Toggle))
+        .style(crate::ui::kit::flat_button_style(graph_open))
+        .padding([km::LINE * 2.0, km::TOOL_GAP]);
+        let graph_btn = crate::ui::kit::tooltip(
+            graph_btn,
+            t!("Node graph"),
+            crate::ui::kit::TipPosition::Top,
+        );
+        // Enter without a keyboard (touch screens): the same as the context
+        // menu's Enter.
+        let enter_btn = button(crate::ui::icons::themed(
+            crate::ui::icons::CHECK,
+            km::BAR_ICON,
+        ))
+        .on_press(Message::CommandFinalize)
+        .style(crate::ui::kit::flat_button_style(false))
+        .padding([km::LINE * 2.0, km::TOOL_GAP]);
+        let enter_btn =
+            crate::ui::kit::tooltip(enter_btn, t!("Enter"), crate::ui::kit::TipPosition::Top);
+        // Drag to float the command line elsewhere; double-click docks it.
+        let move_grip = crate::ui::kit::tooltip(
+            iced::widget::mouse_area(
+                container(crate::ui::icons::themed(crate::ui::icons::MOVE, km::BAR_ICON))
+                    .padding([km::LINE * 2.0, km::TOOL_GAP]),
+            )
+            .on_press(Message::CommandLineMoveGrab)
+            .on_double_click(Message::CommandLineDock)
+            .interaction(iced::mouse::Interaction::Grab),
+            t!("Drag to move; double-click to dock"),
+            crate::ui::kit::TipPosition::Top,
+        );
+        let input_row = row![
+            move_grip,
+            prompt,
+            literal_btn,
+            input_with_history,
+            enter_btn,
+            graph_btn,
+            mcp_btn
+        ]
+        .spacing(km::TOOL_GAP)
+        .align_y(iced::Center);
 
         // Full backlog dropdown — appears ABOVE the input pill when open. The
         // whole log is rendered in ONE read-only `text_editor` (backed by
@@ -927,63 +1458,77 @@ impl CommandLine {
                 .clamp(HISTORY_HEIGHT_MIN, history_max_height(window_height));
             let log = text_editor(history_content)
                 .on_action(Message::CommandHistoryEdit)
-                .size(11)
-                .padding([2, 8])
+                .size(ui_text::UI)
+                .padding(ROW_PAD)
                 .height(Length::Shrink)
                 .highlight_with::<HistoryHighlighter>(
                     self.history_highlight_settings(),
                     history_highlight_format,
                 )
-                .style(|theme: &Theme, _status| {
-                    let palette = theme.palette();
-                    text_editor::Style {
-                        background: Background::Color(palette.background.base.color),
-                        border: Border::default(),
-                        placeholder: palette.background.base.text.scale_alpha(0.72),
-                        value: palette.background.base.text,
-                        selection: palette.primary.base.color.scale_alpha(0.5),
-                    }
+                .style(|theme: &Theme, _status| text_editor::Style {
+                    background: Background::Color(crate::ui::style::chrome::surface(theme)),
+                    border: Border::default(),
+                    placeholder: crate::ui::style::readable::hint_text(theme),
+                    value: crate::ui::style::chrome::text(theme),
+                    selection: crate::ui::style::chrome::accent(theme).scale_alpha(0.5),
                 });
             let log = scrollable(log)
                 .id(iced::widget::Id::new(HISTORY_SCROLL_ID))
                 .height(Length::Fixed(history_height))
                 .direction(scrollable::Direction::Vertical(
-                    scrollable::Scrollbar::new().width(8).scroller_width(6),
+                    scrollable::Scrollbar::new()
+                        .width(km::SCROLL_THUMB_W + 2.0 * km::LINE)
+                        .scroller_width(km::SCROLL_THUMB_W),
                 ))
                 .anchor_bottom();
             // Header strip: a Copy-all and a Clear button pinned above the log.
             let copy_btn = button(
                 row![
                     crate::ui::icons::themed_success(crate::ui::icons::COPY, 11.0),
-                    text(t!("Copy")).size(11),
+                    text(t!("Copy")).size(ui_text::UI),
                 ]
-                .spacing(4)
+                .spacing(km::TOOL_GAP)
                 .align_y(iced::Center),
             )
             .on_press(Message::CommandHistoryCopy)
             .style(header_btn_style)
-            .padding([2, 6]);
+            .padding(BUTTON_PAD);
             let clear_btn = button(
                 row![
                     crate::ui::icons::themed_warning(crate::ui::icons::TRASH, 11.0),
-                    text(t!("Clear")).size(11),
+                    text(t!("Clear")).size(ui_text::UI),
                 ]
-                .spacing(4)
+                .spacing(km::TOOL_GAP)
                 .align_y(iced::Center),
             )
             .on_press(Message::CommandHistoryClear)
             .style(header_btn_style)
-            .padding([2, 6]);
+            .padding(BUTTON_PAD);
+            // Collapses the console back to the single input line (#1094).
+            let collapse_btn = button(crate::ui::icons::themed_arrow_down(11.0))
+                .on_press(Message::CommandHistoryToggle)
+                .style(header_btn_style)
+                .padding(BUTTON_PAD);
             let header = container(
-                row![Space::new().width(Length::Fill), copy_btn, clear_btn]
-                    .spacing(6)
-                    .align_y(iced::Center),
+                row![
+                    Space::new().width(Length::Fill),
+                    copy_btn,
+                    clear_btn,
+                    collapse_btn
+                ]
+                .spacing(ITEM_GAP)
+                .align_y(iced::Center),
             )
             .width(Length::Fill)
-            .padding([2, 8]);
+            .padding(ROW_PAD);
             let panel = container(column![header, log])
                 .width(Length::Fill)
-                .padding(Padding { top: 2.0, right: 8.0, bottom: 4.0, left: 8.0 });
+                .padding(Padding {
+                    top: 2.0,
+                    right: 8.0,
+                    bottom: 4.0,
+                    left: 8.0,
+                });
             let resize = iced::widget::mouse_area(
                 container(crate::ui::icons::themed_primary(
                     crate::ui::icons::RESIZE,
@@ -1002,7 +1547,7 @@ impl CommandLine {
                     .align_x(iced::alignment::Horizontal::Left)
                     .align_y(iced::alignment::Vertical::Top),
             ];
-            opaque(panel).into()
+            opaque(panel)
         } else {
             container(column![]).height(0).into()
         };
@@ -1010,17 +1555,24 @@ impl CommandLine {
         // The transient recent lines and the full archive are two views of the
         // same history. Showing both while the archive is open creates a fake
         // second history region and visually disconnects the input row (#555).
+        let opacity = f32::from(self.opacity_percent) / 100.0;
         let recent_history: Element<'a, Message> = if self.history_open || !has_recent_history {
             container(column![]).height(0).into()
         } else {
-            container(history_rows)
-                .style(|theme: &Theme| container::Style {
-                    background: Some(Background::Color(theme.palette().background.base.color)),
-                    ..Default::default()
-                })
-                .width(Length::Fill)
-                .padding([2, 0])
-                .into()
+            iced::widget::mouse_area(
+                container(history_rows)
+                    .style(move |theme: &Theme| container::Style {
+                        background: Some(Background::Color(
+                            crate::ui::style::chrome::surface(theme).scale_alpha(opacity),
+                        )),
+                        ..Default::default()
+                    })
+                    .width(Length::Fill)
+                    .padding([2.0 * km::LINE, 0.0]),
+            )
+            .on_enter(Message::CommandHistoryHover(true))
+            .on_exit(Message::CommandHistoryHover(false))
+            .into()
         };
         let history_divider: Element<'a, Message> = if self.history_open {
             rule::horizontal(1).into()
@@ -1036,31 +1588,31 @@ impl CommandLine {
                 recent_history,
                 history_divider,
                 container(input_row)
-                    .style(|theme: &Theme| {
-                        let palette = theme.palette();
+                    .style(move |theme: &Theme| {
+                        let color =
+                            crate::ui::style::chrome::surface_raised(theme).scale_alpha(opacity);
                         container::Style {
-                            background: Some(Background::Color(palette.background.weakest.color)),
+                            background: Some(Background::Color(color)),
                             ..Default::default()
                         }
                     })
                     .width(Length::Fill)
                     // Match the drawing tab bar / status bar height, and vertically
                     // centre the prompt/input/dropdown within it (issue #216).
-                    .center_y(Length::Fixed(30.0)),
+                    .center_y(Length::Fixed(BAR_H)),
             ]
             .width(Length::Fill),
         )
-        .style(move |theme: &Theme| {
-            let palette = theme.palette();
-            container::Style {
-                background: Some(Background::Color(palette.background.base.color)),
-                border: Border {
-                    color: palette.background.neutral.color,
-                    width: if history_open { 1.0 } else { 0.0 },
-                    radius: 4.0.into(),
-                },
-                ..Default::default()
-            }
+        .style(move |theme: &Theme| container::Style {
+            background: Some(Background::Color(
+                crate::ui::style::chrome::surface(theme).scale_alpha(opacity),
+            )),
+            border: Border {
+                color: crate::ui::style::chrome::border(theme),
+                width: if history_open { km::line() } else { 0.0 },
+                radius: 4.0.into(),
+            },
+            ..Default::default()
         })
         .width(Length::Fill.max(720.0))
         .into()
@@ -1125,36 +1677,67 @@ pub fn ranked_matches(
 /// Flat button style for the history dropdown's Copy / Clear strip: a subtle
 /// filled pill that brightens on hover.
 fn header_btn_style(theme: &Theme, status: button::Status) -> button::Style {
-    let palette = theme.palette();
     let pair = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-        palette.background.weak
+        iced::theme::palette::Pair::new(
+            crate::ui::style::chrome::hover(theme),
+            crate::ui::style::chrome::strong(theme),
+        )
     } else {
-        palette.background.weakest
+        iced::theme::palette::Pair::new(
+            crate::ui::style::chrome::surface_raised(theme),
+            crate::ui::style::chrome::text(theme),
+        )
     };
     button::Style {
         background: Some(Background::Color(pair.color)),
         text_color: pair.text,
         border: Border {
-            color: palette.background.neutral.color,
-            width: 1.0,
+            color: crate::ui::style::chrome::border(theme),
+            width: km::line(),
             radius: 3.0.into(),
         },
         ..Default::default()
     }
 }
 
+/// The user's command-line text colour, packed `0x01RRGGBB`; 0 keeps the
+/// theme's. Global because the history highlighter takes a plain `fn`.
+static TEXT_COLOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_text_color(rgb: Option<[u8; 3]>) {
+    let packed = rgb.map_or(0, |[r, g, b]| 1 << 24 | u32::from_be_bytes([0, r, g, b]));
+    TEXT_COLOR.store(packed, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn user_text_color() -> Option<Color> {
+    match TEXT_COLOR.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        packed => {
+            let [_, r, g, b] = packed.to_be_bytes();
+            Some(Color::from_rgb8(r, g, b))
+        }
+    }
+}
+
+fn text_color(theme: &Theme) -> Color {
+    user_text_color().unwrap_or(crate::ui::style::chrome::text(theme))
+}
+
 fn history_color(theme: &Theme, kind: &EntryKind) -> Color {
     let palette = theme.palette();
     match kind {
-        EntryKind::Command => palette.background.base.text,
-        EntryKind::Output => palette.background.base.text.scale_alpha(0.72),
+        EntryKind::Command => text_color(theme),
+        EntryKind::Output | EntryKind::Table => text_color(theme).scale_alpha(0.72),
         EntryKind::Error => palette.danger.base.color,
-        EntryKind::Info => accessible_accent_threshold(
-            palette.primary.base.color,
-            palette.background.base.color,
-            palette.background.base.text,
-            4.5,
-        ),
+        EntryKind::Warning => palette.warning.base.color,
+        EntryKind::Info => user_text_color().unwrap_or_else(|| {
+            accessible_accent_threshold(
+                crate::ui::style::chrome::accent(theme),
+                crate::ui::style::chrome::surface(theme),
+                crate::ui::style::chrome::text(theme),
+                4.5,
+            )
+        }),
     }
 }
 
@@ -1165,7 +1748,10 @@ fn history_highlight_format(
     iced::advanced::text::highlighter::Format {
         color: Some(history_color(theme, kind)),
         font: match kind {
-            EntryKind::Error => Some(iced::Font::DEFAULT.weight(iced::font::Weight::Bold)),
+            EntryKind::Error | EntryKind::Warning => {
+                Some(iced::Font::DEFAULT.weight(iced::font::Weight::Bold))
+            }
+            EntryKind::Table => Some(iced::Font::MONOSPACE),
             _ => None,
         },
     }
@@ -1193,7 +1779,7 @@ mod tests {
         let revision = line.error_revision;
         line.push_warning("GPU unavailable");
         let last = line.history.last().expect("warning must be appended");
-        assert_eq!(last.kind, super::EntryKind::Error);
+        assert_eq!(last.kind, super::EntryKind::Warning);
         assert!(last.text.ends_with("GPU unavailable"), "{}", last.text);
         assert_eq!(line.error_revision, revision);
         assert!(line.last_error.is_none());
@@ -1229,6 +1815,16 @@ mod tests {
     fn builtin_commands_still_match_with_an_empty_pool() {
         let m = ranked_matches("LINE", &[], &FxHashMap::default());
         assert!(m.iter().any(|c| c == "LINE"), "got {m:?}");
+    }
+
+    #[test]
+    fn submit_uppercases_only_the_command_verb() {
+        let mut line = CommandLine::new();
+        line.input = "open /home/u/My.dwg --PluginArg".to_string();
+        assert_eq!(
+            line.submit().as_deref(),
+            Some("OPEN /home/u/My.dwg --PluginArg")
+        );
     }
 
     #[test]
@@ -1357,12 +1953,15 @@ mod tests {
     }
 
     #[test]
-    fn error_history_uses_bold_highlight_format() {
+    fn error_and_warning_history_use_bold_highlight_format() {
         let theme = iced::Theme::Light;
         let bold = iced::Font::DEFAULT.weight(iced::font::Weight::Bold);
+        for kind in [EntryKind::Error, EntryKind::Warning] {
+            assert_eq!(history_highlight_format(&kind, &theme).font, Some(bold));
+        }
         assert_eq!(
-            history_highlight_format(&EntryKind::Error, &theme).font,
-            Some(bold)
+            history_highlight_format(&EntryKind::Warning, &theme).color,
+            Some(theme.palette().warning.base.color)
         );
         for kind in [EntryKind::Command, EntryKind::Info, EntryKind::Output] {
             assert_eq!(history_highlight_format(&kind, &theme).font, None);
@@ -1431,17 +2030,20 @@ mod tests {
     }
 
     #[test]
-    fn commandline_fade_zero_hides_unpinned_but_keeps_pinned() {
+    fn commandline_fade_zero_never_fades() {
         let mut line = CommandLine::new();
         line.push_info("transient");
         assert!(line.has_visible_history());
+        assert!(line.has_expiring_history());
         line.set_commandline_fade_ms(0);
-        // Non-pinned entries are skipped entirely at 0.
-        assert!(!line.has_visible_history());
-        assert_eq!(line.visible_history_count(), 0);
+        // At 0, entries never fade so history stays visible, but no timer tick is needed.
+        assert!(line.has_visible_history());
+        assert_eq!(line.visible_history_count(), 3);
+        assert!(!line.has_expiring_history());
         // Pinned step prompt still shows at 0.
         line.set_step_prompt(Some("Specify point:".to_string()));
         assert!(line.has_visible_history());
+        assert!(!line.has_expiring_history());
     }
 
     #[test]
@@ -1473,5 +2075,35 @@ mod tests {
         let last = line.history.last().unwrap();
         assert!(last.pinned);
         assert_eq!(last.text, "ⓘ Specify first point:");
+    }
+}
+
+/// `Enter new value for NAME <current>:`, the one prompt every variable asks
+/// its value with, through one catalog entry so it is translated everywhere.
+pub fn value_prompt(name: &str, current: &dyn std::fmt::Display) -> String {
+    let current = current.to_string();
+    crate::tf!("Enter new value for {name} <{current}>:").into_owned()
+}
+
+/// [`value_prompt`] for a name-valued variable that `.` clears.
+pub fn value_prompt_or_none(name: &str, current: &dyn std::fmt::Display) -> String {
+    let current = current.to_string();
+    crate::tf!("Enter new value for {name}, or . for none <\"{current}\">:").into_owned()
+}
+
+/// [`value_prompt`] for a variable with no value to offer.
+pub fn value_prompt_bare(name: &str) -> String {
+    crate::tf!("Enter new value for {name}:").into_owned()
+}
+
+#[cfg(test)]
+mod svg_paste_tests {
+    #[test]
+    fn copied_svg_is_markup_and_commands_are_not() {
+        assert!(super::is_svg_markup(
+            r#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"></svg>"#
+        ));
+        assert!(!super::is_svg_markup("LINE"));
+        assert!(!super::is_svg_markup("TEXT <value>"));
     }
 }

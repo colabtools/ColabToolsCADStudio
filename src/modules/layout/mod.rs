@@ -1,7 +1,9 @@
 // Layout module — paper space tools (viewports, scale, plot settings).
 // This tab is only shown when the active layout is not "Model".
 
+pub mod alignspace;
 pub mod mview;
+pub mod mvsetup;
 pub mod vplayer;
 
 use crate::modules::{CadModule, IconKind, ModuleEvent, RibbonGroup, ToolDef};

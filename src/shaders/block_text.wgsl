@@ -15,6 +15,15 @@ struct Uniforms {
 @group(1) @binding(0) var atlas_tex: texture_2d<f32>;
 @group(1) @binding(1) var atlas_samp: sampler;
 
+// Atlas texels per glyph unit and the field's half range in glyph units
+// (scene::text::sdf_atlas PX_PER_UNIT / SPREAD_UNITS).
+const PX_PER_UNIT: f32 = 6.0;
+const SPREAD_UNITS: f32 = 1.5;
+// Zoomed in past the atlas, the filtered field reads a stroke's centreline up
+// to about 0.6 texel off (sdf_atlas test zoomed_in_stroke_centreline_*), so
+// the centreline keeps at least this half-width (glyph units) to stay whole.
+const CENTRELINE_FLOOR_UNITS: f32 = 0.11;
+
 struct VertIn {
     @location(0) pos: vec3<f32>,
     @location(1) pos_low: vec3<f32>,
@@ -24,33 +33,43 @@ struct VertIn {
     @location(5) translation: vec3<f32>,
     @location(6) translation_low: vec3<f32>,
     @location(7) instance_depth: f32,
+    @location(8) pen: f32,
 }
 
 struct VertOut {
-    @builtin(position) clip_pos: vec4<f32>,
+    @invariant @builtin(position) clip_pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) @interpolate(flat) pen: f32,
 }
 
 @vertex
 fn vs_main(v: VertIn) -> VertOut {
     var out: VertOut;
-    let rel = (v.pos + v.translation - u.eye_high)
+    let rel = (v.pos - u.eye_high + v.translation)
         + (v.pos_low + v.translation_low - u.eye_low);
     out.clip_pos = u.view_rot * vec4<f32>(rel, 1.0);
     out.clip_pos = apply_draw_order(out.clip_pos, v.source_depth + v.instance_depth);
     out.uv = v.uv;
     out.color = v.color;
+    out.pen = v.pen;
     return out;
 }
 
+// The height, in texels, atlas V coordinates are baked against
+// (`sdf_atlas::MAX_ATLAS_PX`).
+const ATLAS_V_EXTENT: f32 = 8192.0;
+
 @fragment
 fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
-    let uv_dx = dpdx(in.uv);
-    let uv_dy = dpdy(in.uv);
     let dims = vec2<f32>(textureDimensions(atlas_tex));
+    // V is baked against the atlas's largest height, so a growth leaves
+    // every glyph quad valid; the texture is only as tall as it has grown.
+    let uv = vec2<f32>(in.uv.x, in.uv.y * ATLAS_V_EXTENT / dims.y);
+    let uv_dx = dpdx(uv);
+    let uv_dy = dpdy(uv);
     let footprint = max(length(uv_dx * dims), length(uv_dy * dims));
-    let sd_center = textureSampleLevel(atlas_tex, atlas_samp, in.uv, 0.0).r;
+    let sd_center = textureSampleLevel(atlas_tex, atlas_samp, uv, 0.0).r;
     let aa = max(fwidth(sd_center), 1e-4);
     var alpha = smoothstep(0.5 - aa, 0.5 + aa, sd_center);
 
@@ -62,12 +81,23 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
             for (var x = 0; x < samples; x += 1) {
                 let offset = (vec2<f32>(f32(x), f32(y)) + 0.5) / f32(samples) - 0.5;
                 let sd = textureSampleLevel(
-                    atlas_tex, atlas_samp, in.uv + uv_dx * offset.x + uv_dy * offset.y, 0.0
+                    atlas_tex, atlas_samp, uv + uv_dx * offset.x + uv_dy * offset.y, 0.0
                 ).r;
                 sum += smoothstep(0.5 - aa, 0.5 + aa, sd);
             }
         }
         alpha = sum / f32(samples * samples);
+    }
+    if in.pen > 0.0 {
+        // Stroke fonts have no width of their own: once the baked pen band
+        // is wider than a pixel, draw the centreline one pixel wide (the
+        // field holds pen - distance, SPREAD_UNITS per half range).
+        let units_per_px = max(footprint, 1e-4) / PX_PER_UNIT;
+        if in.pen > 0.5 * units_per_px {
+            let from_centre = in.pen - (sd_center - 0.5) * 2.0 * SPREAD_UNITS;
+            let half_width = max(0.5 * units_per_px, CENTRELINE_FLOOR_UNITS);
+            alpha = clamp((half_width - abs(from_centre)) / units_per_px + 0.5, 0.0, 1.0);
+        }
     }
     if alpha <= 0.0 {
         discard;

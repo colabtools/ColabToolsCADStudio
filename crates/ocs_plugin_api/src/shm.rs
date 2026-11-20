@@ -3,7 +3,7 @@
 //! The host owns a memory-mapped file that contains a small, read-only,
 //! rkyv-serialized view of the active document. The plugin maps the same file
 //! read-only and reads entity/layer data directly from the mapping without
-//! copying the full `CadDocument` into its own address space.
+//! copying the full `Document` into its own address space.
 //!
 //! This module is generic over the payload type so that the V3 simplified view
 //! and the V4 bincode-per-entity view can share the same double-buffered
@@ -29,7 +29,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
-use codec::{CadDocument, EntityType, Handle};
+use document::{Document, EntityType, Handle};
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use rkyv::{check_archived_root, to_bytes, Archive, Deserialize, Serialize};
 
@@ -42,7 +42,13 @@ const CONTROL_MAGIC: u32 = 0x4F_43_53_44; // "OCSD"
 /// `ControlPage` and aligned to a typical page boundary so the snapshot segments
 /// that follow are naturally aligned for rkyv.
 const CONTROL_SIZE: usize = 4096;
-const MAX_SNAPSHOT_SIZE: usize = 1024 * 1024 * 1024;
+/// The mapping is a sparse file sized to the drawing; this only guards
+/// against a corrupt size.
+const MAX_SNAPSHOT_SIZE: usize = if usize::BITS >= 64 {
+    64 * 1024 * 1024 * 1024
+} else {
+    1024 * 1024 * 1024
+};
 
 /// Information sent to the plugin so it can open the shared mapping.
 #[derive(Debug, Clone)]
@@ -69,11 +75,19 @@ pub trait SnapshotData: Clone + std::fmt::Debug + Send + Sync + 'static {
 }
 
 /// Host-side, file-backed double buffer for the document view.
+///
+/// The buffer's own control state is HOST-PRIVATE: the host tracks which
+/// segment is active in `shadow_active` and never derives it from the shared
+/// control page, so a plugin that scribbles into the control region cannot
+/// steer the host's next publication into arbitrary memory (it can only
+/// corrupt what the PLUGIN reads, which is the plugin's own problem).
 pub struct DocumentSnapshotStore<T: SnapshotData> {
     path: PathBuf,
     mmap: MmapMut,
     segment_size: usize,
     current_version: u64,
+    /// Host-private index of the currently published segment (0 or 1).
+    shadow_active: usize,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -108,19 +122,42 @@ impl<T: SnapshotData> DocumentSnapshotStore<T> {
         }
         static STORE_ID: AtomicUsize = AtomicUsize::new(0);
         let id = STORE_ID.fetch_add(1, Ordering::Relaxed);
-        let path = Self::temp_path(tab_id, id);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
-        #[cfg(unix)]
-        {
-            use std::fs::Permissions;
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(Permissions::from_mode(0o600))?;
+        // Exclusive creation under a CSPRNG-suffixed name: nobody can
+        // pre-create the path (an attacker's symlink is never followed —
+        // O_NOFOLLOW on Unix, atomic create-new semantics everywhere), and on
+        // Unix the file is owner-only outright instead of opened wide and
+        // chmodded afterwards. The snapshot path IS disclosed to the plugin,
+        // so a same-user plugin writing into a snapshot it was handed is
+        // expected; another user's process can no longer forge or hijack it.
+        let mut file = None;
+        let mut path = None;
+        for _ in 0..5 {
+            let candidate = Self::temp_path(tab_id, id);
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            match options.open(&candidate) {
+                Ok(f) => {
+                    file = Some(f);
+                    path = Some(candidate);
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
         }
+        let Some(file) = file else {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "cannot create a unique snapshot path",
+            ));
+        };
+        let path = path.expect("an opened file implies its path");
         file.set_len(total as u64)?;
 
         let mut mmap = unsafe { MmapOptions::new().len(total).map_mut(&file)? };
@@ -136,14 +173,19 @@ impl<T: SnapshotData> DocumentSnapshotStore<T> {
             mmap,
             segment_size,
             current_version: 0,
+            shadow_active: 0,
             _phantom: std::marker::PhantomData,
         })
     }
 
     fn temp_path(tab_id: u64, id: usize) -> PathBuf {
         let mut path = std::env::temp_dir();
+        let mut suffix = [0u8; 8];
+        if getrandom::getrandom(&mut suffix).is_err() {
+            suffix = [0u8; 8];
+        }
         path.push(format!(
-            "ocs_plugin_doc_v4_{}_{}_{}_{}.bin",
+            "ocs_plugin_doc_v4_{}_{}_{}_{}_{:016x}.bin",
             std::process::id(),
             tab_id,
             std::time::SystemTime::now()
@@ -151,6 +193,7 @@ impl<T: SnapshotData> DocumentSnapshotStore<T> {
                 .unwrap_or_default()
                 .as_millis(),
             id,
+            u64::from_le_bytes(suffix),
         ));
         path
     }
@@ -160,9 +203,18 @@ impl<T: SnapshotData> DocumentSnapshotStore<T> {
         &self.path
     }
 
+    /// The largest snapshot one segment holds.
+    pub fn segment_size(&self) -> usize {
+        self.segment_size
+    }
+
     /// Serialize `data` into the inactive segment and atomically publish it.
     pub fn publish(&mut self, data: &T) -> io::Result<()> {
-        let bytes = data.to_rkyv_bytes()?;
+        self.publish_bytes(&data.to_rkyv_bytes()?)
+    }
+
+    /// Publish bytes already serialized with [`SnapshotData::to_rkyv_bytes`].
+    pub fn publish_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
         if bytes.len() > self.segment_size {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
@@ -174,14 +226,12 @@ impl<T: SnapshotData> DocumentSnapshotStore<T> {
             ));
         }
 
-        let inactive = {
-            let control = ControlPage::from_bytes_mut(&mut self.mmap);
-            let active = control.active_segment.load(Ordering::Acquire) as usize;
-            1 - active
-        };
+        // The inactive segment comes from HOST-PRIVATE state, never from the
+        // shared control page (see the struct docs).
+        let inactive = 1 - self.shadow_active;
         let offset = CONTROL_SIZE + inactive * self.segment_size;
 
-        self.mmap[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        self.mmap[offset..offset + bytes.len()].copy_from_slice(bytes);
         let control = ControlPage::from_bytes_mut(&mut self.mmap);
         // Ensure the plugin sees the new length before it sees the new version.
         control
@@ -190,6 +240,7 @@ impl<T: SnapshotData> DocumentSnapshotStore<T> {
         control
             .active_segment
             .store(inactive as u8, Ordering::Release);
+        self.shadow_active = inactive;
         self.current_version = self.current_version.wrapping_add(1);
         control
             .version
@@ -197,11 +248,10 @@ impl<T: SnapshotData> DocumentSnapshotStore<T> {
         Ok(())
     }
 
-    /// Current published version.
+    /// Current published version (host-private; the shared control page is
+    /// written for readers but never trusted back by the host).
     pub fn version(&self) -> u64 {
-        ControlPage::from_bytes(&self.mmap)
-            .version
-            .load(Ordering::Acquire)
+        self.current_version
     }
 }
 
@@ -290,6 +340,17 @@ impl<T: SnapshotData> SharedDocumentReader<T> {
         let Ok(len) = usize::try_from(control.active_len.load(Ordering::Acquire)) else {
             return &[];
         };
+        // Re-latch the segment index: the host may have flipped segments
+        // between the two loads, which would splice one snapshot's length
+        // onto another segment's bytes.
+        let recheck = control.active_segment.load(Ordering::Acquire) as usize;
+        if recheck != active {
+            return &[];
+        }
+        // A torn or malicious length can never name more than one segment.
+        if len > self.segment_size {
+            return &[];
+        }
         let Some(offset) = active
             .checked_mul(self.segment_size)
             .and_then(|offset| CONTROL_SIZE.checked_add(offset))
@@ -413,8 +474,8 @@ pub struct DocumentViewData {
     pub entities: Vec<EntityView>,
 }
 
-impl From<&CadDocument> for DocumentViewData {
-    fn from(doc: &CadDocument) -> Self {
+impl From<&Document> for DocumentViewData {
+    fn from(doc: &Document) -> Self {
         Self {
             layers: doc.layers.iter().map(LayerView::from).collect(),
             app_ids: doc.app_ids.iter().map(AppIdView::from).collect(),
@@ -444,8 +505,8 @@ pub struct LayerView {
     pub name: String,
 }
 
-impl From<&codec::tables::Layer> for LayerView {
-    fn from(layer: &codec::tables::Layer) -> Self {
+impl From<&document::tables::Layer> for LayerView {
+    fn from(layer: &document::tables::Layer) -> Self {
         Self {
             handle: layer.handle.value(),
             name: layer.name.clone(),
@@ -460,8 +521,8 @@ pub struct AppIdView {
     pub name: String,
 }
 
-impl From<&codec::tables::AppId> for AppIdView {
-    fn from(app_id: &codec::tables::AppId) -> Self {
+impl From<&document::tables::AppId> for AppIdView {
+    fn from(app_id: &document::tables::AppId) -> Self {
         Self {
             handle: app_id.handle.value(),
             name: app_id.name.clone(),
@@ -539,8 +600,8 @@ impl ReaderEntityKind {
 // ── V4 full-entity document view ────────────────────────────────────────────
 
 /// Serializable V4 document view. The outer structure is rkyv; each entity's
-/// `data` is a bincode-encoded `codec::EntityType` so that the plugin can
-/// reconstruct the full typed entity without relying on opencadcodec's own rkyv
+/// `data` is a bincode-encoded `document::EntityType` so that the plugin can
+/// reconstruct the full typed entity without relying on document's own rkyv
 /// support.
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 #[archive(check_bytes)]
@@ -550,10 +611,10 @@ pub struct DocumentViewDataV4 {
     pub entities: Vec<EntityViewV4>,
 }
 
-impl From<&CadDocument> for DocumentViewDataV4 {
-    fn from(doc: &CadDocument) -> Self {
+impl From<&Document> for DocumentViewDataV4 {
+    fn from(doc: &Document) -> Self {
         let mut entities: Vec<_> = doc.entities().map(EntityViewV4::from).collect();
-        // ATTRIB records live inside their owning INSERT in CadDocument rather
+        // ATTRIB records live inside their owning INSERT in Document rather
         // than in the flat entity index. Flatten them into the plugin snapshot
         // as addressable entities while keeping the INSERT's canonical nested
         // copy intact for rendering and file serialization.
@@ -605,9 +666,9 @@ impl From<&EntityType> for EntityViewV4 {
 mod tests {
     use super::*;
     use crate::host::{DocumentReader, ReaderEntityKind};
-    use codec::entities::Point;
-    use codec::tables::Layer;
-    use codec::{CadDocument, EntityType};
+    use document::entities::Point;
+    use document::tables::Layer;
+    use document::{Document, EntityType};
 
     fn unique_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -621,8 +682,8 @@ mod tests {
         ))
     }
 
-    fn sample_doc() -> CadDocument {
-        let mut doc = CadDocument::new();
+    fn sample_doc() -> Document {
+        let mut doc = Document::new();
         doc.layers.add(Layer::new("SURVEY")).unwrap();
         let mut point = Point::from_coords(10.0, 20.0, 5.0);
         point.common.layer = "SURVEY".to_string();
@@ -630,7 +691,10 @@ mod tests {
         doc
     }
 
+    // NTFS allocates a file grown with set_len (it is sparse on Linux and
+    // macOS), and 64 GiB fills the CI runner's disk.
     #[test]
+    #[cfg_attr(windows, ignore = "allocates the whole oversized file on NTFS")]
     fn reader_rejects_oversized_snapshot() {
         let path = unique_path("oversized.bin");
         let file = OpenOptions::new()

@@ -13,14 +13,38 @@ use crate::app::Message;
 use crate::io::xref_model::Pathtype;
 use crate::t;
 use crate::ui::style::common::muted_style;
-use crate::ui::style::form::{button_style, dialog_button, field_style, form_radio};
+use crate::ui::style::form::{button_style, dialog_button, field_style, form_radio, LABEL_WIDTH};
 use crate::ui::window::block_definition::{group, labeled_checkbox};
+
+/// What the read for an attach's placement ghost found in a file: its
+/// model-space objects and units; none when the file was not read or holds
+/// too many objects for a ghost.
+pub type XrefPreviewRead = Option<(Vec<document::EntityType>, i16)>;
 
 /// One edit in the dialog.
 #[derive(Debug, Clone)]
 pub enum XrefAttachMsg {
     /// Name box: a reference already in the drawing, picked or typed.
     Name(String),
+    /// The read of the chosen file, made off the UI thread: the file, its
+    /// thumbnail and its units.
+    FileRead(Box<(String, (Option<image::Handle>, i16))>),
+    /// The reference's file, read off the UI thread for its attach: the tab
+    /// it was started for, that document's generation, and the request, its
+    /// INSERT and the read.
+    Read(
+        u64,
+        u64,
+        Box<(
+            crate::modules::insert::xattach::XrefAttachRequest,
+            document::EntityType,
+            crate::io::xref::XrefRead,
+        )>,
+    ),
+    /// The placement ghost's read, made off the UI thread: the drawing it
+    /// was asked for, that document's generation, the file, and what the
+    /// read found.
+    PreviewRead(u64, u64, Box<(String, XrefPreviewRead)>),
     Browse,
     Overlay(bool),
     ScaleOnScreen(bool),
@@ -152,7 +176,10 @@ fn number_field<'a>(
         field = field.on_input(on_input);
     }
     row![
-        text(label).size(11).style(muted_style).width(Length::Fixed(16.0)),
+        text(label)
+            .size(11)
+            .style(muted_style)
+            .width(Length::Fixed(16.0)),
         field
     ]
     .spacing(6)
@@ -236,18 +263,12 @@ pub fn view_window<'a>(
     let reference_type = group(
         t!("Reference Type").into_owned(),
         column![
-            form_radio(
-                t!("Attachment"),
-                false,
-                Some(state.overlay),
-                |v| msg(XrefAttachMsg::Overlay(v)),
-            ),
-            form_radio(
-                t!("Overlay"),
-                true,
-                Some(state.overlay),
-                |v| msg(XrefAttachMsg::Overlay(v)),
-            ),
+            form_radio(t!("Attachment"), false, Some(state.overlay), |v| msg(
+                XrefAttachMsg::Overlay(v)
+            ),),
+            form_radio(t!("Overlay"), true, Some(state.overlay), |v| msg(
+                XrefAttachMsg::Overlay(v)
+            ),),
         ]
         .spacing(6),
         Length::Shrink,
@@ -313,8 +334,10 @@ pub fn view_window<'a>(
     // ── Path type, rotation, block unit ─────────────────────────────────
     let path_type = group(
         t!("Path type").into_owned(),
-        pick_list(Some(state.path_type), PathTypeChoice::ALL, |choice| choice.to_string())
-            .on_select(|v| msg(XrefAttachMsg::PathType(v)))
+        pick_list(Some(state.path_type), PathTypeChoice::ALL, |choice| {
+            choice.to_string()
+        })
+        .on_select(|v| msg(XrefAttachMsg::PathType(v)))
         .text_size(11)
         .padding([3, 6])
         .width(Fill),
@@ -367,8 +390,12 @@ pub fn view_window<'a>(
         group(
             t!("Location").into_owned(),
             column![
-                read_only_field(t!("Found in:").into_owned(), &state.found_in, 92.0),
-                read_only_field(t!("Saved path:").into_owned(), &state.saved_path, 92.0),
+                read_only_field(t!("Found in:").into_owned(), &state.found_in, LABEL_WIDTH,),
+                read_only_field(
+                    t!("Saved path:").into_owned(),
+                    &state.saved_path,
+                    LABEL_WIDTH,
+                ),
             ]
             .spacing(5),
             Length::Shrink,
@@ -384,10 +411,11 @@ pub fn view_window<'a>(
         t!("Show Details")
     };
     let footer = row![
-        button(text(details_label).size(12))
-            .on_press(msg(XrefAttachMsg::Details(!state.details)))
-            .style(button::secondary)
-            .padding([6, 18]),
+        dialog_button(
+            details_label,
+            msg(XrefAttachMsg::Details(!state.details)),
+            false,
+        ),
         Space::new().width(Fill),
         dialog_button(t!("OK"), msg(XrefAttachMsg::Apply), true),
         dialog_button(t!("Cancel"), Message::CloseModal, false),

@@ -3,6 +3,32 @@
 version = 4
 
 [[package]]
+name = "acadrust"
+version = "0.6.8"
+source = "git+https://github.com/hakanaktt/acadrust.git?rev=a7d378502748e6428655aa091306f01f7f3a17a9#a7d378502748e6428655aa091306f01f7f3a17a9"
+dependencies = [
+ "anyhow",
+ "bitflags",
+ "byteorder",
+ "encoding_rs",
+ "flate2",
+ "foldhash",
+ "indexmap",
+ "itoa",
+ "memchr",
+ "memmap2",
+ "nom",
+ "oem_cp",
+ "once_cell",
+ "rayon",
+ "ryu",
+ "serde",
+ "thiserror 2.0.20",
+ "web-time",
+ "whichever",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -28,7 +54,6 @@ dependencies = [
  "cfg-if",
  "getrandom 0.3.4",
  "once_cell",
- "serde",
  "version_check",
  "zerocopy",
 ]
@@ -1235,15 +1260,26 @@ dependencies = [
  "cargo-lock",
  "getrandom 0.2.17",
  "interprocess",
+ "libc",
  "libloading 0.8.9",
  "memmap2",
- "opencadcodec",
+ "opencaddocument",
  "rkyv",
  "serde",
  "serde-reflection",
  "serde_bytes",
  "serde_json",
  "thiserror 1.0.69",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "oem_cp"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c7959d3349f484aec36462f98226983578bf7d33f9b034c32967489c7000e1f"
+dependencies = [
+ "phf 0.11.3",
 ]
 
 [[package]]
@@ -1254,7 +1290,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "opencad-python"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ocs_plugin_api",
  "rustpython-vm",
@@ -1263,26 +1299,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "opencadcodec"
-version = "0.5.5"
-source = "git+https://github.com/HakanSeven12/opencadcodec.git?rev=cdf2277#cdf227782acab8b0b7035d99ed02530a90ae6773"
+name = "opencaddocument"
+version = "0.1.0"
+source = "git+https://github.com/HakanSeven12/opencaddocument.git?rev=41b870fb4fb5fcd12afd2903118b8d0a326312c8#41b870fb4fb5fcd12afd2903118b8d0a326312c8"
 dependencies = [
- "ahash 0.8.12",
- "anyhow",
- "bitflags",
- "byteorder",
- "encoding_rs",
- "flate2",
- "indexmap",
- "itoa",
- "memmap2",
- "nom",
- "once_cell",
- "rayon",
- "ryu",
+ "acadrust",
  "serde",
- "thiserror 1.0.69",
- "web-time",
 ]
 
 [[package]]
@@ -2689,6 +2711,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bae2f2b2b816647a1cab1acc91f5bd20812d53cb344382635ec2181940c8034f"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "whichever"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68887c9512981e597d730f1d95b2eb6abdd53385e4e76c35a95e7121e16232b0"
+dependencies = [
+ "whichever-macros",
+]
+
+[[package]]
+name = "whichever-macros"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb15ad553239d9fdefac12e31e16c7682dc62a2106ba035aec69c5dd15835a7b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
 ]
 
 [[package]]

@@ -1,9 +1,7 @@
-use codec::entities::{Dimension, DimensionLinear};
-use codec::types::Vector3;
-use codec::EntityType;
-use kernel::geom2d::{
-    closest_point, Circle as KernelCircle, Curve, Line as KernelLine,
-};
+use document::entities::{Dimension, DimensionLinear};
+use document::types::Vector3;
+use document::EntityType;
+use ocs_geom::geom2d::{closest_point, Circle as KernelCircle, Curve, Line as KernelLine};
 
 use crate::command::{
     CadCommand, CmdOption, CmdResult, DimensionAssociationInput, DimensionPreview, InputKind,
@@ -11,8 +9,8 @@ use crate::command::{
 };
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
 use crate::scene::model::wire_model::WireModel;
-use glam::DVec3;
 use crate::t;
+use glam::DVec3;
 
 /// Select the measured axis from where the dimension line clears the points.
 pub(crate) fn measure_axis(first: DVec3, second: DVec3, def: DVec3) -> DVec3 {
@@ -84,11 +82,19 @@ pub struct LinearDimensionCommand {
     awaiting_angle: bool,
     /// True while a rotation value for the Rotated option is being entered.
     awaiting_rotation: bool,
+    /// The first of two picked points giving the Rotated angle.
+    rotation_from: Option<DVec3>,
     axis_mode: AxisMode,
     selecting_object: bool,
     picked_entity: Option<EntityType>,
-    source_handle: Option<codec::Handle>,
+    source_handle: Option<document::Handle>,
     mtext_override: bool,
+}
+
+impl Default for LinearDimensionCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LinearDimensionCommand {
@@ -101,6 +107,7 @@ impl LinearDimensionCommand {
             text_angle: None,
             awaiting_angle: false,
             awaiting_rotation: false,
+            rotation_from: None,
             axis_mode: AxisMode::Automatic,
             selecting_object: false,
             picked_entity: None,
@@ -143,12 +150,17 @@ pub(crate) fn linear_dimension_entity(
     crate::entities::dimension::reset_automatic_text_position(&mut dim.base);
     dim.base.actual_measurement = dim.measurement();
     crate::entities::dimension::set_dimension_text_override(&mut dim.base, text_override);
-    EntityType::Dimension(Dimension::Linear(dim))
+    EntityType::Dimension(Box::new(Dimension::Linear(dim)))
 }
 
 impl CadCommand for LinearDimensionCommand {
     fn name(&self) -> &'static str {
         "DIMLINEAR"
+    }
+
+    /// A dimension's point prompts refuse unusable input this way (measured).
+    fn point_rejection(&self) -> Option<String> {
+        Some(t!("Invalid point input.").into_owned())
     }
 
     fn set_working_plane(&mut self, plane: WorkingPlane) {
@@ -168,6 +180,9 @@ impl CadCommand for LinearDimensionCommand {
             return t!("DIMLINEAR  Specify text angle (degrees):").into_owned();
         }
         if self.awaiting_rotation {
+            if self.rotation_from.is_some() {
+                return t!("Specify second point:").into_owned();
+            }
             return t!("DIMLINEAR  Specify dimension line angle (degrees):").into_owned();
         }
         if self.selecting_object {
@@ -175,7 +190,7 @@ impl CadCommand for LinearDimensionCommand {
         }
         match self.step {
             Step::FirstPoint => {
-                t!("DIMLINEAR  Specify first extension line origin or press Enter to select object:")
+                t!("DIMLINEAR  Specify first extension line origin or <select object>:")
                     .into_owned()
             }
             Step::SecondPoint(_) => {
@@ -188,6 +203,22 @@ impl CadCommand for LinearDimensionCommand {
     }
 
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
+        // The Rotated angle can be shown by two points.
+        if self.awaiting_rotation {
+            match self.rotation_from.take() {
+                None => self.rotation_from = Some(pt),
+                Some(from) => {
+                    let (a, b) = (self.plane.to_local(from), self.plane.to_local(pt));
+                    if a.distance_squared(b) > 1e-24 {
+                        self.axis_mode = AxisMode::Rotated((b.y - a.y).atan2(b.x - a.x));
+                        self.awaiting_rotation = false;
+                    } else {
+                        self.rotation_from = Some(from);
+                    }
+                }
+            }
+            return CmdResult::NeedPoint;
+        }
         match self.step {
             Step::FirstPoint => {
                 self.step = Step::SecondPoint(pt);
@@ -224,6 +255,7 @@ impl CadCommand for LinearDimensionCommand {
         }
         if self.awaiting_rotation {
             self.awaiting_rotation = false;
+            self.rotation_from = None;
             return CmdResult::NeedPoint;
         }
         if matches!(self.step, Step::FirstPoint) {
@@ -317,6 +349,7 @@ impl CadCommand for LinearDimensionCommand {
                 self.axis_mode = AxisMode::Rotated(angle);
             }
             self.awaiting_rotation = false;
+            self.rotation_from = None;
             return Some(CmdResult::NeedPoint);
         }
         if !matches!(self.step, Step::DimensionLine { .. }) {
@@ -369,7 +402,7 @@ impl CadCommand for LinearDimensionCommand {
         self.picked_entity = Some(entity);
     }
 
-    fn on_entity_pick(&mut self, handle: codec::Handle, point: DVec3) -> CmdResult {
+    fn on_entity_pick(&mut self, handle: document::Handle, point: DVec3) -> CmdResult {
         let Some(entity) = self.picked_entity.take() else {
             return CmdResult::NeedPoint;
         };
@@ -386,6 +419,9 @@ impl CadCommand for LinearDimensionCommand {
     }
 
     fn on_mouse_move(&mut self, pt: DVec3) -> Option<WireModel> {
+        if let Some(from) = self.rotation_from {
+            return Some(preview_wire(vec![from, pt]));
+        }
         match self.step {
             Step::FirstPoint => None,
             Step::SecondPoint(first) => Some(preview_wire(vec![first, pt])),
@@ -446,10 +482,7 @@ fn dimension_line_offset(second: DVec3, point: DVec3, axis: DVec3) -> f64 {
     (point - second).dot(perpendicular)
 }
 
-pub(crate) fn dimension_source_points(
-    entity: &EntityType,
-    click: DVec3,
-) -> Option<(DVec3, DVec3)> {
+pub(crate) fn dimension_source_points(entity: &EntityType, click: DVec3) -> Option<(DVec3, DVec3)> {
     let point = |p: Vector3| DVec3::new(p.x, p.y, p.z);
     match entity {
         EntityType::Line(line) => Some((point(line.start), point(line.end))),
@@ -525,7 +558,11 @@ fn nearest_segment(
     if points.len() < 2 {
         return None;
     }
-    let count = if closed { points.len() } else { points.len() - 1 };
+    let count = if closed {
+        points.len()
+    } else {
+        points.len() - 1
+    };
     (0..count)
         .map(|index| {
             let first = points[index];
@@ -553,44 +590,14 @@ fn ocs_point(point: [f64; 2], elevation: f64, normal: Vector3) -> DVec3 {
 }
 
 fn preview_wire(points: Vec<DVec3>) -> WireModel {
-    WireModel {
-        bg_adapt: None,
-        point_marker: None,
-        taper_widths: Vec::new(),
-        pattern_stations: Vec::new(),
-        world_width: 0.0,
-        depth_override: None,
-        display_visible: true,
-        snap_only: false,
-        plot_visible: true,
-        fill_is_3d: false,
-        fill_is_2d_solid: false,
-        render_instance: None,
-        pick_tris: Vec::new(),
-        pick_tris_low: Vec::new(),
-            dash_from_start: false,
-            dash_align_end: None,
-            text_verts: Vec::new(),
-        name: "dimlinear_preview".to_string(),
-        points: points
-            .into_iter()
-            .map(|p| [p.x as f32, p.y as f32, p.z as f32])
-            .collect(),
-        points_low: Vec::new(),
-        color: WireModel::CYAN,
-        selected: false,
-        pattern_length: 0.0,
-        pattern: [0.0; 8],
-        line_weight_px: 1.0,
-        snap_pts: vec![],
-        tangent_geoms: vec![],
-        aci: 0,
-        key_vertices: vec![],
-        aabb: WireModel::UNBOUNDED_AABB,
-        plinegen: true,
-        fill_tris: vec![],
-        fill_tris_low: Vec::new(),
-    }
+    // Preview geometry is f64; `solid_f64` keeps the residual so the rubber
+    // band stays on the snapped points at UTM-scale coordinates.
+    WireModel::solid_f64(
+        "dimlinear_preview".to_string(),
+        points.into_iter().map(|p| p.to_array()).collect(),
+        WireModel::CYAN,
+        false,
+    )
 }
 
 /// Project the two extension origins onto the dimension line, which passes
@@ -615,11 +622,27 @@ fn linear_dimension_preview(first: DVec3, second: DVec3, def: DVec3, axis: DVec3
     let half_width = ((second - first).length().log10().max(0.0) + 1.0) * 0.18;
     let half_height = 0.16;
     vec![
-        first, d1, nan, second, d2, nan, d1, d2, nan,
-        d1, d1 + axis * arrow + perp * arrow * 0.45, nan,
-        d1, d1 + axis * arrow - perp * arrow * 0.45, nan,
-        d2, d2 - axis * arrow + perp * arrow * 0.45, nan,
-        d2, d2 - axis * arrow - perp * arrow * 0.45, nan,
+        first,
+        d1,
+        nan,
+        second,
+        d2,
+        nan,
+        d1,
+        d2,
+        nan,
+        d1,
+        d1 + axis * arrow + perp * arrow * 0.45,
+        nan,
+        d1,
+        d1 + axis * arrow - perp * arrow * 0.45,
+        nan,
+        d2,
+        d2 - axis * arrow + perp * arrow * 0.45,
+        nan,
+        d2,
+        d2 - axis * arrow - perp * arrow * 0.45,
+        nan,
         text - axis * half_width - perp * half_height,
         text + axis * half_width - perp * half_height,
         text + axis * half_width + perp * half_height,
@@ -634,6 +657,7 @@ fn linear_text_pos(first: DVec3, second: DVec3, def: DVec3, axis: DVec3) -> DVec
     (d1 + d2) * 0.5 + perp * 0.15
 }
 
-
 // ── Autocomplete registry ─────────────────────────────────
-inventory::submit!(crate::command::CommandRegistration { names: &["DIMLINEAR"] });  // LinearDimensionCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["DIMLINEAR"]
+}); // LinearDimensionCommand

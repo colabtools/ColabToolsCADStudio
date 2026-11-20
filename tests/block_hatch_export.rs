@@ -6,12 +6,12 @@
 // plot printed the block as bare monochrome outlines. `synced_hatch_models`
 // (the viewport) explodes visible INSERTs and materializes their fills; both
 // paths now share `exploded_insert_hatch_models`.
-use codec::entities::hatch::{
+use document::entities::hatch::{
     BoundaryEdge, BoundaryPath, BoundaryPathFlags, HatchPatternLine, LineEdge,
 };
-use codec::entities::Hatch;
-use codec::types::{Color as AcadColor, Vector2};
-use codec::EntityType;
+use document::entities::Hatch;
+use document::types::{Color as AcadColor, Vector2};
+use document::EntityType;
 use OpenCADStudio::scene::model::hatch_model::HatchPattern;
 use OpenCADStudio::scene::Scene;
 
@@ -75,8 +75,8 @@ fn block_internal_hatch_reaches_export() {
 
     // A blue hatch, wrapped into a block and inserted in model space — the
     // minimal shape of "coloured fill nested in a block".
-    let h = scene.add_entity(EntityType::Hatch(square_hatch(5)));
-    let identity = codec::types::Transform::identity();
+    let h = scene.add_entity(EntityType::Hatch(Box::new(square_hatch(5))));
+    let identity = document::types::Transform::identity();
     scene
         .create_block_from_entities(&[h], "LOGO", &identity, &identity)
         .expect("wrap hatch into a block + insert");
@@ -92,6 +92,62 @@ fn block_internal_hatch_reaches_export() {
     );
 }
 
+#[test]
+fn block_hatches_keep_placement_and_nonzero_child_layers() {
+    use document::entities::Insert;
+    use document::tables::{BlockRecord, Layer};
+    use document::types::Vector3;
+
+    let mut scene = Scene::new();
+    for name in ["FIRST", "SECOND", "STICKY"] {
+        scene.document.layers.add(Layer::new(name)).unwrap();
+    }
+    let mut record = BlockRecord::new("HATCHES");
+    record.handle = scene.document.allocate_handle();
+    let owner = record.handle;
+    scene.document.block_records.add(record).unwrap();
+
+    let mut inherited = square_hatch(5);
+    inherited.common.owner_handle = owner;
+    inherited.common.layer = "0".into();
+    let raw_handle = scene
+        .document
+        .add_entity(EntityType::Hatch(Box::new(inherited)))
+        .unwrap();
+    let mut sticky = square_hatch(3);
+    sticky.common.owner_handle = owner;
+    sticky.common.layer = "STICKY".into();
+    scene
+        .document
+        .add_entity(EntityType::Hatch(Box::new(sticky)))
+        .unwrap();
+
+    for (layer, x) in [("FIRST", 0.0), ("SECOND", 100.0)] {
+        let mut insert = Insert::new("HATCHES", Vector3::new(x, 0.0, 0.0));
+        insert.common.layer = layer.into();
+        scene.add_entity(EntityType::Insert(insert));
+    }
+    scene.populate_hatches_from_document();
+    let mut layers: Vec<String> = scene
+        .paper_plot_hatches()
+        .iter()
+        .filter_map(|hatch| hatch.effective_layer.as_deref())
+        .map(str::to_string)
+        .collect();
+    layers.sort();
+    layers.dedup();
+    assert_eq!(layers, ["FIRST", "SECOND", "STICKY"]);
+    assert_eq!(
+        scene
+            .document
+            .get_entity(raw_handle)
+            .unwrap()
+            .common()
+            .layer,
+        "0"
+    );
+}
+
 // A pattern hatch that stores its own resolved line geometry must render at
 // THAT spacing — not the name-matched catalog spacing × pattern_scale. Before
 // the fix, ANSI31 was re-derived from the metric catalog (3.175) × scale, so a
@@ -100,7 +156,7 @@ fn block_internal_hatch_reaches_export() {
 fn pattern_hatch_uses_stored_line_spacing() {
     let mut scene = Scene::new();
     // Spacing 0.5; a big pattern_scale (10) that the catalog path would apply.
-    scene.add_entity(EntityType::Hatch(ansi31_stored(0.5, 10.0)));
+    scene.add_entity(EntityType::Hatch(Box::new(ansi31_stored(0.5, 10.0))));
     scene.populate_hatches_from_document();
 
     let hatches = scene.paper_plot_hatches();
@@ -109,7 +165,9 @@ fn pattern_hatch_uses_stored_line_spacing() {
         .find(|m| matches!(m.pattern, HatchPattern::Pattern(_)))
         .expect("pattern hatch present in export set");
 
-    let HatchPattern::Pattern(fams) = &m.pattern else { unreachable!() };
+    let HatchPattern::Pattern(fams) = &m.pattern else {
+        unreachable!()
+    };
     // Effective perpendicular spacing = family.dy * model.scale.
     let dy = fams[0].dy.abs();
     let spacing = dy * m.scale;
@@ -141,7 +199,9 @@ fn far_from_origin_pattern_hatch_still_fills() {
     // the perpendicular index is |k| ≈ 4000·sin45°/0.3 ≈ 9400, well past the
     // 4096 clamp on both ends; the old absolute-index clamp inverts the range
     // (k_lo > k_hi) there and emits nothing.
-    scene.add_entity(EntityType::Hatch(ansi31_stored_at(0.3, 1.0, 4000.0, 0.0)));
+    scene.add_entity(EntityType::Hatch(Box::new(ansi31_stored_at(
+        0.3, 1.0, 4000.0, 0.0,
+    ))));
     scene.populate_hatches_from_document();
 
     let hatches = scene.paper_plot_hatches();
@@ -186,7 +246,7 @@ fn textbox_boundary_path_is_not_filled() {
     let mut tb = rect_path(0.0, 0.0, 200.0, 50.0);
     tb.flags = BoundaryPathFlags::from_bits(8 | 1); // TEXTBOX + EXTERNAL
     hatch.paths.push(tb);
-    scene.add_entity(EntityType::Hatch(hatch));
+    scene.add_entity(EntityType::Hatch(Box::new(hatch)));
     scene.populate_hatches_from_document();
 
     let hatches = scene.paper_plot_hatches();
@@ -240,6 +300,8 @@ fn app_created_hatch_roundtrips_catalog_spacing() {
     let mut scene = Scene::new();
     let boundary: Vec<[f32; 2]> = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
     let model = HatchModel {
+        entity: None,
+        effective_layer: None,
         pattern_origin: None,
         render_instance: None,
         world_origin: [0.0, 0.0],
@@ -250,7 +312,7 @@ fn app_created_hatch_roundtrips_catalog_spacing() {
         boundary_exterior: None,
         boundary_sources: None,
         boundary_paths: None,
-        style: codec::entities::HatchStyleType::Normal,
+        style: document::entities::HatchStyleType::Normal,
         pattern: entry.gpu.clone(),
         name: "ANSI31".into(),
         color: [0.75, 0.75, 0.75, 0.85],
@@ -268,7 +330,9 @@ fn app_created_hatch_roundtrips_catalog_spacing() {
         .iter()
         .find(|m| matches!(m.pattern, HatchPattern::Pattern(_)))
         .expect("pattern hatch present after round-trip");
-    let HatchPattern::Pattern(fams) = &m.pattern else { unreachable!() };
+    let HatchPattern::Pattern(fams) = &m.pattern else {
+        unreachable!()
+    };
     let got = perp_spacing(&fams[0], m.scale);
     assert!(
         (got - expected).abs() < expected * 0.02,
@@ -299,6 +363,8 @@ fn nested_hatch_serializes_only_outer_as_external() {
     let boundary_f32: Vec<[f32; 2]> = wcs.iter().map(|&[x, y]| [x as f32, y as f32]).collect();
 
     let model = HatchModel {
+        entity: None,
+        effective_layer: None,
         pattern_origin: None,
         render_instance: None,
         world_origin: [0.0, 0.0],
@@ -309,7 +375,7 @@ fn nested_hatch_serializes_only_outer_as_external() {
         boundary_exterior: None,
         boundary_sources: None,
         boundary_paths: None,
-        style: codec::entities::HatchStyleType::Normal,
+        style: document::entities::HatchStyleType::Normal,
         pattern: HatchPattern::Solid,
         name: "SOLID".into(),
         color: [0.45, 0.45, 0.45, 0.60],
@@ -326,7 +392,13 @@ fn nested_hatch_serializes_only_outer_as_external() {
     let dxf = scene
         .document
         .entities()
-        .find_map(|e| if let EntityType::Hatch(h) = e { Some(h) } else { None })
+        .find_map(|e| {
+            if let EntityType::Hatch(h) = e {
+                Some(h)
+            } else {
+                None
+            }
+        })
         .expect("nested hatch written to document");
 
     assert_eq!(dxf.paths.len(), 2, "outer boundary + one hole path");
@@ -334,8 +406,20 @@ fn nested_hatch_serializes_only_outer_as_external() {
     let ex = BoundaryPathFlags::EXTERNAL.bits();
     let out = BoundaryPathFlags::OUTERMOST.bits();
 
-    assert!(dxf.paths[0].flags.bits() & ex != 0, "outer path must be flagged external");
-    assert!(dxf.paths[0].flags.bits() & out != 0, "outer path must be flagged outermost");
-    assert!(dxf.paths[1].flags.bits() & ex == 0, "hole path must NOT be flagged external");
-    assert!(dxf.paths[1].flags.bits() & out == 0, "hole path must NOT be flagged outermost");
+    assert!(
+        dxf.paths[0].flags.bits() & ex != 0,
+        "outer path must be flagged external"
+    );
+    assert!(
+        dxf.paths[0].flags.bits() & out != 0,
+        "outer path must be flagged outermost"
+    );
+    assert!(
+        dxf.paths[1].flags.bits() & ex == 0,
+        "hole path must NOT be flagged external"
+    );
+    assert!(
+        dxf.paths[1].flags.bits() & out == 0,
+        "hole path must NOT be flagged outermost"
+    );
 }

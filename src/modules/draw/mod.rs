@@ -1,21 +1,21 @@
 // Draw module — Draw, Modify, Annotation and Layer tools.
 
-mod changelog;
+pub(crate) mod changelog;
 pub mod clipboard;
 pub mod defaults;
-mod donate;
+pub(crate) mod donate;
 pub mod draw;
 pub mod fence;
-pub mod units;
 pub mod groups;
 pub mod inquiry;
 pub mod layers;
 pub mod modify;
 pub mod properties;
-mod report;
+pub(crate) mod report;
 pub mod select;
+pub mod units;
 
-use crate::modules::{CadModule, RibbonGroup, RibbonItem};
+use crate::modules::{CadModule, IconKind, ModuleEvent, RibbonGroup, RibbonItem, ToolDef};
 
 pub struct DrawModule;
 
@@ -28,22 +28,20 @@ impl CadModule for DrawModule {
     }
 
     fn ribbon_groups(&self) -> &[RibbonGroup] {
-        use crate::modules::annotate::{
-            angular_dim, leader_cmd, linear_dim, mleader_cmd, mtext, radius_dim, text,
-        };
-        use crate::modules::insert::{create_block, insert_block};
+        use crate::modules::annotate::{leader_cmd, linear_dim, mleader_cmd, mtext, text};
+        use crate::modules::insert::{attedit, create_block, edit_block, insert_block};
         use clipboard::{copy_clip, cut, paste};
         use draw::{arc, circle, ellipse, hatch, line, polyline, shapes};
         use groups::{group, ungroup};
+        use inquiry::{area, dist, measuregeom};
         use layers::{
-            layfrz, layiso, laylck, layoff, layon, laythw, layulk, layuniso, make_current,
+            layfrz, layiso, laylck, layoff, layon, laythw, layulk, layuniso, laywalk, make_current,
             match_layer, panel,
         };
         use modify::{
             array, copy, delete, explode, fillet, mirror, offset, rotate, scale, stretch,
             translate, trim,
         };
-        use inquiry::{area, dist};
         use properties::match_prop;
 
         static GROUPS: std::sync::OnceLock<Vec<RibbonGroup>> = std::sync::OnceLock::new();
@@ -78,7 +76,7 @@ impl CadModule for DrawModule {
                             id: ellipse::DROPDOWN_ID,
                             icon: ellipse::ICON,
                             items: ellipse::DROPDOWN_ITEMS.to_vec(),
-                            default: "ELLIPSE",
+                            default: "ELLIPSE_CENTER",
                         },
                         RibbonItem::Dropdown {
                             id: hatch::DROPDOWN_ID,
@@ -126,34 +124,18 @@ impl CadModule for DrawModule {
                         RibbonItem::LargeDropdown {
                             id: "ANNOTATION_TEXT",
                             label: "Text",
-                            icon: text::ICON,
+                            icon: mtext::ICON,
                             items: vec![
-                                (text::tool().id, text::tool().label, text::tool().icon),
                                 (mtext::tool().id, mtext::tool().label, mtext::tool().icon),
+                                (text::tool().id, text::tool().label, text::tool().icon),
                             ],
-                            default: "TEXT",
+                            default: "MTEXT",
                         },
                         RibbonItem::LargeDropdown {
                             id: "ANNOTATION_DIMENSIONS",
                             label: "Dimensions",
                             icon: linear_dim::ICON,
-                            items: vec![
-                                (
-                                    linear_dim::tool().id,
-                                    linear_dim::tool().label,
-                                    linear_dim::tool().icon,
-                                ),
-                                (
-                                    radius_dim::tool().id,
-                                    radius_dim::tool().label,
-                                    radius_dim::tool().icon,
-                                ),
-                                (
-                                    angular_dim::tool().id,
-                                    angular_dim::tool().label,
-                                    angular_dim::tool().icon,
-                                ),
-                            ],
+                            items: crate::modules::annotate::dimension_menu_items(),
                             default: "DIMLINEAR",
                         },
                         RibbonItem::LargeDropdown {
@@ -187,6 +169,8 @@ impl CadModule for DrawModule {
                                 laylck::tool(),
                                 make_current::tool(),
                                 layiso::tool(),
+                                laywalk::tool(),
+                                match_layer::copy_to_layer_tool(),
                             ],
                             row3: vec![
                                 layon::tool(),
@@ -194,15 +178,20 @@ impl CadModule for DrawModule {
                                 layulk::tool(),
                                 match_layer::tool(),
                                 layuniso::tool(),
+                                match_layer::laycur_tool(),
                             ],
                         },
                     ],
                 },
                 RibbonGroup {
                     title: "Block",
+                    // Slide-out: Define / Manage / Synchronize Attributes and
+                    // Set Base Point.
                     tools: vec![
-                        RibbonItem::LargeTool(create_block::tool()),
-                        RibbonItem::LargeTool(insert_block::tool()),
+                        insert_block::gallery(),
+                        RibbonItem::Tool(create_block::tool()),
+                        RibbonItem::Tool(edit_block::tool()),
+                        RibbonItem::Tool(attedit::tool()),
                     ],
                 },
                 RibbonGroup {
@@ -215,7 +204,9 @@ impl CadModule for DrawModule {
                     title: "Groups",
                     tools: vec![
                         RibbonItem::LargeTool(group::tool()),
-                        RibbonItem::LargeTool(ungroup::tool()),
+                        RibbonItem::Tool(ungroup::tool()),
+                        RibbonItem::Tool(groups::edit_tool()),
+                        RibbonItem::Tool(groups::selection_tool()),
                     ],
                 },
                 RibbonGroup {
@@ -234,18 +225,27 @@ impl CadModule for DrawModule {
                 },
                 RibbonGroup {
                     title: "Measure",
-                    tools: vec![
-                        RibbonItem::LargeDropdown {
-                            id: "MEASURE_MENU",
-                            label: "Measure",
-                            icon: dist::ICON,
-                            items: vec![
-                                ("DIST", "Distance", dist::ICON),
-                                ("AREA", "Area", area::ICON),
-                            ],
-                            default: "DIST",
-                        },
-                    ],
+                    tools: vec![RibbonItem::LargeDropdown {
+                        id: "MEASURE_MENU",
+                        label: "Measure",
+                        icon: dist::ICON,
+                        items: vec![
+                            ("DIST", "Distance", dist::ICON),
+                            ("MEASURERADIUS", "Radius", measuregeom::RADIUS_ICON),
+                            ("MEASUREANGLE", "Angle", measuregeom::ANGLE_ICON),
+                            ("AREA", "Area", area::ICON),
+                        ],
+                        default: "DIST",
+                    }],
+                },
+                RibbonGroup {
+                    title: "Close",
+                    tools: vec![RibbonItem::LargeTool(ToolDef {
+                        id: "BCLOSETESTBLOCK",
+                        label: "Close Test Block",
+                        icon: IconKind::Svg(include_bytes!("../../../assets/icons/mt_ok.svg")),
+                        event: ModuleEvent::Command("BCLOSETESTBLOCK".into()),
+                    })],
                 },
                 // Support group lives on the Start tab now (see view.rs:
                 // start_page_view). Removed from the Draw ribbon to declutter.

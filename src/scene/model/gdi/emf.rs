@@ -6,7 +6,10 @@
 // this player understands.
 
 use super::raster::{Canvas, Rgba};
-use super::{canvas_for_box, colorref, dib, stock_obj, text, Brush, Dc, Font, Obj, Pen, Xform};
+use super::{
+    canvas_for_box, colorref, dib, stock_obj, text, Brush, Dc, Font, Obj, Pen, Rendered, Target,
+    Xform,
+};
 
 #[inline]
 fn u32_at(d: &[u8], o: usize) -> u32 {
@@ -127,7 +130,13 @@ impl Player {
 
     /// Points of a 16-bit poly record at `off`, `n` entries.
     fn pts16(rec: &[u8], off: usize, n: usize) -> Vec<[f32; 2]> {
-        let mut v = Vec::with_capacity(n);
+        // `n` is a raw u32 out of the record — for POLYPOLYLINE it is the
+        // per-ring count, which the `total > 400_000` check never bounds:
+        // `u32::MAX` used to request a ~17 GB capacity up front and abort
+        // on allocation failure. Only bytes present can be read (loop
+        // below), so the capacity is sized from the record.
+        let avail = rec.len().saturating_sub(off) / 4;
+        let mut v = Vec::with_capacity(n.min(avail));
         for i in 0..n {
             let o = off + i * 4;
             if o + 4 > rec.len() {
@@ -139,7 +148,8 @@ impl Player {
     }
 
     fn pts32(rec: &[u8], off: usize, n: usize) -> Vec<[f32; 2]> {
-        let mut v = Vec::with_capacity(n);
+        let avail = rec.len().saturating_sub(off) / 8;
+        let mut v = Vec::with_capacity(n.min(avail));
         for i in 0..n {
             let o = off + i * 8;
             if o + 8 > rec.len() {
@@ -151,7 +161,7 @@ impl Player {
     }
 }
 
-pub fn render(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+pub fn render(data: &[u8], target: Target) -> Option<Rendered> {
     if data.len() < 88 || u32_at(data, 0) != 1 || &data[40..44] != b" EMF" {
         return None;
     }
@@ -162,7 +172,12 @@ pub fn render(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         i32_at(data, 16) as f32,
         i32_at(data, 20) as f32,
     );
-    let (mut canvas, dev_scale) = canvas_for_box(br - bl, bb - bt)?;
+    let super::Frame {
+        mut canvas,
+        dev_scale,
+        offset,
+        full,
+    } = canvas_for_box(br - bl, bb - bt, target)?;
     let mut p = Player {
         dc: Dc::new(),
         objects: Vec::new(),
@@ -170,6 +185,8 @@ pub fn render(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     };
     p.dc.dev_org = (bl, bt);
     p.dc.dev_scale = dev_scale;
+    p.dc.canvas_off = offset;
+    p.dc.ss = canvas.ss as f32;
 
     let mut off = 0usize;
     let mut guard = 0usize;
@@ -180,7 +197,7 @@ pub fn render(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         }
         let ty = u32_at(data, off);
         let size = u32_at(data, off + 4) as usize;
-        if size < 8 || size % 4 != 0 || off + size > data.len() {
+        if size < 8 || !size.is_multiple_of(4) || off + size > data.len() {
             break;
         }
         let rec = &data[off..off + size];
@@ -337,7 +354,7 @@ pub fn render(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
                     }
                 }
             }
-            62 | 63 | 64 => {
+            62..=64 => {
                 if let Some(path) = p.path.take() {
                     let close = ty != 64;
                     let stroke = ty != 62;
@@ -570,6 +587,13 @@ pub fn render(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
                     }
                     // POLYPOLYLINE(7)/POLYPOLYGON(8)
                     7 | 8 => {
+                        // The shared arm guard only promises 28 bytes, but
+                        // this sub-arm reads `total` at 28 and starts the
+                        // counts array at 32: `nSize = 28` records used to
+                        // panic `range end index 32 out of len 28`.
+                        if rec.len() < 32 {
+                            continue;
+                        }
                         let n_polys = u32_at(rec, 24) as usize;
                         let total = u32_at(rec, 28) as usize;
                         if n_polys == 0 || n_polys > 100_000 || total > 400_000 {
@@ -621,6 +645,232 @@ pub fn render(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         }
     }
 
-    let (px, w, h) = canvas.downsample(super::SS);
-    Some((px, w, h))
+    Some(
+        super::Frame {
+            canvas,
+            dev_scale,
+            offset,
+            full,
+        }
+        .finish(),
+    )
+}
+
+#[cfg(test)]
+mod polypoly_size_tests {
+    use super::render;
+
+    /// 88-byte EMR_HEADER (`iType=1`, `nSize=88`, bounds 0..100, `" EMF"`
+    /// signature at 40) + raw records + EMR_EOF.
+    pub(super) fn emf_with(records: &[Vec<u8>]) -> Vec<u8> {
+        let mut emf = Vec::new();
+        emf.extend_from_slice(&1u32.to_le_bytes());
+        emf.extend_from_slice(&88u32.to_le_bytes());
+        emf.extend_from_slice(&0i32.to_le_bytes()); // rclBounds
+        emf.extend_from_slice(&0i32.to_le_bytes());
+        emf.extend_from_slice(&100i32.to_le_bytes());
+        emf.extend_from_slice(&100i32.to_le_bytes());
+        emf.extend_from_slice(&[0u8; 16]); // rclFrame
+        emf.extend_from_slice(b" EMF"); // dSignature @40
+        emf.extend_from_slice(&[0u8; 44]);
+        assert_eq!(emf.len(), 88);
+        for rec in records {
+            emf.extend_from_slice(rec);
+        }
+        emf.extend_from_slice(&14u32.to_le_bytes()); // EMR_EOF
+        emf.extend_from_slice(&8u32.to_le_bytes());
+        emf
+    }
+
+    /// Record with `iType`/`nSize` header + body (body length %4).
+    pub(super) fn record(ty: u32, body: &[u8]) -> Vec<u8> {
+        let mut rec = Vec::with_capacity(8 + body.len());
+        rec.extend_from_slice(&ty.to_le_bytes());
+        rec.extend_from_slice(&((8 + body.len()) as u32).to_le_bytes());
+        rec.extend_from_slice(body);
+        rec
+    }
+
+    /// `nSize = 28` (bounds + nPolys only): the arm guard accepts 28 but
+    /// `7 | 8` reads `u32_at(rec, 28)` — `range end index 32 out of len 28`.
+    #[test]
+    fn a_28_byte_polypolyline_record_is_skipped_not_oob() {
+        let rec = record(7, &[0u8; 20]);
+        assert_eq!(rec.len(), 28);
+        assert!(render(&emf_with(&[rec]), super::super::Target::DEFAULT).is_some());
+    }
+
+    /// `iType = 91` maps to kind 8 the same way (`ty - 83`).
+    #[test]
+    fn a_28_byte_polypolygon_record_is_skipped_not_oob() {
+        let rec = record(91, &[0u8; 20]);
+        assert_eq!(rec.len(), 28);
+        assert!(render(&emf_with(&[rec]), super::super::Target::DEFAULT).is_some());
+    }
+
+    /// A well-formed record (nPolys + total + counts fit in 36 bytes) still
+    /// goes through the reads at 24/28 — the fix must not skip it.
+    #[test]
+    fn a_full_size_polypolyline_record_still_renders() {
+        let mut body = vec![0u8; 16]; // bounds
+        body.extend_from_slice(&1u32.to_le_bytes()); // nPolys @24
+        body.extend_from_slice(&1u32.to_le_bytes()); // total  @28
+        body.extend_from_slice(&0u32.to_le_bytes()); // counts[0] @32 (empty ring)
+        let rec = record(7, &body);
+        assert_eq!(rec.len(), 36);
+        assert!(render(&emf_with(&[rec]), super::super::Target::DEFAULT).is_some());
+    }
+
+    /// A per-ring point count is a raw u32 (`counts[0] @32`). `pts32` sized
+    /// its vector straight from that field: `u32::MAX` requests a ~34 GB
+    /// capacity and the allocator aborts the process. The `total > 400_000`
+    /// check never bounds individual ring counts. Capacity must come from
+    /// the bytes actually present.
+    #[test]
+    fn a_hostile_ring_point_count_is_sized_from_the_record_32bit() {
+        let mut body = vec![0u8; 16]; // bounds
+        body.extend_from_slice(&1u32.to_le_bytes()); // nPolys @24
+        body.extend_from_slice(&1u32.to_le_bytes()); // total @28 (claimed, unused)
+        body.extend_from_slice(&u32::MAX.to_le_bytes()); // counts[0] @32 ← defect
+        body.extend_from_slice(&1i32.to_le_bytes()); // the one real point
+        body.extend_from_slice(&2i32.to_le_bytes());
+        let rec = record(7, &body);
+        let pts = super::Player::pts32(&rec, 36, u32::MAX as usize);
+        assert!(
+            pts.capacity() <= rec.len() / 8 + 1,
+            "pre-allocated {} slots",
+            pts.capacity()
+        );
+        assert_eq!(pts, vec![[1.0, 2.0]]);
+    }
+
+    /// Same defect through `pts16` (non-wide records, iType 90 → kind 7).
+    #[test]
+    fn a_hostile_ring_point_count_is_sized_from_the_record_16bit() {
+        let mut body = vec![0u8; 16]; // bounds
+        body.extend_from_slice(&1u32.to_le_bytes()); // nPolys @24
+        body.extend_from_slice(&1u32.to_le_bytes()); // total @28
+        body.extend_from_slice(&u32::MAX.to_le_bytes()); // counts[0] @32 ← defect
+        body.extend_from_slice(&3i16.to_le_bytes()); // the one real point
+        body.extend_from_slice(&4i16.to_le_bytes());
+        let rec = record(90, &body);
+        let pts = super::Player::pts16(&rec, 36, u32::MAX as usize);
+        assert!(
+            pts.capacity() <= rec.len() / 4 + 1,
+            "pre-allocated {} slots",
+            pts.capacity()
+        );
+        assert_eq!(pts, vec![[3.0, 4.0]]);
+    }
+
+    /// End-to-end: the hostile count reaches `render` via EMR_POLYPOLYLINE
+    /// and must still render the points that exist, without dying.
+    #[test]
+    fn a_hostile_ring_count_still_renders_the_points_that_exist() {
+        let mut body = vec![0u8; 16]; // bounds
+        body.extend_from_slice(&1u32.to_le_bytes()); // nPolys @24
+        body.extend_from_slice(&1u32.to_le_bytes()); // total @28 (≤ cap, claimed)
+        body.extend_from_slice(&u32::MAX.to_le_bytes()); // counts[0] @32 ← defect
+        body.extend_from_slice(&0i32.to_le_bytes()); // point (0,0)
+        body.extend_from_slice(&0i32.to_le_bytes());
+        body.extend_from_slice(&50i32.to_le_bytes()); // point (50,0)
+        body.extend_from_slice(&0i32.to_le_bytes());
+        let rec = record(7, &body);
+        assert!(render(&emf_with(&[rec]), super::super::Target::DEFAULT).is_some());
+    }
+}
+
+#[cfg(test)]
+pub(super) mod size_tests {
+    use super::polypoly_size_tests::{emf_with, record};
+    use super::render;
+    use crate::scene::model::gdi::Target;
+
+    fn point(ty: u32, x: i32, y: i32) -> Vec<u8> {
+        let mut body = x.to_le_bytes().to_vec();
+        body.extend_from_slice(&y.to_le_bytes());
+        record(ty, &body)
+    }
+
+    /// A 100×100 picture: a one-pixel line across it at y = 50, black by
+    /// default or in a cosmetic pen of `color` (COLORREF).
+    pub(crate) fn hairline(color: Option<u32>) -> Vec<u8> {
+        let mut records = Vec::new();
+        if let Some(color) = color {
+            let mut pen = 1u32.to_le_bytes().to_vec(); // ihPen
+            pen.extend_from_slice(&0u32.to_le_bytes()); // PS_SOLID
+            pen.extend_from_slice(&0i32.to_le_bytes()); // width 0: cosmetic
+            pen.extend_from_slice(&0i32.to_le_bytes());
+            pen.extend_from_slice(&color.to_le_bytes());
+            records.push(record(38, &pen)); // EMR_CREATEPEN
+            records.push(record(37, &1u32.to_le_bytes())); // EMR_SELECTOBJECT
+        }
+        records.push(point(27, 10, 50)); // EMR_MOVETOEX
+        records.push(point(54, 90, 50)); // EMR_LINETO
+        emf_with(&records)
+    }
+
+    fn rgb(r: &crate::scene::model::gdi::Rendered, x: u32, y: u32) -> [u8; 3] {
+        let i = ((y * r.width + x) * 4) as usize;
+        [r.pixels[i], r.pixels[i + 1], r.pixels[i + 2]]
+    }
+
+    /// Drawn at the size it shows, a one-pixel line lights one whole row of
+    /// pixels in its own colour, not two rows at half of it.
+    #[test]
+    fn a_hairline_lights_whole_pixels_in_its_own_colour() {
+        for (color, ink) in [(None, [0, 0, 0]), (Some(0x0000_00FF), [255, 0, 0])] {
+            let r = render(
+                &hairline(color),
+                Target {
+                    long_side: 100,
+                    region: None,
+                },
+            )
+            .expect("renders");
+            assert_eq!((r.width, r.height), (100, 100));
+            assert_eq!(rgb(&r, 50, 50), ink, "the line's row, colour {color:?}");
+            assert_eq!(rgb(&r, 50, 49), [255, 255, 255], "above it");
+            assert_eq!(rgb(&r, 50, 51), [255, 255, 255], "below it");
+        }
+    }
+
+    /// The whole picture is drawn at the size asked for, up to the size it
+    /// had before the view was known.
+    #[test]
+    fn the_whole_picture_is_drawn_at_the_size_asked_for() {
+        let size = |long_side| {
+            let r = render(
+                &hairline(None),
+                Target {
+                    long_side,
+                    region: None,
+                },
+            )
+            .expect("renders");
+            (r.width, r.height, r.region)
+        };
+        assert_eq!(size(240), (240, 240, [0.0, 0.0, 1.0, 1.0]));
+        assert_eq!(size(100_000), (1600, 1600, [0.0, 0.0, 1.0, 1.0]));
+    }
+
+    /// A region is drawn at the scale of the whole picture it belongs to,
+    /// and its line stays one screen pixel wide.
+    #[test]
+    fn a_region_is_drawn_at_the_scale_of_its_whole_picture() {
+        let r = render(
+            &hairline(None),
+            Target {
+                long_side: 400,
+                region: Some([0.25, 0.25, 0.75, 0.75]),
+            },
+        )
+        .expect("renders");
+        assert_eq!((r.width, r.height), (200, 200));
+        assert_eq!(r.region, [0.25, 0.25, 0.75, 0.75]);
+        // y = 50 of 100 is row 200 of the whole 400, row 100 of the region.
+        assert_eq!(rgb(&r, 100, 100), [0, 0, 0]);
+        assert_eq!(rgb(&r, 100, 99), [255, 255, 255]);
+        assert_eq!(rgb(&r, 100, 101), [255, 255, 255]);
+    }
 }

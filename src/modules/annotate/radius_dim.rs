@@ -1,6 +1,6 @@
-use codec::entities::{Dimension, DimensionRadius};
-use codec::types::{Handle, Vector3};
-use codec::EntityType;
+use document::entities::{Dimension, DimensionRadius};
+use document::types::{Handle, Vector3};
+use document::EntityType;
 
 use crate::command::{
     CadCommand, CmdOption, CmdResult, DimensionAssociationInput, DimensionPreview, InputKind,
@@ -9,7 +9,7 @@ use crate::command::{
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
 use crate::scene::model::wire_model::WireModel;
 use crate::t;
-use glam::{DVec3, Vec3};
+use glam::DVec3;
 
 pub const ICON: IconKind = IconKind::Svg(include_bytes!("../../../assets/icons/dim_radius.svg"));
 
@@ -35,6 +35,12 @@ pub struct RadiusDimensionCommand {
     awaiting_angle: bool,
     picked_entity: Option<EntityType>,
     source_handle: Option<Handle>,
+}
+
+impl Default for RadiusDimensionCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RadiusDimensionCommand {
@@ -93,7 +99,7 @@ pub(crate) fn radial_dimension_entity(
     if let Some(angle) = text_angle {
         dim.base.text_rotation = angle;
     }
-    plane.place_entity(EntityType::Dimension(Dimension::Radius(dim)))
+    plane.place_entity(EntityType::Dimension(Box::new(Dimension::Radius(dim))))
 }
 
 /// A radius dimension for a dimensional constraint: the leader leaves the
@@ -111,7 +117,7 @@ pub(crate) fn radius_constraint_entity(
     dim.leader_length = chord.distance(location).max(radius * 0.5);
     dim.base.actual_measurement = dim.measurement();
     crate::entities::dimension::set_dimension_text_override(&mut dim.base, text);
-    Some(EntityType::Dimension(Dimension::Radius(dim)))
+    Some(EntityType::Dimension(Box::new(Dimension::Radius(dim))))
 }
 
 /// The unit direction a radial constraint's dimension points in, from the
@@ -122,11 +128,15 @@ pub(crate) fn radial_direction(center: DVec3, location: DVec3) -> Option<DVec3> 
 }
 
 impl CadCommand for RadiusDimensionCommand {
-    fn set_working_plane(&mut self, _plane: WorkingPlane) {
-    }
+    fn set_working_plane(&mut self, _plane: WorkingPlane) {}
 
     fn name(&self) -> &'static str {
         "DIMRADIUS"
+    }
+
+    /// A dimension's point prompts refuse unusable input this way (measured).
+    fn point_rejection(&self) -> Option<String> {
+        Some(t!("Invalid point input.").into_owned())
     }
 
     fn prompt(&self) -> String {
@@ -137,7 +147,7 @@ impl CadCommand for RadiusDimensionCommand {
             return t!("DIMRADIUS  Specify text angle (degrees):").into_owned();
         }
         match self.step {
-            Step::SelectObject => t!("DIMRADIUS  Select arc, circle, or polyline arc:").into_owned(),
+            Step::SelectObject => t!("DIMRADIUS  Select arc or circle:").into_owned(),
             Step::DimLine(_) => {
                 t!("DIMRADIUS  Specify dimension line location  [Mtext/Text/Angle]:").into_owned()
             }
@@ -147,14 +157,12 @@ impl CadCommand for RadiusDimensionCommand {
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
         match self.step {
             Step::SelectObject => CmdResult::NeedPoint,
-            Step::DimLine(source) => {
-                CmdResult::CommitDimension {
-                    entity: self.build_dimension(source, pt),
-                    association: DimensionAssociationInput::Infer(self.source_handle),
-                    preserve_base_style: false,
-                    continue_command: false,
-                }
-            }
+            Step::DimLine(source) => CmdResult::CommitDimension {
+                entity: self.build_dimension(source, pt),
+                association: DimensionAssociationInput::Infer(self.source_handle),
+                preserve_base_style: false,
+                continue_command: false,
+            },
         }
     }
 
@@ -246,13 +254,11 @@ impl CadCommand for RadiusDimensionCommand {
                 self.awaiting_text = true;
                 Some(CmdResult::NeedPoint)
             }
-            "M" | "MTEXT" => {
-                Some(CmdResult::SuspendForMTextInput {
-                    pos: self.editor_anchor(),
-                    initial: self.text_override.clone().unwrap_or_default(),
-                    height: 2.5,
-                })
-            }
+            "M" | "MTEXT" => Some(CmdResult::SuspendForMTextInput {
+                pos: self.editor_anchor(),
+                initial: self.text_override.clone().unwrap_or_default(),
+                height: 2.5,
+            }),
             "A" | "ANGLE" => {
                 self.awaiting_angle = true;
                 Some(CmdResult::NeedPoint)
@@ -312,14 +318,14 @@ impl CadCommand for RadiusDimensionCommand {
         match self.step {
             Step::SelectObject => None,
             Step::DimLine(source) => {
-                let center = dvec(source.center_world()).as_vec3();
-                let point = dvec(source.chord_at(pt.to_array())).as_vec3();
+                let center = dvec(source.center_world());
+                let point = dvec(source.chord_at(pt.to_array()));
                 Some(preview_wire(vec![
                     center,
                     point,
-                    Vec3::new(f32::NAN, f32::NAN, f32::NAN),
+                    DVec3::splat(f64::NAN),
                     point,
-                    pt.as_vec3(),
+                    pt,
                 ]))
             }
         }
@@ -329,7 +335,9 @@ impl CadCommand for RadiusDimensionCommand {
         let Step::DimLine(source) = self.step else {
             return None;
         };
-        Some(vec![DimensionPreview::current_style(self.build_dimension(source, cursor))])
+        Some(vec![DimensionPreview::current_style(
+            self.build_dimension(source, cursor),
+        )])
     }
 }
 
@@ -341,42 +349,15 @@ fn dvec(point: Vector3) -> DVec3 {
     DVec3::new(point.x, point.y, point.z)
 }
 
-fn preview_wire(points: Vec<Vec3>) -> WireModel {
-    WireModel {
-        bg_adapt: None,
-        point_marker: None,
-        taper_widths: Vec::new(),
-        pattern_stations: Vec::new(),
-        world_width: 0.0,
-        depth_override: None,
-        display_visible: true,
-        snap_only: false,
-        plot_visible: true,
-        fill_is_3d: false,
-        fill_is_2d_solid: false,
-        render_instance: None,
-        pick_tris: Vec::new(),
-        pick_tris_low: Vec::new(),
-        dash_from_start: false,
-        dash_align_end: None,
-        text_verts: Vec::new(),
-        name: "dimradius_preview".to_string(),
-        points: points.into_iter().map(|p| [p.x, p.y, p.z]).collect(),
-        points_low: Vec::new(),
-        color: WireModel::CYAN,
-        selected: false,
-        pattern_length: 0.0,
-        pattern: [0.0; 8],
-        line_weight_px: 1.0,
-        snap_pts: vec![],
-        tangent_geoms: vec![],
-        aci: 0,
-        key_vertices: vec![],
-        aabb: WireModel::UNBOUNDED_AABB,
-        plinegen: true,
-        fill_tris: vec![],
-        fill_tris_low: Vec::new(),
-    }
+fn preview_wire(points: Vec<DVec3>) -> WireModel {
+    WireModel::solid_f64(
+        "dimradius_preview".to_string(),
+        points.into_iter().map(|point| point.to_array()).collect(),
+        WireModel::CYAN,
+        false,
+    )
 }
 
-inventory::submit!(crate::command::CommandRegistration { names: &["DIMRADIUS"] });
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["DIMRADIUS"]
+});

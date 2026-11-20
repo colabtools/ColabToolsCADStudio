@@ -1,7 +1,7 @@
-use codec::types::{Transform, Vector3};
+use document::types::{Transform, Vector3};
 use glam::DVec3;
 
-use crate::command::EntityTransform;
+use crate::entities::transform::EntityTransform;
 
 #[inline]
 fn to_v3(v: DVec3) -> Vector3 {
@@ -10,17 +10,20 @@ fn to_v3(v: DVec3) -> Vector3 {
 
 pub fn apply_standard_transform<T>(entity: &mut T, center: DVec3, axis: DVec3, angle_rad: f64)
 where
-    T: codec::Entity,
+    T: document::Entity,
 {
     let t = Transform::from_translation(to_v3(-center))
-        .then(&Transform::from_rotation(to_v3(axis.normalize_or(DVec3::Z)), angle_rad))
+        .then(&Transform::from_rotation(
+            to_v3(axis.normalize_or(DVec3::Z)),
+            angle_rad,
+        ))
         .then(&Transform::from_translation(to_v3(center)));
     entity.apply_transform(&t);
 }
 
 pub fn apply_standard_scale<T>(entity: &mut T, center: DVec3, factor: f64)
 where
-    T: codec::Entity,
+    T: document::Entity,
 {
     let s = factor;
     let t = Transform::from_scaling_with_origin(Vector3::new(s, s, s), to_v3(center));
@@ -29,39 +32,98 @@ where
 
 pub fn apply_standard_entity_transform<T, F>(entity: &mut T, t: &EntityTransform, mirror: F)
 where
-    T: codec::Entity,
+    T: document::Entity,
     F: FnOnce(&mut T, DVec3, DVec3),
 {
     match t {
         EntityTransform::Translate(d) => entity.translate(to_v3(*d)),
-        EntityTransform::Rotate { center, axis, angle_rad } => {
-            apply_standard_transform(entity, *center, *axis, *angle_rad)
-        }
+        EntityTransform::Rotate {
+            center,
+            axis,
+            angle_rad,
+        } => apply_standard_transform(entity, *center, *axis, *angle_rad),
         EntityTransform::Scale { center, factor } => apply_standard_scale(entity, *center, *factor),
         EntityTransform::Mirror {
             p1,
             p2,
             working_normal,
         } => {
-            if working_normal.normalize_or(DVec3::Z).abs_diff_eq(DVec3::Z, 1e-10) {
+            if working_normal
+                .normalize_or(DVec3::Z)
+                .abs_diff_eq(DVec3::Z, 1e-10)
+            {
                 mirror(entity, *p1, *p2)
             } else {
-                entity.apply_transform(&reflection_about_working_line(
-                    *p1,
-                    *p2,
-                    *working_normal,
-                ));
+                entity.apply_transform(&reflection_about_working_line(*p1, *p2, *working_normal));
             }
         }
         EntityTransform::Affine(transform) => entity.apply_transform(transform),
     }
 }
 
-/// Reflection across the world-XY line through `p1`→`p2` as an opencadcodec
-/// `Transform`, for delegating MIRROR to opencadcodec's entity-aware
+/// [`apply_standard_entity_transform`] for an entity stored in its OCS
+/// (`normal`). The `mirror` closure reflects stored coordinates as world XY,
+/// which they are only under a +Z normal: an arc with a -Z normal keeps its
+/// centre with X negated, and reflecting that as world X across a vertical
+/// line threw the copy far away (#3325). Any other normal goes through the
+/// document's OCS-aware reflection instead.
+pub fn apply_ocs_entity_transform<T, F>(
+    entity: &mut T,
+    t: &EntityTransform,
+    normal: Vector3,
+    mirror: F,
+) where
+    T: document::Entity,
+    F: FnOnce(&mut T, DVec3, DVec3),
+{
+    let plus_z = DVec3::new(normal.x, normal.y, normal.z)
+        .normalize_or(DVec3::Z)
+        .abs_diff_eq(DVec3::Z, 1e-10);
+    match t {
+        EntityTransform::Mirror {
+            p1,
+            p2,
+            working_normal,
+        } if !plus_z => {
+            entity.apply_transform(&reflection_about_working_line(*p1, *p2, *working_normal))
+        }
+        _ => apply_standard_entity_transform(entity, t, mirror),
+    }
+}
+
+/// `t` as one document `Transform`, for data that has no entity-specific
+/// rules (XDATA world points, distances and scale factors).
+pub fn codec_transform(t: &EntityTransform) -> Transform {
+    match t {
+        EntityTransform::Translate(d) => Transform::from_translation(to_v3(*d)),
+        EntityTransform::Rotate {
+            center,
+            axis,
+            angle_rad,
+        } => Transform::from_translation(to_v3(-*center))
+            .then(&Transform::from_rotation(
+                to_v3(axis.normalize_or(DVec3::Z)),
+                *angle_rad,
+            ))
+            .then(&Transform::from_translation(to_v3(*center))),
+        EntityTransform::Scale { center, factor } => Transform::from_scaling_with_origin(
+            Vector3::new(*factor, *factor, *factor),
+            to_v3(*center),
+        ),
+        EntityTransform::Mirror {
+            p1,
+            p2,
+            working_normal,
+        } => reflection_about_working_line(*p1, *p2, *working_normal),
+        EntityTransform::Affine(transform) => *transform,
+    }
+}
+
+/// Reflection across the world-XY line through `p1`→`p2` as a document
+/// `Transform`, for delegating MIRROR to document's entity-aware
 /// `apply_transform` paths (which handle direction flags, stored-angle
 /// conventions and bulges themselves). Degenerate line → identity.
-pub fn reflection_about_xy_line(p1: DVec3, p2: DVec3) -> codec::types::Transform {
+pub fn reflection_about_xy_line(p1: DVec3, p2: DVec3) -> document::types::Transform {
     reflection_about_working_line(p1, p2, DVec3::Z)
 }
 
@@ -71,8 +133,8 @@ pub fn reflection_about_working_line(
     p1: DVec3,
     p2: DVec3,
     working_normal: DVec3,
-) -> codec::types::Transform {
-    use codec::types::{Matrix4, Transform};
+) -> document::types::Transform {
+    use document::types::{Matrix4, Transform};
     let line = p2 - p1;
     let plane_normal = line
         .cross(working_normal.normalize_or(DVec3::Z))
@@ -84,9 +146,24 @@ pub fn reflection_about_working_line(
     let d = 2.0 * n.dot(p1);
     Transform::from_matrix(Matrix4 {
         m: [
-            [1.0 - 2.0 * n.x * n.x, -2.0 * n.x * n.y, -2.0 * n.x * n.z, d * n.x],
-            [-2.0 * n.y * n.x, 1.0 - 2.0 * n.y * n.y, -2.0 * n.y * n.z, d * n.y],
-            [-2.0 * n.z * n.x, -2.0 * n.z * n.y, 1.0 - 2.0 * n.z * n.z, d * n.z],
+            [
+                1.0 - 2.0 * n.x * n.x,
+                -2.0 * n.x * n.y,
+                -2.0 * n.x * n.z,
+                d * n.x,
+            ],
+            [
+                -2.0 * n.y * n.x,
+                1.0 - 2.0 * n.y * n.y,
+                -2.0 * n.y * n.z,
+                d * n.y,
+            ],
+            [
+                -2.0 * n.z * n.x,
+                -2.0 * n.z * n.y,
+                1.0 - 2.0 * n.z * n.z,
+                d * n.z,
+            ],
             [0.0, 0.0, 0.0, 1.0],
         ],
     })
@@ -105,19 +182,66 @@ pub fn reflected_point(p: DVec3, p1: DVec3, p2: DVec3, working_normal: DVec3) ->
 }
 
 pub fn reflect_xy_point(x: &mut f64, y: &mut f64, p1: DVec3, p2: DVec3) {
-    let ax = (p2.x - p1.x) as f64;
-    let ay = (p2.y - p1.y) as f64;
+    let ax = p2.x - p1.x;
+    let ay = p2.y - p1.y;
     let len2 = ax * ax + ay * ay;
     if len2 < 1e-12 {
         return;
     }
-    let rx = *x - p1.x as f64;
-    let ry = *y - p1.y as f64;
+    let rx = *x - p1.x;
+    let ry = *y - p1.y;
     let dot = rx * ax + ry * ay;
     let mx = 2.0 * dot * ax / len2 - rx;
     let my = 2.0 * dot * ay / len2 - ry;
-    *x = p1.x as f64 + mx;
-    *y = p1.y as f64 + my;
+    *x = p1.x + mx;
+    *y = p1.y + my;
+}
+
+/// An ellipse / elliptical arc's image under any affine transform, through the
+/// codec's `transform_ellipse` so the block-cache fast path and the entity
+/// agree with every other path (explode, insert) by construction.
+///
+/// Returns `(center, major_axis, normal, minor_axis_ratio, start_param,
+/// end_param)`; the major axis is the longer one and a reflection flips the
+/// normal.
+pub fn transform_ellipse_geometry(
+    center: Vector3,
+    major_axis: Vector3,
+    normal: Vector3,
+    minor_axis_ratio: f64,
+    start_param: f64,
+    end_param: f64,
+    transform: &Transform,
+) -> Option<(Vector3, Vector3, Vector3, f64, f64, f64)> {
+    use document::Entity;
+    if normal.length() <= 1e-12 || major_axis.length() <= 1e-12 {
+        return None;
+    }
+    let mut ellipse = document::entities::Ellipse {
+        center,
+        major_axis,
+        normal,
+        minor_axis_ratio,
+        start_parameter: start_param,
+        end_parameter: end_param,
+        ..Default::default()
+    };
+    ellipse.apply_transform(transform);
+    let values = [ellipse.center, ellipse.major_axis, ellipse.normal];
+    if values
+        .iter()
+        .any(|v| !(v.x.is_finite() && v.y.is_finite() && v.z.is_finite()))
+    {
+        return None;
+    }
+    Some((
+        ellipse.center,
+        ellipse.major_axis,
+        ellipse.normal,
+        ellipse.minor_axis_ratio,
+        ellipse.start_parameter,
+        ellipse.end_parameter,
+    ))
 }
 
 /// DXF arbitrary-axis algorithm — returns the OCS X and Y basis vectors in WCS
@@ -189,13 +313,13 @@ pub fn wcs_point_to_ocs(wcs: (f64, f64, f64), normal: (f64, f64, f64)) -> (f64, 
 #[cfg(test)]
 mod mirror_delegation_tests {
     use super::*;
-    use crate::command::EntityTransform;
     use crate::entities::traits::Transformable;
-    use codec::entities::hatch::{BoundaryEdge, BoundaryPath, CircularArcEdge, LineEdge};
-    use codec::entities::Hatch;
-    use codec::types::Vector2;
+    use crate::entities::transform::EntityTransform;
+    use document::entities::hatch::{BoundaryEdge, BoundaryPath, CircularArcEdge, LineEdge};
+    use document::entities::Hatch;
+    use document::types::Vector2;
 
-    // MIRROR on a hatch goes through reflection_about_xy_line + opencadcodec's
+    // MIRROR on a hatch goes through reflection_about_xy_line + document's
     // transform_hatch. Mirror a Line→Arc→Line path across a vertical line and
     // assert the arc stays endpoint-continuous, flips its direction flag, and
     // keeps its sweep magnitude (the stored-angle conventions the old
@@ -264,10 +388,173 @@ mod ocs_axes_142 {
     #[test]
     fn x_normal_axes_nonzero() {
         let (ax, ay) = super::ocs_axes((-1.0, 0.0, 0.0));
-        let nz = |v: (f64,f64,f64)| v.0.abs()+v.1.abs()+v.2.abs();
+        let nz = |v: (f64, f64, f64)| v.0.abs() + v.1.abs() + v.2.abs();
         assert!(nz(ax) > 0.5, "ax collapsed: {:?}", ax);
         assert!(nz(ay) > 0.5, "ay collapsed: {:?}", ay);
-        let p = super::ocs_point_to_wcs((-25.0, 90.0, 0.0), (-1.0,0.0,0.0));
-        assert!(p.0.abs()+p.1.abs()+p.2.abs() > 1.0, "point collapsed: {:?}", p);
+        let p = super::ocs_point_to_wcs((-25.0, 90.0, 0.0), (-1.0, 0.0, 0.0));
+        assert!(
+            p.0.abs() + p.1.abs() + p.2.abs() > 1.0,
+            "point collapsed: {:?}",
+            p
+        );
+    }
+}
+
+#[cfg(test)]
+mod ellipse_transform_tests {
+    use super::*;
+    use std::f64::consts::{FRAC_PI_2, FRAC_PI_4};
+
+    fn sample_point(
+        center: Vector3,
+        major: Vector3,
+        normal: Vector3,
+        ratio: f64,
+        t: f64,
+    ) -> Vector3 {
+        let u = major;
+        let v = normal.normalize().cross(&major) * ratio;
+        center + u * t.cos() + v * t.sin()
+    }
+
+    #[test]
+    fn negative_rotation_negative_scale_distant_origin() {
+        // Original ellipse arc at distant center (7000, 5000, 0)
+        let center = Vector3::new(7000.0, 5000.0, 0.0);
+        let major = Vector3::new(10.0, 0.0, 0.0);
+        let normal = Vector3::new(0.0, 0.0, 1.0);
+        let ratio = 0.5;
+        let start_param = FRAC_PI_4;
+        let end_param = 3.0 * FRAC_PI_4;
+
+        // Transform: non-uniform negative scale (-1.0, -1.0, 1.0), rotation -45 deg, translation (100, 200, 0)
+        let rot_rad = -FRAC_PI_4;
+        let transform = Transform::from_scaling(Vector3::new(-1.0, -1.0, 1.0))
+            .then(&Transform::from_rotation(Vector3::UNIT_Z, rot_rad))
+            .then(&Transform::from_translation(Vector3::new(
+                100.0, 200.0, 0.0,
+            )));
+
+        let (c, m, n, r, s, e) = transform_ellipse_geometry(
+            center,
+            major,
+            normal,
+            ratio,
+            start_param,
+            end_param,
+            &transform,
+        )
+        .expect("transformation should succeed");
+
+        assert!(r <= 1.0 && r > 0.0, "ratio must be in (0, 1], got {r}");
+        assert!(m.length() >= m.length() * r);
+
+        // Verify that start, end, and intermediate points match exactly
+        for i in 0..=10 {
+            let frac = i as f64 / 10.0;
+            let orig_t = start_param + frac * (end_param - start_param);
+            let orig_pt = sample_point(center, major, normal, ratio, orig_t);
+            let expected_pt = transform.apply(orig_pt);
+
+            let new_t = s + frac * (e - s);
+            let actual_pt = sample_point(c, m, n, r, new_t);
+
+            let diff = (expected_pt - actual_pt).length();
+            assert!(
+                diff < 1e-9,
+                "Point at frac {frac} differs by {diff}: expected {expected_pt:?}, got {actual_pt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn axis_swapping_under_non_uniform_negative_scale() {
+        // When scale along Y is much larger, the minor axis becomes the major axis
+        let center = Vector3::new(0.0, 0.0, 0.0);
+        let major = Vector3::new(10.0, 0.0, 0.0);
+        let normal = Vector3::new(0.0, 0.0, 1.0);
+        let ratio = 0.5; // initial minor length is 5.0
+        let start_param = 0.1;
+        let end_param = 2.0;
+
+        // Scale X by -1, Scale Y by -3: transformed major length is 10, transformed minor length is 15.
+        // So axes must swap!
+        let transform = Transform::from_scaling(Vector3::new(-1.0, -3.0, 1.0))
+            .then(&Transform::from_rotation(Vector3::UNIT_Z, -FRAC_PI_2));
+
+        let (c, m, n, r, s, e) = transform_ellipse_geometry(
+            center,
+            major,
+            normal,
+            ratio,
+            start_param,
+            end_param,
+            &transform,
+        )
+        .expect("transformation should succeed");
+
+        assert!(r <= 1.0, "ratio must be <= 1.0 after axis swap, got {r}");
+        assert!((r - (10.0 / 15.0)).abs() < 1e-9);
+
+        // Verify points match
+        for i in 0..=10 {
+            let frac = i as f64 / 10.0;
+            let orig_t = start_param + frac * (end_param - start_param);
+            let orig_pt = sample_point(center, major, normal, ratio, orig_t);
+            let expected_pt = transform.apply(orig_pt);
+
+            let new_t = s + frac * (e - s);
+            let actual_pt = sample_point(c, m, n, r, new_t);
+
+            let diff = (expected_pt - actual_pt).length();
+            assert!(
+                diff < 1e-9,
+                "Point at frac {frac} differs by {diff}: expected {expected_pt:?}, got {actual_pt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reflection_handedness_flip_arc_preservation() {
+        // Reflection across Y axis (scale X by -1, Y by 1)
+        let center = Vector3::new(50.0, 60.0, 0.0);
+        let major = Vector3::new(8.0, 0.0, 0.0);
+        let normal = Vector3::new(0.0, 0.0, 1.0);
+        let ratio = 0.75;
+        let start_param = 0.2;
+        let end_param = 1.8;
+
+        let transform = Transform::from_scaling(Vector3::new(-1.0, 1.0, 1.0))
+            .then(&Transform::from_rotation(Vector3::UNIT_Z, -0.6));
+
+        let (c, m, n, r, s, e) = transform_ellipse_geometry(
+            center,
+            major,
+            normal,
+            ratio,
+            start_param,
+            end_param,
+            &transform,
+        )
+        .expect("transformation should succeed");
+
+        // Normal must be inverted in Z due to reflection
+        assert!(n.z < 0.0, "normal Z should be flipped, got {}", n.z);
+
+        for i in 0..=10 {
+            let frac = i as f64 / 10.0;
+            let orig_t = start_param + frac * (end_param - start_param);
+            let orig_pt = sample_point(center, major, normal, ratio, orig_t);
+            let expected_pt = transform.apply(orig_pt);
+
+            let new_t = s + frac * (e - s);
+            let actual_pt = sample_point(c, m, n, r, new_t);
+
+            let diff = (expected_pt - actual_pt).length();
+            assert!(
+                diff < 1e-9,
+                "Point at frac {frac} differs by {diff}: expected {expected_pt:?}, got {actual_pt:?}"
+            );
+        }
     }
 }

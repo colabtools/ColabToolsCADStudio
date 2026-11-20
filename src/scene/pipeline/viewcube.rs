@@ -9,12 +9,12 @@
 // This eliminates gimbal lock at top/bottom views and keeps the cube in sync
 // with arcball orbit at all angles.
 
+use crate::t;
 use bytemuck::{Pod, Zeroable};
 use glam::camera::rh::proj::directx::orthographic;
 use glam::{Mat4, Vec3, Vec4};
 use iced::wgpu;
 use iced::{Rectangle, Size};
-use crate::t;
 
 #[path = "viewcube_text_atlas.rs"]
 mod viewcube_text_atlas;
@@ -1133,14 +1133,13 @@ impl ViewCubePipeline {
             &ring_idxs,
             wgpu::BufferUsages::INDEX,
         );
-        let ring_line_vertex_buffer =
-            super::gpu_upload::upload_buffer(
-                device,
-                queue,
-                "vc.ring_line_vb",
-                &ring_line_verts,
-                wgpu::BufferUsages::VERTEX,
-            );
+        let ring_line_vertex_buffer = super::gpu_upload::upload_buffer(
+            device,
+            queue,
+            "vc.ring_line_vb",
+            &ring_line_verts,
+            wgpu::BufferUsages::VERTEX,
+        );
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("vc.ub"),
             size: std::mem::size_of::<CubeUniforms>() as u64,
@@ -1316,14 +1315,13 @@ impl ViewCubePipeline {
                     },
                 ],
             });
-        let composite_uniform_buffer =
-            super::gpu_upload::upload_buffer(
-                device,
-                queue,
-                "vc.composite_uniform",
-                &[1.0f32, 1.0, 0.0, 0.0],
-                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            );
+        let composite_uniform_buffer = super::gpu_upload::upload_buffer(
+            device,
+            queue,
+            "vc.composite_uniform",
+            &[1.0f32, 1.0, 1.0, 0.0],
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        );
         let composite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("vc.composite_sampler"),
             mag_filter: wgpu::FilterMode::Nearest,
@@ -1423,6 +1421,7 @@ impl ViewCubePipeline {
         cam_rotation: Mat4,
         compass_rotation: Mat4,
         hover: Option<usize>,
+        opacity: f32,
         text_color: [f32; 4],
     ) {
         let render_size = VIEWCUBE_RENDER_PX.ceil() as u32;
@@ -1456,20 +1455,19 @@ impl ViewCubePipeline {
             bytemuck::cast_slice(&[
                 self.depth_texture_size.width as f32 / alloc_w,
                 self.depth_texture_size.height as f32 / alloc_h,
-                0.0,
+                opacity.clamp(0.0, 1.0),
                 0.0,
             ]),
         );
-        self.text
-            .update(
-                queue,
-                cam_rotation,
-                compass_rotation,
-                render_size,
-                render_size,
-                self.cube_px,
-                text_color,
-            );
+        self.text.update(
+            queue,
+            cam_rotation,
+            compass_rotation,
+            render_size,
+            render_size,
+            self.cube_px,
+            text_color,
+        );
     }
 
     pub fn ensure_depth_texture(&mut self, device: &wgpu::Device, size: Size<u32>) {
@@ -1522,7 +1520,11 @@ impl ViewCubePipeline {
         surface_clip: Rectangle<u32>,
         clip: &Rectangle<u32>,
     ) -> bool {
-        let min_size = self.depth_texture_size.width.min(self.depth_texture_size.height).max(1);
+        let min_size = self
+            .depth_texture_size
+            .width
+            .min(self.depth_texture_size.height)
+            .max(1);
         viewcube_should_render(surface_dest, surface_clip, clip, min_size)
     }
 }
@@ -1542,7 +1544,6 @@ pub fn viewcube_should_render(
 }
 
 impl ViewCubePipeline {
-
     pub fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1574,7 +1575,14 @@ impl ViewCubePipeline {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_viewport(0.0, 0.0, render_width as f32, render_height as f32, 0.0, 1.0);
+        pass.set_viewport(
+            0.0,
+            0.0,
+            render_width as f32,
+            render_height as f32,
+            0.0,
+            1.0,
+        );
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
@@ -1582,10 +1590,7 @@ impl ViewCubePipeline {
         pass.draw_indexed(0..self.index_count, 0, 0..1);
         pass.set_bind_group(0, &self.ring_uniform_bind_group, &[]);
         pass.set_vertex_buffer(0, self.ring_vertex_buffer.slice(..));
-        pass.set_index_buffer(
-            self.ring_index_buffer.slice(..),
-            wgpu::IndexFormat::Uint32,
-        );
+        pass.set_index_buffer(self.ring_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.ring_index_count, 0, 0..1);
         pass.set_pipeline(&self.line_pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -1720,7 +1725,7 @@ fn create_resolve_texture(
 
 fn round_up_viewcube_texture(value: u32) -> u32 {
     const GRID: u32 = 128;
-    ((value.max(1) + GRID - 1) / GRID) * GRID
+    value.max(1).div_ceil(GRID) * GRID
 }
 
 // ── Hit test ──────────────────────────────────────────────────────────────
@@ -1787,6 +1792,18 @@ pub fn hit_test(
 }
 
 /// Returns the hovered region id (0-25), or None.
+/// The cube's opacity with the cursor at (`mx`, `my`) in a viewport `vp_w`
+/// wide: opaque over the navigation corner, else NAVVCUBEOPACITY percent.
+pub fn viewcube_opacity(mx: f32, my: f32, vp_w: f32, inactive_percent: u8) -> f32 {
+    let over = (vp_w - VIEWCUBE_RENDER_PX..=vp_w).contains(&mx)
+        && (0.0..=VIEWCUBE_RENDER_PX).contains(&my);
+    if over {
+        1.0
+    } else {
+        f32::from(inactive_percent.min(100)) / 100.0
+    }
+}
+
 pub fn hover_id(
     mx: f32,
     my: f32,

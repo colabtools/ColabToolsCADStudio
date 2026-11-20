@@ -23,7 +23,7 @@ impl OpenCADStudio {
                     .objects
                     .iter()
                     .filter_map(|(handle, object)| match object {
-                        codec::objects::ObjectType::MLineStyle(style) => {
+                        document::objects::ObjectType::MLineStyle(style) => {
                             Some((*handle, style.clone()))
                         }
                         _ => None,
@@ -34,7 +34,26 @@ impl OpenCADStudio {
                 self.tabs[i].active_cmd = Some(Box::new(cmd_obj));
             }
 
-            cmd if cmd == "WIPEOUT" || cmd == "WO" || cmd.starts_with("WIPEOUT ") => {
+            // WIPEOUT's Frames option: a new mode regenerates twice (the
+            // reference prints it twice); the current mode changes nothing.
+            cmd if cmd.starts_with("_WIPEOUT_FRAMES ") => {
+                let mode = cmd["_WIPEOUT_FRAMES ".len()..]
+                    .trim()
+                    .parse::<i16>()
+                    .unwrap_or(1);
+                let current = crate::modules::draw::draw::wipeout::wipeout_frame_mode(
+                    &self.tabs[i].scene.document,
+                );
+                if mode != current {
+                    let task = self.dispatch_command(&format!("WIPEOUTFRAME {mode}"));
+                    self.command_line
+                        .push_output(crate::t!("Regenerating model.").as_ref());
+                    return Some(task);
+                }
+                return Some(Task::none());
+            }
+
+            cmd if cmd == "WIPEOUT" || cmd.starts_with("WIPEOUT ") => {
                 use crate::modules::draw::draw::wipeout::WipeoutCommand;
                 let args = cmd
                     .split_once(' ')
@@ -53,8 +72,30 @@ impl OpenCADStudio {
                 self.tabs[i].active_cmd = Some(Box::new(wo_cmd));
             }
 
-            cmd if cmd == "IMAGE" || cmd == "IMAGEATTACH" || cmd == "IM" => {
-                return Some(Task::done(Message::ImagePick));
+            // IMAGE / IMAGEATTACH / -IMAGEATTACH / IM [path]
+            // A bare command opens the file picker. A path on the command
+            // line is attached the way a dropped picture is, so a script can
+            // place a raster reference without a dialog; the insertion point
+            // prompt then follows as usual.
+            cmd if {
+                let verb = cmd.split_whitespace().next().unwrap_or_default();
+                matches!(
+                    verb.trim_start_matches('-').to_ascii_uppercase().as_str(),
+                    "IMAGE" | "IMAGEATTACH" | "IM"
+                )
+            } =>
+            {
+                let rest = cmd
+                    .split_once(char::is_whitespace)
+                    .map(|(_, rest)| rest.trim())
+                    .unwrap_or("");
+                if rest.is_empty() {
+                    return Some(Task::done(Message::ImagePick));
+                }
+                let path = std::path::PathBuf::from(rest.trim_matches('"'));
+                return Some(self.update(Message::ImagePickResult(
+                    crate::io::image_file_size(path),
+                )));
             }
 
             cmd if cmd == "IMAGEEMBED" => {
@@ -63,35 +104,33 @@ impl OpenCADStudio {
 
             "REVCLOUD" | "REVCLOUD_RECTANGULAR" | "REVCLOUD_POLYGONAL" | "REVCLOUD_FREEHAND" => {
                 use crate::modules::draw::draw::revcloud::RevCloudCommand;
-                let view_height = self.tabs[i].scene.camera.borrow().ortho_size() as f64 * 2.0;
-                let default_arc_length = (view_height * 0.0125).max(1.0e-6);
-                let sources = self.tabs[i]
-                    .scene
-                    .document
-                    .entities()
-                    .map(|entity| (entity.common().handle, entity.clone()))
-                    .collect();
-                let mut command = RevCloudCommand::new(default_arc_length, sources);
-                if let Some(mode) = cmd.strip_prefix("REVCLOUD_") {
-                    command.on_text_input(mode);
-                }
-                self.command_line.push_info(&command.prompt());
-                self.tabs[i].active_cmd = Some(Box::new(command));
-            }
-
-            "ATTDEF" => {
-                use crate::modules::draw::draw::attdef::AttdefCommand;
-                let defaults = crate::scene::creation_style::current_text_defaults(
+                // REVCLOUDAPPROXARCLEN, or (while it is 0) a twentieth of the
+                // view's diagonal.
+                let stored = crate::io::drawing_variable(
                     &self.tabs[i].scene.document,
-                );
-                let cmd = AttdefCommand::with_text_defaults(
-                    defaults.height,
-                    defaults.style_name,
-                    defaults.width_factor,
-                    defaults.oblique_angle,
-                );
-                self.command_line.push_info(&cmd.prompt());
-                self.tabs[i].active_cmd = Some(Box::new(cmd));
+                    crate::entities::revcloud::ARC_LENGTH_VARIABLE,
+                )
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value > 0.0);
+                let view_height = self.tabs[i].scene.camera.borrow().ortho_size() as f64 * 2.0;
+                let arc_length = stored.unwrap_or_else(|| {
+                    crate::entities::revcloud::view_arc_length(
+                        view_height,
+                        self.tabs[i].scene.view_aspect(),
+                    )
+                    .max(1.0e-6)
+                });
+                let mut command = RevCloudCommand::new(arc_length, stored.is_some());
+                let mut prompt = command.prompt();
+                // The ribbon's Rectangular / Polygonal / Freehand choose the
+                // type first, as `_R` / `_P` / `_F` after the command.
+                if let Some(mode) = cmd.strip_prefix("REVCLOUD_") {
+                    self.command_line.push_info(&prompt);
+                    command.on_text_input(&mode[..1]);
+                    prompt = command.prompt();
+                }
+                self.command_line.push_info(&prompt);
+                self.tabs[i].active_cmd = Some(Box::new(command));
             }
 
             // Command-line attribute editing on selected Insert entities. Bare
@@ -99,53 +138,316 @@ impl OpenCADStudio {
             // (see the ATTEDIT arm in the inquiry family); the dash form is the
             // command-line entry point.
             // Usage:
-            //   -ATTEDIT          — list all attributes on selected Insert(s)
-            //   ATTEDIT <tag> <v> — quick-set attribute <tag> to <v>
+            //   -ATTEDIT                        — ask the measured question flow
+            //   -ATTEDIT REPLACE <old> <new> [block] [tag] [value]
+            //                                   — swap one string inside matching values
+            //   ATTEDIT <tag> <v>               — quick-set attribute <tag> to <v>
             cmd if cmd.starts_with("ATTEDIT ")
                 || cmd == "-ATTEDIT"
                 || cmd.starts_with("-ATTEDIT ") =>
             {
                 let rest = cmd
-                    .trim_start_matches("-ATTEDIT")
-                    .trim_start_matches("ATTEDIT")
+                    .strip_prefix("-ATTEDIT")
+                    .or_else(|| cmd.strip_prefix("ATTEDIT"))
+                    .unwrap_or("")
                     .trim();
-                let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
-                let selected_handles: Vec<codec::Handle> = self.tabs[i]
+                if rest.is_empty() {
+                    use crate::modules::draw::modify::attedit::{
+                        AttributeCandidate, DashAtteditCommand,
+                    };
+                    let candidates: Vec<AttributeCandidate> = self.tabs[i]
+                        .scene
+                        .document
+                        .entities()
+                        .filter_map(|entity| match entity {
+                            document::EntityType::Insert(insert) => Some(insert),
+                            _ => None,
+                        })
+                        .flat_map(|insert| {
+                            let on_screen = self.typed_point_in_view(
+                                i,
+                                glam::DVec3::new(
+                                    insert.insert_point.x,
+                                    insert.insert_point.y,
+                                    insert.insert_point.z,
+                                ),
+                            );
+                            let handle = insert.common.handle;
+                            insert
+                                .attributes
+                                .iter()
+                                .map(move |attr| AttributeCandidate {
+                                    handle,
+                                    block: insert.block_name.clone(),
+                                    tag: attr.tag.clone(),
+                                    value: attr.get_value().to_string(),
+                                    on_screen,
+                                })
+                        })
+                        .collect();
+                    let command = DashAtteditCommand::new(candidates);
+                    self.command_line.push_info(&command.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(command));
+                    return Some(Task::none());
+                }
+                let tokens: Vec<&str> = rest.split_whitespace().collect();
+                let selection: Vec<document::Handle> = self.tabs[i]
                     .scene
                     .selected_entities()
                     .iter()
                     .map(|(h, _)| *h)
                     .collect();
-                if selected_handles.is_empty() {
-                    self.command_line
-                        .push_error(crate::t!("ATTEDIT: select an Insert entity first.").as_ref());
+                // A leading token names a block reference when the drawing has
+                // an Insert with that handle; otherwise it is a tag filter.
+                let first_handle = tokens.first().and_then(|token| {
+                    let hex = token
+                        .strip_prefix("0x")
+                        .or_else(|| token.strip_prefix("0X"))
+                        .unwrap_or(token);
+                    let value = u64::from_str_radix(hex, 16).ok()?;
+                    let handle = document::Handle::new(value);
+                    self.tabs[i]
+                        .scene
+                        .document
+                        .get_entity(handle)
+                        .filter(|entity| matches!(entity, document::EntityType::Insert(_)))
+                        .map(|_| handle)
+                });
+                let mut targets: Vec<document::Handle> = match first_handle {
+                    Some(handle) => vec![handle],
+                    None => selection.clone(),
+                };
+                let args: &[&str] = if first_handle.is_some() {
+                    &tokens[1..]
                 } else {
-                    let mut found_any = false;
-                    for sh in &selected_handles {
-                        if let Some(codec::EntityType::Insert(ins)) = self.tabs[i]
+                    &tokens[..]
+                };
+                let option = args.first().map(|arg| arg.to_ascii_uppercase());
+
+                if option.as_deref() == Some("RENAME") {
+                    let (Some(old), Some(new)) = (args.get(1), args.get(2)) else {
+                        self.command_line.push_error(
+                            crate::t!("ATTEDIT: usage is -ATTEDIT RENAME <old tag> <new tag>.")
+                                .as_ref(),
+                        );
+                        return Some(Task::none());
+                    };
+                    // No handle and no selection means the whole drawing: the
+                    // global rename every reference sees.
+                    if targets.is_empty() {
+                        targets = self.tabs[i]
                             .scene
                             .document
                             .entities()
-                            .find(|e| e.common().handle == *sh)
+                            .filter_map(|entity| match entity {
+                                document::EntityType::Insert(_) => Some(entity.common().handle),
+                                _ => None,
+                            })
+                            .collect();
+                    }
+                    let old_up = old.to_uppercase();
+                    let mut reports = Vec::new();
+                    let mut changed = 0usize;
+                    let mut refs = 0usize;
+                    self.push_undo_snapshot(i, "ATTEDIT RENAME");
+                    for handle in &targets {
+                        if self.tabs[i].scene.is_layer_locked(*handle) {
+                            continue;
+                        }
+                        if let Some(document::EntityType::Insert(ins)) = self.tabs[i]
+                            .scene
+                            .document
+                            .entities_mut()
+                            .find(|e| e.common().handle == *handle)
+                        {
+                            let mut renamed_here = 0usize;
+                            for attr in &mut ins.attributes {
+                                if attr.tag.to_uppercase() == old_up {
+                                    let previous = attr.tag.clone();
+                                    attr.tag = (*new).to_string();
+                                    reports.push(format!(
+                                        "  Insert {handle:x}: [{previous}] -> [{new}]"
+                                    ));
+                                    changed += 1;
+                                    renamed_here += 1;
+                                }
+                            }
+                            if renamed_here > 0 {
+                                refs += 1;
+                            }
+                        }
+                    }
+                    if changed > 0 {
+                        self.tabs[i].dirty = true;
+                        for line in &reports {
+                            self.command_line.push_output(line);
+                        }
+                        self.command_line.push_output(
+                            crate::tf!(
+                                "ATTEDIT: renamed {changed} attribute(s) [{old_up}] -> [{new}] in {refs} reference(s)."
+                            )
+                            .as_ref(),
+                        );
+                    } else {
+                        self.command_line
+                            .push_error(crate::tf!("ATTEDIT: tag '{old_up}' not found.").as_ref());
+                    }
+                } else if option.as_deref() == Some("REPLACE") {
+                    let (Some(old), Some(new)) = (args.get(1).copied(), args.get(2).copied())
+                    else {
+                        self.command_line.push_error(
+                            crate::t!(
+                                "ATTEDIT: usage is -ATTEDIT REPLACE <old string> <new string>."
+                            )
+                            .as_ref(),
+                        );
+                        return Some(Task::none());
+                    };
+                    // No handle and no selection means the whole drawing.
+                    if targets.is_empty() {
+                        targets = self.tabs[i]
+                            .scene
+                            .document
+                            .entities()
+                            .filter_map(|entity| match entity {
+                                document::EntityType::Insert(_) => Some(entity.common().handle),
+                                _ => None,
+                            })
+                            .collect();
+                    }
+                    // The reference narrows the global edit with block-name,
+                    // tag and value specifications, in that order.
+                    let block_spec = args.get(3).copied().unwrap_or("*");
+                    let tag_spec = args.get(4).copied().unwrap_or("*");
+                    let value_spec = args.get(5).copied().unwrap_or("*");
+                    // The global question flow appends its on-screen answer.
+                    let visible_only = args
+                        .get(6)
+                        .is_some_and(|flag| flag.eq_ignore_ascii_case("VISIBLE"));
+                    let on_screen: std::collections::HashSet<document::Handle> = if visible_only {
+                        self.tabs[i]
+                            .scene
+                            .document
+                            .entities()
+                            .filter_map(|entity| match entity {
+                                document::EntityType::Insert(insert)
+                                    if self.typed_point_in_view(
+                                        i,
+                                        glam::DVec3::new(
+                                            insert.insert_point.x,
+                                            insert.insert_point.y,
+                                            insert.insert_point.z,
+                                        ),
+                                    ) =>
+                                {
+                                    Some(entity.common().handle)
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    } else {
+                        std::collections::HashSet::new()
+                    };
+                    let mut changed = 0usize;
+                    let mut occurrences = 0usize;
+                    self.push_undo_snapshot(i, "ATTEDIT REPLACE");
+                    for handle in &targets {
+                        if self.tabs[i].scene.is_layer_locked(*handle) {
+                            continue;
+                        }
+                        if visible_only && !on_screen.contains(handle) {
+                            continue;
+                        }
+                        if let Some(document::EntityType::Insert(ins)) = self.tabs[i]
+                            .scene
+                            .document
+                            .entities_mut()
+                            .find(|e| e.common().handle == *handle)
+                        {
+                            if !crate::app::control::block_ops::glob_match_ci(
+                                block_spec,
+                                &ins.block_name,
+                            ) {
+                                continue;
+                            }
+                            for attr in &mut ins.attributes {
+                                if !crate::app::control::block_ops::glob_match_ci(
+                                    tag_spec, &attr.tag,
+                                ) {
+                                    continue;
+                                }
+                                let value = attr.get_value().to_string();
+                                if crate::app::control::block_ops::glob_match_ci(value_spec, &value)
+                                    && value.contains(old)
+                                {
+                                    occurrences += value.matches(old).count();
+                                    attr.set_value(value.replace(old, new));
+                                    changed += 1;
+                                }
+                            }
+                        }
+                    }
+                    if changed > 0 {
+                        self.tabs[i].dirty = true;
+                        self.command_line.push_output(
+                            crate::tf!(
+                                "ATTEDIT: replaced {occurrences} occurrence(s) of '{old}' with '{new}' in {changed} attribute(s)."
+                            )
+                            .as_ref(),
+                        );
+                    } else {
+                        self.command_line
+                            .push_error(crate::tf!("ATTEDIT: string '{old}' not found.").as_ref());
+                    }
+                } else if targets.is_empty() {
+                    // No handle and nothing selected: ask for the reference
+                    // instead of refusing to start.
+                    if args.is_empty() {
+                        use crate::modules::draw::modify::attedit::AtteditCommand;
+                        let command = AtteditCommand::new(
+                            crate::modules::draw::modify::attedit::AtteditKind::Classic,
+                            None,
+                        );
+                        self.command_line.push_info(&command.prompt());
+                        self.tabs[i].active_cmd = Some(Box::new(command));
+                    } else {
+                        self.command_line.push_error(
+                            crate::t!("ATTEDIT: no Insert entities in selection.").as_ref(),
+                        );
+                    }
+                } else {
+                    let mut lines = Vec::new();
+                    let mut found_any = false;
+                    for handle in &targets {
+                        if let Some(document::EntityType::Insert(ins)) =
+                            self.tabs[i].scene.document.get_entity(*handle)
                         {
                             found_any = true;
-                            if rest.is_empty() {
-                                // List attributes.
+                            if args.is_empty() {
                                 if ins.attributes.is_empty() {
-                                    self.command_line.push_output(
-                                        crate::tf!("  Insert {:x}: no attributes.", sh.value())
-                                            .as_ref(),
-                                    );
+                                    lines.push(format!(
+                                        "  Insert {:x}: no attributes.",
+                                        handle.value()
+                                    ));
                                 } else {
                                     for attr in &ins.attributes {
-                                        self.command_line.push_output(
-                                            crate::tf!(
-                                                "  [{tag}] = {val}",
-                                                tag = attr.tag,
-                                                val = attr.get_value()
-                                            )
-                                            .as_ref(),
-                                        );
+                                        lines.push(format!(
+                                            "  [{}] = {}",
+                                            attr.tag,
+                                            attr.get_value()
+                                        ));
+                                    }
+                                }
+                            } else if args.len() == 1 {
+                                // Individual mode: list the one tag asked for.
+                                let tag_up = args[0].to_uppercase();
+                                for attr in &ins.attributes {
+                                    if attr.tag.to_uppercase() == tag_up {
+                                        lines.push(format!(
+                                            "  [{}] = {}",
+                                            attr.tag,
+                                            attr.get_value()
+                                        ));
                                     }
                                 }
                             }
@@ -156,25 +458,37 @@ impl OpenCADStudio {
                             crate::t!("ATTEDIT: no Insert entities in selection.").as_ref(),
                         );
                     }
-                    // If tag + value supplied, mutate attributes.
-                    if parts.len() == 2 && !parts[0].is_empty() {
-                        let tag_up = parts[0].to_uppercase();
-                        let new_val = parts[1];
+                    for line in lines {
+                        self.command_line.push_output(&line);
+                    }
+                    // Tag and value supplied: set it on every target.
+                    if args.len() >= 2 {
+                        let tag_up = args[0].to_uppercase();
+                        let new_val = args[1];
                         let mut changed = 0usize;
+                        let mut reports = Vec::new();
                         self.push_undo_snapshot(i, "ATTEDIT");
-                        for sh in &selected_handles {
-                            if self.tabs[i].scene.is_layer_locked(*sh) {
+                        for handle in &targets {
+                            if self.tabs[i].scene.is_layer_locked(*handle) {
                                 continue;
                             }
-                            if let Some(codec::EntityType::Insert(ins)) = self.tabs[i]
+                            if let Some(document::EntityType::Insert(ins)) = self.tabs[i]
                                 .scene
                                 .document
                                 .entities_mut()
-                                .find(|e| e.common().handle == *sh)
+                                .find(|e| e.common().handle == *handle)
                             {
                                 for attr in &mut ins.attributes {
                                     if attr.tag.to_uppercase() == tag_up {
+                                        let previous = attr.get_value().to_string();
                                         attr.set_value(new_val);
+                                        reports.push(format!(
+                                            "  Insert {:x}: [{}] '{}' -> '{}'",
+                                            handle.value(),
+                                            attr.tag,
+                                            previous,
+                                            new_val
+                                        ));
                                         changed += 1;
                                     }
                                 }
@@ -182,6 +496,9 @@ impl OpenCADStudio {
                         }
                         if changed > 0 {
                             self.tabs[i].dirty = true;
+                            for line in &reports {
+                                self.command_line.push_output(line);
+                            }
                             self.command_line.push_output(
                                 crate::tf!(
                                 "ATTEDIT: updated {changed} attribute(s) [{tag_up}] = {new_val}."
@@ -198,68 +515,32 @@ impl OpenCADStudio {
                 }
             }
 
-            // ATTDISP — control attribute display visibility.
-            // ATTDISP ON   — make all AttributeDefinitions visible
-            // ATTDISP OFF  — make all AttributeDefinitions invisible
-            // ATTDISP NORMAL — restore: show only those without the invisible flag
+            // ATTDISP sets ATTMODE: 0 hides every attribute, 1 shows the
+            // visible ones, 2 shows them all. The definitions are not touched.
             "ATTDISP" => {
-                use crate::command::KeywordCommand;
-                let c = KeywordCommand::new(
-                    "ATTDISP",
-                    "ATTDISP  attribute display  [On / Off / Normal]:",
-                    vec![
-                        ("On", "ON", None),
-                        ("Off", "OFF", None),
-                        ("Normal", "NORMAL", None),
-                    ],
+                let command = crate::modules::draw::draw::attdef::AttdispCommand::new(
+                    self.tabs[i].scene.document.header.attribute_visibility,
                 );
-                self.command_line.push_info(&c.prompt());
-                self.tabs[i].active_cmd = Some(Box::new(c));
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
             }
             cmd if cmd.starts_with("ATTDISP ") => {
-                let sub = cmd.split_whitespace().nth(1).unwrap_or("").to_uppercase();
-                match sub.as_str() {
-                    "ON" | "OFF" | "NORMAL" => {
-                        let handles: Vec<_> = self.tabs[i]
-                            .scene
-                            .document
-                            .entities()
-                            .filter_map(|entity| {
-                                matches!(entity, codec::EntityType::AttributeDefinition(_))
-                                    .then_some(entity.common().handle)
-                            })
-                            .filter(|handle| !self.tabs[i].scene.is_layer_locked(*handle))
-                            .collect();
-                        self.push_undo_snapshot(i, "ATTDISP");
-                        let mut count = 0usize;
-                        for handle in handles {
-                            if let Some(codec::EntityType::AttributeDefinition(ad)) =
-                                self.tabs[i].scene.document.get_entity_mut(handle)
-                            {
-                                match sub.as_str() {
-                                    "ON" => {
-                                        ad.flags.invisible = false;
-                                        count += 1;
-                                    }
-                                    "OFF" => {
-                                        ad.flags.invisible = true;
-                                        count += 1;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        self.tabs[i].dirty = true;
-                        self.command_line.push_output(
-                            crate::tf!("ATTDISP {sub}: {count} attribute definition(s) updated.")
-                                .as_ref(),
-                        );
-                    }
+                let mode = match cmd[8..].trim().to_ascii_uppercase().as_str() {
+                    "OFF" => 0,
+                    "ON" => 2,
+                    "NORMAL" | "N" => 1,
                     _ => {
-                        self.command_line
-                            .push_info(crate::t!("Usage: ATTDISP ON | OFF | NORMAL").as_ref());
+                        self.command_line.push_rejection("Invalid option keyword.");
+                        return Some(Task::none());
                     }
+                };
+                if self.tabs[i].scene.document.header.attribute_visibility != mode {
+                    self.push_undo_snapshot(i, "ATTDISP");
+                    self.tabs[i].scene.document.header.attribute_visibility = mode;
+                    self.tabs[i].dirty = true;
+                    self.tabs[i].scene.bump_geometry();
                 }
+                self.command_line.push_output("Regenerating model.");
             }
 
             "DONUT" => {
@@ -391,6 +672,7 @@ impl OpenCADStudio {
                 });
                 match seed {
                     Some((s, tangent)) => {
+                        self.last_point = Some(s);
                         let new_cmd = ArcContCommand::new(s, tangent);
                         self.command_line.push_info(&new_cmd.prompt());
                         self.tabs[i].active_cmd = Some(Box::new(new_cmd));
@@ -446,9 +728,13 @@ impl OpenCADStudio {
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
-            "POLY_E" => {
+            "POLY_E" | "_POLY_E_EDGE" => {
                 use crate::modules::draw::draw::shapes::PolyECommand;
-                let new_cmd = PolyECommand::new();
+                let new_cmd = if cmd == "_POLY_E_EDGE" {
+                    PolyECommand::at_first_endpoint()
+                } else {
+                    PolyECommand::new()
+                };
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
@@ -488,7 +774,7 @@ impl OpenCADStudio {
                     .document
                     .entities()
                     .filter_map(|entity| match entity {
-                        codec::EntityType::Face3D(face) => {
+                        document::EntityType::Face3D(face) => {
                             Some((face.common.handle, face.clone()))
                         }
                         _ => None,
@@ -525,63 +811,91 @@ impl OpenCADStudio {
             "CENTERLINE" => {
                 use crate::modules::draw::draw::centerline::CenterLineCommand;
                 let settings = self.tabs[i].scene.centerline_settings();
-                let new_cmd = CenterLineCommand::new(settings);
+                let names = self.tabs[i].scene.layer_names_for_center();
+                let new_cmd = CenterLineCommand::new(settings, names);
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
 
-            "CENTERRESET" => {
-                let handles = self.tabs[i].scene.selected_handles_in_order();
+            // CENTERRESET / CENTERDISASSOCIATE work on the preselected centre
+            // objects, or ask for them.
+            "CENTERRESET" | "CENTERDISASSOCIATE"
+                if !self.tabs[i]
+                    .scene
+                    .selected_handles_in_order()
+                    .iter()
+                    .any(|handle| self.tabs[i].scene.is_center_object(*handle)) =>
+            {
+                use crate::modules::draw::select::SelectObjectsCommand;
+                let (prompt, apply) = if cmd == "CENTERRESET" {
+                    (
+                        crate::tr!("center-cmd", "reset-select"),
+                        "_CENTERRESET_APPLY",
+                    )
+                } else {
+                    (
+                        crate::tr!("center-cmd", "disassociate-select"),
+                        "_CENTERDISASSOCIATE_APPLY",
+                    )
+                };
+                let prompt: &'static str = Box::leak(prompt.into_boxed_str());
+                let select = SelectObjectsCommand::filtered(
+                    cmd,
+                    apply,
+                    prompt,
+                    crate::scene::centerline::is_center_carrier,
+                );
+                self.command_line.push_info(&select.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(select));
+            }
+
+            "CENTERRESET" | "_CENTERRESET_APPLY" => {
+                let handles: Vec<_> = self.tabs[i]
+                    .scene
+                    .selected_handles_in_order()
+                    .into_iter()
+                    .filter(|handle| self.tabs[i].scene.is_center_object(*handle))
+                    .collect();
+                self.tabs[i].scene.deselect_all();
+                // An empty selection ends the command without a report.
+                if handles.is_empty() {
+                    return Some(self.finish_dispatch(cmd));
+                }
                 self.push_undo_snapshot(i, "CENTERRESET");
                 let count = self.tabs[i].scene.reset_centerlines(&handles)
                     + self.tabs[i].scene.reset_center_marks(&handles);
                 if count > 0 {
                     self.tabs[i].dirty = true;
                 }
-                self.command_line.push_output(&crate::tf!(
-                    "CENTERRESET: {count} center object(s) updated."
+                self.command_line.push_output(&crate::tr!(
+                    "center-cmd",
+                    "reset-done",
+                    count = count
                 ));
             }
 
             "CENTERREASSOCIATE" => {
-                let handles = self.tabs[i].scene.selected_handles_in_order();
-                let mark_targets: Vec<_> = handles
-                    .iter()
-                    .copied()
-                    .filter(|handle| {
-                        let Some(codec::EntityType::Line(line)) =
-                            self.tabs[i].scene.document.get_entity(*handle)
-                        else {
-                            return false;
-                        };
-                        codec::entities::CenterMarkAssociation::read(&line.common.extended_data)
-                            .is_some()
-                    })
-                    .collect();
-                if mark_targets.len() == 1 && handles.len() == 1 {
-                    use crate::modules::draw::draw::dimcenter::CenterMarkReassociateCommand;
-                    let new_cmd = CenterMarkReassociateCommand::new(mark_targets[0]);
-                    self.command_line.push_info(&new_cmd.prompt());
-                    self.tabs[i].active_cmd = Some(Box::new(new_cmd));
-                    return Some(self.finish_dispatch(cmd));
-                }
-                self.push_undo_snapshot(i, "CENTERREASSOCIATE");
-                let count = self.tabs[i]
-                    .scene
-                    .set_centerline_association(&handles, true)
-                    + self.tabs[i]
-                        .scene
-                        .set_center_mark_association(&handles, true);
-                if count > 0 {
-                    self.tabs[i].dirty = true;
-                }
-                self.command_line.push_output(&crate::tf!(
-                    "CENTERREASSOCIATE: {count} center object(s) associated."
-                ));
+                use crate::modules::draw::draw::dimcenter::CenterReassociateCommand;
+                let new_cmd = CenterReassociateCommand::new();
+                self.command_line.push_info(&new_cmd.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
 
-            "CENTERDISASSOCIATE" => {
-                let handles = self.tabs[i].scene.selected_handles_in_order();
+            "CENTERDISASSOCIATE" | "_CENTERDISASSOCIATE_APPLY" => {
+                let handles: Vec<_> = self.tabs[i]
+                    .scene
+                    .selected_handles_in_order()
+                    .into_iter()
+                    .filter(|handle| self.tabs[i].scene.is_center_object(*handle))
+                    .collect();
+                self.tabs[i].scene.deselect_all();
+                if handles.is_empty() {
+                    return Some(self.finish_dispatch(cmd));
+                }
+                let was_associated: Vec<(bool, bool)> = handles
+                    .iter()
+                    .filter_map(|handle| self.tabs[i].scene.center_object_state(*handle))
+                    .collect();
                 self.push_undo_snapshot(i, "CENTERDISASSOCIATE");
                 let count = self.tabs[i]
                     .scene
@@ -592,9 +906,20 @@ impl OpenCADStudio {
                 if count > 0 {
                     self.tabs[i].dirty = true;
                 }
-                self.command_line.push_output(&crate::tf!(
-                    "CENTERDISASSOCIATE: {count} center object(s) detached."
+                self.command_line.push_output(&crate::tr!(
+                    "center-cmd",
+                    "disassociate-done",
+                    count = count
                 ));
+                for (mark, associated) in was_associated {
+                    if associated {
+                        self.command_line.push_output(&if mark {
+                            crate::tr!("center-cmd", "mark-disassociated")
+                        } else {
+                            crate::tr!("center-cmd", "line-disassociated")
+                        });
+                    }
+                }
             }
 
             "DIMCENTER" => {
@@ -607,7 +932,8 @@ impl OpenCADStudio {
             "CENTERMARK" => {
                 use crate::modules::draw::draw::dimcenter::CenterMarkCommand;
                 let settings = self.tabs[i].scene.centerline_settings();
-                let new_cmd = CenterMarkCommand::new(settings);
+                let names = self.tabs[i].scene.layer_names_for_center();
+                let new_cmd = CenterMarkCommand::new(settings, names);
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
@@ -650,9 +976,33 @@ impl OpenCADStudio {
                 }
             }
 
-            "MEASUREGEOM" => {
+            // GAPCHECK steps through small openings between the loose ends
+            // of the selected curves; it changes nothing.
+            "GAPCHECK" => {
+                use crate::modules::manage::gapcheck::{curve_ends, GapCheckCommand};
+                if self.tabs[i].scene.selected.is_empty() {
+                    use crate::modules::draw::select::SelectObjectsCommand;
+                    let selection = SelectObjectsCommand::new("GAPCHECK");
+                    self.command_line.push_info(&selection.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(selection));
+                } else {
+                    let ends = curve_ends(self.tabs[i].scene.selected_entities());
+                    let command = GapCheckCommand::new(ends);
+                    self.command_line.push_info(&command.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(command));
+                }
+            }
+
+            "MEASUREGEOM" | "MEASURERADIUS" | "MEASUREANGLE" => {
                 use crate::modules::draw::inquiry::measuregeom::MeasureGeomCommand;
-                let new_cmd = MeasureGeomCommand::new();
+                let new_cmd = match cmd {
+                    "MEASURERADIUS" => MeasureGeomCommand::radius(),
+                    "MEASUREANGLE" => MeasureGeomCommand::angle(),
+                    // A first arc or length segment leaves where the
+                    // drawing's last line or arc ended.
+                    _ => MeasureGeomCommand::new()
+                        .with_last_direction(self.cont_anchor.map(|(_, direction)| direction)),
+                };
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
@@ -785,6 +1135,8 @@ impl OpenCADStudio {
 
             "HATCH" => {
                 use crate::modules::draw::draw::hatch::HatchCommand;
+                let perf_hatch = crate::perf::enabled();
+                let hatch_start = perf_hatch.then(iced::time::Instant::now);
                 let working_plane = if self.tabs[i].editing_model_space() {
                     self.tabs[i].ucs_xform().working_plane()
                 } else {
@@ -793,7 +1145,7 @@ impl OpenCADStudio {
                 let normal = working_plane.z.normalize_or(glam::DVec3::Z);
                 let elevation = working_plane.origin.dot(normal);
                 let storage = crate::entities::curve::ocs_plane(
-                    codec::types::Vector3::new(normal.x, normal.y, normal.z),
+                    document::types::Vector3::new(normal.x, normal.y, normal.z),
                     elevation,
                 );
                 let plane = crate::command::WorkingPlane::new(
@@ -801,8 +1153,24 @@ impl OpenCADStudio {
                     glam::DVec3::from_array(storage.x_axis),
                     glam::DVec3::from_array(storage.y_axis),
                 );
-                let boundary_sources = self.tabs[i].scene.boundary_sources_on_plane(plane, 1.0e-6);
-                let outlines = crate::scene::boundary_faces(&boundary_sources, 1.0e-6);
+                let sources_started = crate::perf::enabled().then(iced::time::Instant::now);
+                let boundary_sources = self.tabs[i].scene.boundary_sources_on_screen(plane, 1.0e-6);
+                let sources_ms = crate::perf::elapsed_ms(sources_started);
+                let (source_count, segment_count, curve_count) = if perf_hatch {
+                    (
+                        boundary_sources.len(),
+                        boundary_sources
+                            .values()
+                            .map(|source| source.segments.len())
+                            .sum::<usize>(),
+                        boundary_sources
+                            .values()
+                            .map(|source| source.curves.len())
+                            .sum::<usize>(),
+                    )
+                } else {
+                    (0, 0, 0)
+                };
                 let selected = self.tabs[i]
                     .scene
                     .selected_entities()
@@ -812,14 +1180,27 @@ impl OpenCADStudio {
                 let inherited = selected.iter().find_map(|handle| {
                     let model = self.tabs[i].scene.hatches.get(handle)?.clone();
                     let common = self.tabs[i].scene.document.get_entity(*handle)?.common();
-                    Some((model, common.color.clone(), common.transparency))
+                    Some((model, common.color, common.transparency))
                 });
-                let new_cmd =
-                    HatchCommand::new(outlines, boundary_sources, selected, inherited, plane)
-                        .with_origin(self.tabs[i].scene.document.hatch_origin());
+                let new_cmd = HatchCommand::new(boundary_sources, selected, inherited, plane)
+                    .with_origin(self.tabs[i].scene.document.hatch_origin())
+                    .with_associative(self.hatch_associative)
+                    .with_gap_tolerance(self.hatch_gap_tolerance)
+                    .with_prefs(self.hatch_prefs);
+                if let Some(message) = new_cmd.start_message() {
+                    self.command_line.push_output(&message);
+                }
+                self.hatch_drafts = Default::default();
+                self.hatch_panel_shown = false;
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
                 self.refresh_area_preview(i);
+                let total_ms = crate::perf::elapsed_ms(hatch_start);
+                if perf_hatch && total_ms >= 1.0 {
+                    crate::perf_record!(
+                        "[perf] hatch-command-start total={total_ms:.1}ms sources={source_count} segments={segment_count} curves={curve_count} source-query={sources_ms:.1}ms"
+                    );
+                }
             }
 
             "HATCHEDIT" => {
@@ -837,7 +1218,7 @@ impl OpenCADStudio {
                             )
                         });
                         let (scale, angle) = match entity {
-                            Some(codec::EntityType::Hatch(hatch)) => (
+                            Some(document::EntityType::Hatch(hatch)) => (
                                 hatch.pattern_scale as f32,
                                 hatch.pattern_angle.to_degrees() as f32,
                             ),
@@ -877,14 +1258,23 @@ impl OpenCADStudio {
             }
 
             "GRADIENT" => {
-                use crate::modules::draw::draw::hatch::GradientCommand;
-                let boundary_sources = self.tabs[i]
-                    .scene
-                    .boundary_sources_on_plane(crate::command::WorkingPlane::default(), 1.0e-6);
-                let outlines = crate::scene::boundary_faces(&boundary_sources, 1.0e-6);
-                let new_cmd = GradientCommand::new(outlines, boundary_sources);
+                use crate::modules::draw::draw::hatch::HatchCommand;
+                let plane = crate::command::WorkingPlane::default();
+                let boundary_sources = self.tabs[i].scene.boundary_sources_on_screen(plane, 1.0e-6);
+                let new_cmd = HatchCommand::new(boundary_sources, Vec::new(), None, plane)
+                    .gradient()
+                    .with_origin(self.tabs[i].scene.document.hatch_origin())
+                    .with_associative(self.hatch_associative)
+                    .with_gap_tolerance(self.hatch_gap_tolerance)
+                    .with_prefs(self.hatch_prefs);
+                if let Some(message) = new_cmd.start_message() {
+                    self.command_line.push_output(&message);
+                }
+                self.hatch_drafts = Default::default();
+                self.hatch_panel_shown = false;
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
+                self.refresh_area_preview(i);
             }
 
             "BOUNDARY" => {
@@ -894,27 +1284,40 @@ impl OpenCADStudio {
                 } else {
                     crate::command::WorkingPlane::default()
                 };
-                let sources = self.tabs[i].scene.boundary_sources_on_plane(plane, 1.0e-6);
+                let sources = self.tabs[i].scene.boundary_sources_on_screen(plane, 1.0e-6);
                 let selected = self.tabs[i]
                     .scene
                     .selected_entities()
                     .iter()
                     .map(|(handle, _)| *handle)
                     .collect();
-                let new_cmd = BoundaryCommand::new(sources, selected, plane);
+                let new_cmd =
+                    BoundaryCommand::new(sources, selected, plane, self.hatch_gap_tolerance);
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
 
-            "ELLIPSE" => {
+            "ELLIPSE_CENTER" => {
                 use crate::modules::draw::draw::ellipse::EllipseCommand;
+                let pellipse = self.tabs[i]
+                    .scene
+                    .document
+                    .header
+                    .create_ellipse_as_polyline;
+                crate::modules::draw::defaults::set_pellipse(pellipse);
                 let new_cmd = EllipseCommand::new();
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
 
-            "ELLIPSE_AXIS" => {
+            "ELLIPSE" | "ELLIPSE_AXIS" => {
                 use crate::modules::draw::draw::ellipse::EllipseAxisCommand;
+                let pellipse = self.tabs[i]
+                    .scene
+                    .document
+                    .header
+                    .create_ellipse_as_polyline;
+                crate::modules::draw::defaults::set_pellipse(pellipse);
                 let new_cmd = EllipseAxisCommand::new();
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
@@ -922,6 +1325,12 @@ impl OpenCADStudio {
 
             "ELLIPSE_ARC" => {
                 use crate::modules::draw::draw::ellipse::EllipseArcCommand;
+                let pellipse = self.tabs[i]
+                    .scene
+                    .document
+                    .header
+                    .create_ellipse_as_polyline;
+                crate::modules::draw::defaults::set_pellipse(pellipse);
                 let new_cmd = EllipseArcCommand::new();
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
@@ -983,6 +1392,12 @@ impl OpenCADStudio {
             }
 
             "ERASE" => {
+                // A selected Block Editor parameter/action erases like Delete.
+                if self.tabs[i].selected_authoring.is_some()
+                    && self.tabs[i].scene.selected.is_empty()
+                {
+                    return Some(self.update(Message::DeleteSelected));
+                }
                 let handles: Vec<_> = self.tabs[i]
                     .scene
                     .selected_entities()
@@ -996,7 +1411,6 @@ impl OpenCADStudio {
                     self.command_line.push_info(&cmd.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(cmd));
                 } else {
-                    let n = handles.len();
                     let delta_safe = self.delta_erase_safe(i, &handles);
                     let pending = self.begin_undo(i, "ERASE", handles.len(), delta_safe);
                     // Stash the erased entities so OOPS can restore them.
@@ -1004,11 +1418,20 @@ impl OpenCADStudio {
                         .iter()
                         .filter_map(|h| self.tabs[i].scene.document.get_entity_arc(*h))
                         .collect();
+                    // Erasing an associative hatch drops its link to its boundary.
+                    let associative_hatch = handles.iter().any(|h| {
+                        matches!(
+                            self.tabs[i].scene.document.get_entity(*h),
+                            Some(document::EntityType::Hatch(hatch)) if hatch.is_associative
+                        )
+                    });
                     self.tabs[i].scene.erase_entities(&handles);
                     self.tabs[i].dirty = true;
                     self.refresh_properties();
-                    self.command_line
-                        .push_output(crate::tf!("{n} object(s) erased.").as_ref());
+                    if associative_hatch {
+                        self.command_line
+                            .push_output(&crate::tr!("hatch-cmd", "associativity-removed"));
+                    }
                     if let Some(pd) = pending {
                         self.commit_undo_delta(i, pd);
                     }
@@ -1059,13 +1482,72 @@ impl OpenCADStudio {
                 }
             }
 
-            "GCRESET" => {
+            "DCDISPLAY" => {
+                use crate::command::ValuePromptCommand;
+                use crate::modules::draw::select::SelectObjectsCommand;
+                if self.tabs[i].scene.selected_handles_in_order().is_empty() {
+                    let sel = SelectObjectsCommand::new(cmd);
+                    self.command_line.push_info(&sel.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(sel));
+                } else {
+                    let c = ValuePromptCommand::new(
+                        "DCDISPLAY",
+                        "DCDISPLAY  Enter an option [Show/Hide] <Show>:",
+                    );
+                    self.command_line.push_info(&c.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(c));
+                }
+            }
+
+            cmd if cmd.starts_with("DCDISPLAY ") => {
+                let visible = match cmd["DCDISPLAY ".len()..]
+                    .trim()
+                    .to_ascii_uppercase()
+                    .as_str()
+                {
+                    "" | "S" | "SHOW" => true,
+                    "H" | "HIDE" => false,
+                    _ => {
+                        self.command_line
+                            .push_error(crate::t!("Usage: DCDISPLAY [Show|Hide]").as_ref());
+                        return Some(self.finish_dispatch(cmd));
+                    }
+                };
+                let handles = self.tabs[i].scene.selected_handles_in_order();
                 let scope = self.tabs[i].current_parametric_scope();
-                let count = self.tabs[i]
-                    .scene
-                    .set_parametric_constraint_visibility(scope, None, false, true);
+                let count = self.tabs[i].scene.set_parametric_constraint_visibility(
+                    scope,
+                    Some(&handles),
+                    true,
+                    visible,
+                );
                 self.command_line
-                    .push_output(format!("{} constraint indicator(s) reset.", count).as_str());
+                    .push_output(crate::tf!("{} constraint indicator(s) updated.", count).as_ref());
+            }
+
+            "GCRESET" => {
+                let handles = self.tabs[i].scene.selected_handles_in_order();
+                if handles.is_empty() {
+                    self.command_line
+                        .push_error(crate::t!("No objects selected.").as_ref());
+                } else {
+                    let scope = self.tabs[i].current_parametric_scope();
+                    let count = self.tabs[i].scene.set_parametric_constraint_visibility(
+                        scope,
+                        Some(&handles),
+                        false,
+                        true,
+                    );
+                    if count == 0 {
+                        self.command_line.push_output(
+                            crate::t!("No constraint indicators on the selection.").as_ref(),
+                        );
+                    } else {
+                        self.command_line.push_output(
+                            crate::tf!("{} constraint indicator(s) reset.", count).as_ref(),
+                        );
+                    }
+                }
             }
 
             "CONSTRAINTBAR_RESET" => {
@@ -1080,9 +1562,8 @@ impl OpenCADStudio {
                         false,
                         true,
                     );
-                    self.command_line.push_output(
-                        format!("{} constraint bar(s) reset.", count).as_str(),
-                    );
+                    self.command_line
+                        .push_output(format!("{} constraint bar(s) reset.", count).as_str());
                 }
             }
 
@@ -1097,7 +1578,7 @@ impl OpenCADStudio {
                     visible,
                 );
                 self.command_line
-                    .push_output(format!("{} constraint indicator(s) updated.", count).as_str());
+                    .push_output(crate::tf!("{} constraint indicator(s) updated.", count).as_ref());
             }
 
             "DELCONSTRAINT" => {
@@ -1131,7 +1612,7 @@ impl OpenCADStudio {
                         self.command_line.push_output("No constraints found.");
                         return None;
                     }
-                    let dimensions: Vec<codec::Handle> = ids
+                    let dimensions: Vec<document::Handle> = ids
                         .iter()
                         .filter_map(|id| before.dimensions.get(id).copied())
                         .collect();
@@ -1195,20 +1676,15 @@ impl OpenCADStudio {
                     self.tabs[i].active_cmd = Some(Box::new(sel));
                 } else {
                     let scope = self.tabs[i].current_parametric_scope();
-                    let inferred = self.tabs[i]
-                        .scene
-                        .inferred_parametric_constraints(
-                            scope,
-                            &handles,
-                            &self.auto_constrain_settings,
-                        );
+                    let inferred = self.tabs[i].scene.inferred_parametric_constraints(
+                        scope,
+                        &handles,
+                        &self.auto_constrain_settings,
+                    );
                     if inferred.is_empty() {
                         self.command_line.push_output(
-                            format!(
-                                "0 constraint(s) applied to {} object(s).",
-                                handles.len()
-                            )
-                            .as_str(),
+                            format!("0 constraint(s) applied to {} object(s).", handles.len())
+                                .as_str(),
                         );
                         self.tabs[i].scene.deselect_all();
                         self.refresh_selected_grips();
@@ -1227,6 +1703,11 @@ impl OpenCADStudio {
                             .scene
                             .record_undo_parametric_constraints_before(scope, before);
                         let count = inferred.len();
+                        let mut per_kind: std::collections::BTreeMap<&'static str, usize> =
+                            std::collections::BTreeMap::new();
+                        for (kind, _) in &inferred {
+                            *per_kind.entry(kind.label()).or_default() += 1;
+                        }
                         for (kind, refs) in inferred {
                             let id = self.tabs[i]
                                 .scene
@@ -1243,10 +1724,11 @@ impl OpenCADStudio {
                             .copied()
                             .map(|handle| (handle, crate::scene::ChangeKind::Modified))
                             .collect();
-                        self.tabs[i].scene.bump_entities_with_parametric_policy(
+                        self.tabs[i].scene.bump_entities_after_constraint_added(
                             &changes,
                             &[],
                             self.constraint_solve_mode,
+                            &[],
                         );
                         self.tabs[i].dirty = true;
                         self.refresh_properties();
@@ -1258,6 +1740,15 @@ impl OpenCADStudio {
                             )
                             .as_str(),
                         );
+                        let mut breakdown: Vec<(&str, usize)> = per_kind.into_iter().collect();
+                        breakdown.sort_by(|left, right| {
+                            right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0))
+                        });
+                        for (name, n) in breakdown {
+                            self.command_line
+                                .push_output(format!("{n} {name}").as_str());
+                        }
+                        self.report_pending_network_moves(i);
                         if let Some(pd) = pending {
                             self.commit_undo_delta(i, pd);
                         }
@@ -1267,6 +1758,7 @@ impl OpenCADStudio {
 
             "GCSMOOTH" => {
                 use crate::modules::parametric::SmoothConstraintCommand;
+                self.geom_constraint_last = "Smooth";
                 let handles = self.tabs[i].scene.selected_handles_in_order();
                 if handles.is_empty() {
                     let command = SmoothConstraintCommand::new();
@@ -1331,8 +1823,7 @@ impl OpenCADStudio {
                 use crate::scene::named_parameters::DrivingValue;
                 use crate::scene::parametric_constraints::{
                     dynamic_dimension_text, next_angular_parameter_name,
-                    next_dimensional_parameter_name, next_radial_parameter_name,
-                    ConstraintKind,
+                    next_dimensional_parameter_name, next_radial_parameter_name, ConstraintKind,
                 };
 
                 let scope = self.tabs[i].current_parametric_scope();
@@ -1372,7 +1863,11 @@ impl OpenCADStudio {
                     };
                     if self.tabs[i]
                         .scene
-                        .validate_parametric_constraint(kind, &refs, Some(&DrivingValue::Literal(measured)))
+                        .validate_parametric_constraint(
+                            kind,
+                            &refs,
+                            Some(&DrivingValue::Literal(measured)),
+                        )
                         .is_err()
                     {
                         refused += 1;
@@ -1456,7 +1951,7 @@ impl OpenCADStudio {
                         annotational,
                         decimals,
                     );
-                    if let Some(codec::EntityType::Dimension(mut dimension)) =
+                    if let Some(document::EntityType::Dimension(mut dimension)) =
                         self.tabs[i].scene.document.get_entity(handle).cloned()
                     {
                         let before = self.tabs[i].scene.document.get_entity_arc(handle);
@@ -1472,7 +1967,7 @@ impl OpenCADStudio {
                             dimension.base_mut().common.layer =
                                 crate::scene::parametric_constraints::DYNAMIC_DIMENSION_LAYER
                                     .to_string();
-                            dimension.base_mut().common.color = codec::types::Color::Rgb {
+                            dimension.base_mut().common.color = document::types::Color::Rgb {
                                 r: 103,
                                 g: 109,
                                 b: 118,
@@ -1480,7 +1975,7 @@ impl OpenCADStudio {
                         }
                         self.tabs[i]
                             .scene
-                            .update_entity(codec::EntityType::Dimension(dimension));
+                            .update_entity(document::EntityType::Dimension(dimension));
                     }
                     let set = self.tabs[i].scene.parametric_constraint_set_mut(scope);
                     let id = set.add(kind, refs, Some(DrivingValue::Named(name)));
@@ -1495,17 +1990,22 @@ impl OpenCADStudio {
                     .into_iter()
                     .map(|handle| (handle, crate::scene::ChangeKind::Modified))
                     .collect();
-                self.tabs[i].scene.bump_entities(&changes);
+                self.tabs[i]
+                    .scene
+                    .bump_entities_after_constraint_added(&changes, &[], false, &[]);
                 self.tabs[i].scene.refresh_hidden_dynamic_dimensions();
                 self.tabs[i].scene.refresh_dynamic_dimension_scales(true);
                 self.tabs[i].scene.deselect_all();
                 self.tabs[i].dirty = true;
                 self.refresh_properties();
-                self.command_line
-                    .push_output(crate::tf!("{converted} associative dimensions converted").as_ref());
                 self.command_line.push_output(
-                    crate::tf!("{refused} associative dimension(s) could not be converted").as_ref(),
+                    crate::tf!("{converted} associative dimensions converted").as_ref(),
                 );
+                self.command_line.push_output(
+                    crate::tf!("{refused} associative dimension(s) could not be converted")
+                        .as_ref(),
+                );
+                self.report_pending_network_moves(i);
                 if let Some(pd) = pending {
                     self.commit_undo_delta(i, pd);
                 }
@@ -1522,8 +2022,13 @@ impl OpenCADStudio {
                 let (kind, axis, label) = if vertical {
                     (ConstraintKind::Vertical, "Vertical", "Vertical constraint")
                 } else {
-                    (ConstraintKind::Horizontal, "Horizontal", "Horizontal constraint")
+                    (
+                        ConstraintKind::Horizontal,
+                        "Horizontal",
+                        "Horizontal constraint",
+                    )
                 };
+                self.geom_constraint_last = axis;
                 let new_command = || {
                     if vertical {
                         HorizontalConstraintCommand::vertical()
@@ -1541,20 +2046,21 @@ impl OpenCADStudio {
                         .push_error(&format!("{axis}: select exactly one compatible object."));
                 } else {
                     let handle = handles[0];
-                    let reference = self.tabs[i]
-                        .scene
-                        .document
-                        .get_entity(handle)
-                        .and_then(|entity| {
-                            HorizontalConstraintCommand::preselected_reference(entity, handle)
-                        });
+                    let reference =
+                        self.tabs[i]
+                            .scene
+                            .document
+                            .get_entity(handle)
+                            .and_then(|entity| {
+                                HorizontalConstraintCommand::preselected_reference(entity, handle)
+                            });
                     if let Some(reference) = reference {
                         let plane = self.tabs[i].ucs_xform().working_plane();
                         let direction = if vertical { plane.y } else { plane.x };
                         return Some(self.apply_cmd_result(CmdResult::AddHorizontalConstraint {
                             kind,
                             selection: HorizontalConstraintSelection::Reference(reference),
-                            direction: codec::types::Vector3::new(
+                            direction: document::types::Vector3::new(
                                 direction.x,
                                 direction.y,
                                 direction.z,
@@ -1577,18 +2083,21 @@ impl OpenCADStudio {
                 use crate::modules::parametric::FixConstraintCommand;
                 use crate::scene::parametric_constraints::ConstraintKind;
 
+                self.geom_constraint_last = "Fix";
+
                 // One preselected whole curve applies at once (ribbon
                 // "select first, then click"); anything else goes through
                 // the reference's own point-or-object prompt.
                 let handles = self.tabs[i].scene.selected_handles_in_order();
                 if let [handle] = handles.as_slice() {
-                    let reference = self.tabs[i]
-                        .scene
-                        .document
-                        .get_entity(*handle)
-                        .and_then(|entity| {
-                            FixConstraintCommand::preselected_reference(entity, *handle)
-                        });
+                    let reference =
+                        self.tabs[i]
+                            .scene
+                            .document
+                            .get_entity(*handle)
+                            .and_then(|entity| {
+                                FixConstraintCommand::preselected_reference(entity, *handle)
+                            });
                     if let Some(reference) = reference {
                         return Some(self.apply_cmd_result(CmdResult::AddParametricConstraint {
                             kind: ConstraintKind::Fixed,
@@ -1608,6 +2117,7 @@ impl OpenCADStudio {
 
             "CCONSTRAINT" | "GCCOINCIDENT" => {
                 use crate::modules::parametric::CoincidentConstraintCommand;
+                self.geom_constraint_last = "Coincident";
                 let new_cmd = CoincidentConstraintCommand::new();
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
@@ -1615,7 +2125,7 @@ impl OpenCADStudio {
 
             "GEOMCONSTRAINT" => {
                 use crate::modules::parametric::GeomConstraintCommand;
-                let new_cmd = GeomConstraintCommand::new();
+                let new_cmd = GeomConstraintCommand::new(self.geom_constraint_last);
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
@@ -1638,16 +2148,91 @@ impl OpenCADStudio {
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
 
-            // DCFORM's answer, then on into DIMCONSTRAINT's options as the
-            // reference does.
+            // DCFORM's answer: convert the selected dimensional constraints,
+            // or, with nothing selected, set the form new ones will use.
             cmd if cmd.starts_with("DCFORM_SET ") => {
                 use crate::modules::parametric::DimConstraintMenuCommand;
-                self.constraint_form_annotational = cmd
+                let annotational = cmd
                     .trim_start_matches("DCFORM_SET ")
                     .trim()
                     .eq_ignore_ascii_case("Annotational");
+                let dimensions = self.tabs[i]
+                    .scene
+                    .selected_dimensional_constraint_dimensions();
+                if !dimensions.is_empty() {
+                    let form = self.constraint_form_name();
+                    let changing: Vec<_> = dimensions
+                        .iter()
+                        .copied()
+                        .filter(|handle| {
+                            self.tabs[i].scene.dimension_is_annotational(*handle) != annotational
+                        })
+                        .collect();
+                    if changing.is_empty() {
+                        self.constraint_form_annotational = annotational;
+                        self.command_line.push_output(&format!(
+                            "The selected dimensional constraint already uses the {form} form."
+                        ));
+                        self.tabs[i].active_cmd = None;
+                        self.tabs[i].snap_result = None;
+                        return Some(self.finish_dispatch(cmd));
+                    }
+                    let layer = self.tabs[i].active_layer.clone();
+                    let pending = self.begin_undo(i, "Constraint form", changing.len(), false);
+                    let mut converted = 0;
+                    for handle in &changing {
+                        if self.tabs[i].scene.set_dimensional_constraint_form(
+                            *handle,
+                            annotational,
+                            &layer,
+                        ) {
+                            converted += 1;
+                        }
+                    }
+                    if converted > 0 {
+                        self.constraint_form_annotational = annotational;
+                        self.tabs[i].scene.refresh_dynamic_dimension_texts();
+                        self.tabs[i].scene.refresh_dynamic_dimension_scales(true);
+                        self.tabs[i].scene.refresh_hidden_dynamic_dimensions();
+                        self.tabs[i].dirty = true;
+                        self.refresh_properties();
+                    }
+                    let failed = changing.len() - converted;
+                    if failed > 0 {
+                        self.command_line.push_error(&format!(
+                            "{failed} of {} dimensional constraints could not be changed; a locked layer or a read-only dimension blocks them.",
+                            changing.len()
+                        ));
+                    } else {
+                        self.command_line.push_output(&format!(
+                            "{converted} dimensional constraint{} converted to the {form} form.",
+                            if converted == 1 { "" } else { "s" }
+                        ));
+                    }
+                    self.tabs[i].active_cmd = None;
+                    self.tabs[i].snap_result = None;
+                    if let Some(pd) = pending {
+                        if converted > 0 {
+                            self.commit_undo_delta(i, pd);
+                        } else {
+                            // Nothing changed, so the recording must not
+                            // become an empty history step.
+                            let _ = self.tabs[i].scene.take_undo_recording();
+                        }
+                    }
+                    return Some(self.finish_dispatch(cmd));
+                }
+                if !self.tabs[i].scene.selected_handles_in_order().is_empty() {
+                    self.command_line.push_error(
+                        "No dimensional constraint is selected; select its dimension and run DCFORM again.",
+                    );
+                    self.tabs[i].active_cmd = None;
+                    self.tabs[i].snap_result = None;
+                    return Some(self.finish_dispatch(cmd));
+                }
+                self.constraint_form_annotational = annotational;
                 self.command_line.push_output(&format!(
-                    "Current settings:  Constraint form = {}",
+                    "Current settings:  Constraint form = {} (used by new dimensional constraints).",
                     self.constraint_form_name()
                 ));
                 let new_cmd = DimConstraintMenuCommand::new(self.dim_constraint_last);
@@ -1751,14 +2336,16 @@ impl OpenCADStudio {
                 use crate::command::CmdResult;
                 use crate::modules::parametric::PerpendicularConstraintCommand;
 
+                self.geom_constraint_last = "Perpendicular";
                 let handles = self.tabs[i].scene.selected_handles_in_order();
                 if handles.is_empty() {
                     let command = PerpendicularConstraintCommand::new();
                     self.command_line.push_info(&command.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(command));
                 } else if handles.len() != 2 {
+                    self.tabs[i].scene.deselect_all();
                     self.command_line
-                        .push_output("Select exactly two perpendicular-compatible objects.");
+                        .push_error("Select exactly two perpendicular-compatible objects.");
                 } else {
                     let picks = handles
                         .iter()
@@ -1768,36 +2355,37 @@ impl OpenCADStudio {
                         })
                         .collect::<Vec<_>>();
                     if picks.len() == 2 && picks[0].reference != picks[1].reference {
-                        return Some(self.apply_cmd_result(CmdResult::AddPerpendicularConstraint {
-                            first: picks[0].reference,
-                            second: picks[1].reference,
-                            first_fixed: picks[0].fixed_reference,
-                            second_start: picks[1].start_reference,
-                            label: "Perpendicular constraint",
-                        }));
+                        return Some(self.apply_cmd_result(
+                            CmdResult::AddPerpendicularConstraint {
+                                first: picks[0].reference,
+                                second: picks[1].reference,
+                                first_fixed: picks[0].fixed_reference,
+                                second_start: picks[1].start_reference,
+                                label: "Perpendicular constraint",
+                            },
+                        ));
                     }
                     self.tabs[i].scene.deselect_all();
                     self.command_line.push_error(
                         "Invalid selection for Perpendicular. Select a line segment, polyline segment, text, MText, major or minor axis of ellipse or elliptical arc.",
                     );
-                    let command = PerpendicularConstraintCommand::new();
-                    self.command_line.push_info(&command.prompt());
-                    self.tabs[i].active_cmd = Some(Box::new(command));
                 }
             }
 
-            "TCONSTRAINT" => {
+            "TCONSTRAINT" | "GCTANGENT" => {
                 use crate::command::CmdResult;
                 use crate::modules::parametric::TangentConstraintCommand;
 
+                self.geom_constraint_last = "Tangent";
                 let handles = self.tabs[i].scene.selected_handles_in_order();
                 if handles.is_empty() {
                     let command = TangentConstraintCommand::new();
                     self.command_line.push_info(&command.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(command));
                 } else if handles.len() != 2 {
+                    self.tabs[i].scene.deselect_all();
                     self.command_line
-                        .push_output("Select exactly two tangent-compatible objects.");
+                        .push_error("Select exactly two tangent-compatible objects.");
                 } else {
                     let refs = handles
                         .iter()
@@ -1817,23 +2405,52 @@ impl OpenCADStudio {
                     self.command_line.push_error(
                         "Invalid selection for Tangent. Select a line, polyline segment, circle, arc or ellipse.",
                     );
-                    let command = TangentConstraintCommand::new();
-                    self.command_line.push_info(&command.prompt());
-                    self.tabs[i].active_cmd = Some(Box::new(command));
                 }
             }
 
             "ECONSTRAINT" | "GCEQUAL" => {
+                use crate::command::CmdResult;
                 use crate::modules::parametric::EqualConstraintCommand;
-                // Both objects are picked inside the command, as in the
-                // reference; a selection made beforehand is not used.
+                self.geom_constraint_last = "Equal";
+                // A live selection is the set the constraint is about: the
+                // umbrella dispatches the type while the picks are still in
+                // place, and the reference consumes a pickfirst selection
+                // there too. The first object is the datum, as it is for a
+                // first-then-second pick; with nothing selected the command
+                // picks its own two objects.
+                let handles = self.tabs[i].scene.selected_handles_in_order();
+                if handles.len() >= 2 {
+                    let refs = handles
+                        .iter()
+                        .filter_map(|handle| {
+                            let entity = self.tabs[i].scene.document.get_entity(*handle)?;
+                            EqualConstraintCommand::preselected_reference(entity, *handle)
+                        })
+                        .collect::<Vec<_>>();
+                    if refs.len() == handles.len() {
+                        let (first, others) = refs.split_first().expect("checked len >= 2");
+                        return Some(self.apply_cmd_result(CmdResult::AddEqualConstraint {
+                            first: *first,
+                            others: others.to_vec(),
+                            multiple: false,
+                            label: "Equal constraint",
+                        }));
+                    }
+                    self.command_line
+                        .push_error(EqualConstraintCommand::INVALID_OBJECT);
+                }
                 self.tabs[i].scene.deselect_all();
                 let command = EqualConstraintCommand::new();
                 self.command_line.push_info(&command.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(command));
             }
 
-            "PCONSTRAINT" | "LCONSTRAINT" | "NRCONSTRAINT" => {
+            "PCONSTRAINT" | "LCONSTRAINT" | "NRCONSTRAINT" | "GCPARALLEL" | "GCCOLLINEAR" => {
+                match cmd {
+                    "PCONSTRAINT" | "GCPARALLEL" => self.geom_constraint_last = "Parallel",
+                    "LCONSTRAINT" | "GCCOLLINEAR" => self.geom_constraint_last = "Collinear",
+                    _ => {}
+                }
                 let handles = self.tabs[i].scene.selected_handles_in_order();
                 if handles.is_empty() {
                     use crate::modules::draw::select::SelectObjectsCommand;
@@ -1841,15 +2458,20 @@ impl OpenCADStudio {
                     self.command_line.push_info(&sel.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(sel));
                 } else if handles.len() != 2 {
-                    self.command_line.push_output(
+                    self.tabs[i].scene.deselect_all();
+                    self.command_line.push_error(
                         "Select exactly two entities (first = reference, second = the one that moves), then run this constraint again.",
                     );
                 } else {
                     use crate::command::CmdResult;
                     use crate::scene::parametric_constraints::{ConstraintKind, ParametricRef};
                     let (kind, label) = match cmd {
-                        "PCONSTRAINT" => (ConstraintKind::Parallel, "Parallel constraint"),
-                        "LCONSTRAINT" => (ConstraintKind::Colinear, "Colinear constraint"),
+                        "PCONSTRAINT" | "GCPARALLEL" => {
+                            (ConstraintKind::Parallel, "Parallel constraint")
+                        }
+                        "LCONSTRAINT" | "GCCOLLINEAR" => {
+                            (ConstraintKind::Colinear, "Colinear constraint")
+                        }
                         _ => (ConstraintKind::Normal, "Normal constraint"),
                     };
                     return Some(self.apply_cmd_result(CmdResult::AddParametricConstraint {
@@ -1868,6 +2490,7 @@ impl OpenCADStudio {
                 use crate::command::CmdResult;
                 use crate::modules::parametric::ConcentricConstraintCommand;
 
+                self.geom_constraint_last = "Concentric";
                 let handles = self.tabs[i].scene.selected_handles_in_order();
                 if handles.is_empty() {
                     let command = ConcentricConstraintCommand::new();
@@ -1894,6 +2517,9 @@ impl OpenCADStudio {
                     );
                     let command = refs
                         .first()
+                        // Unlike the perpendicular and tangent refusals, this
+                        // one keeps a pick that did convert: the command asks
+                        // for the partner of a circle it already holds.
                         .copied()
                         .map(ConcentricConstraintCommand::with_first)
                         .unwrap_or_else(ConcentricConstraintCommand::new);
@@ -1902,7 +2528,8 @@ impl OpenCADStudio {
                 }
             }
 
-            "SYCONSTRAINT" => {
+            "SYCONSTRAINT" | "GCSYMMETRIC" => {
+                self.geom_constraint_last = "Symmetric";
                 let handles = self.tabs[i].scene.selected_handles_in_order();
                 if handles.is_empty() {
                     use crate::modules::parametric::SymmetricConstraintCommand;
@@ -1910,21 +2537,21 @@ impl OpenCADStudio {
                     self.command_line.push_info(&command.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(command));
                 } else {
-                    use crate::command::{
-                        CmdResult, SymmetricConstraintSelection,
-                    };
+                    use crate::command::{CmdResult, SymmetricConstraintSelection};
                     use crate::modules::parametric::SymmetricConstraintCommand;
 
-                    let refs = (handles.len() == 3).then(|| {
-                        let first = self.tabs[i].scene.document.get_entity(handles[0])?;
-                        let second = self.tabs[i].scene.document.get_entity(handles[1])?;
-                        let axis = self.tabs[i].scene.document.get_entity(handles[2])?;
-                        SymmetricConstraintCommand::preselected_refs(
-                            (first, handles[0]),
-                            (second, handles[1]),
-                            (axis, handles[2]),
-                        )
-                    }).flatten();
+                    let refs = (handles.len() == 3)
+                        .then(|| {
+                            let first = self.tabs[i].scene.document.get_entity(handles[0])?;
+                            let second = self.tabs[i].scene.document.get_entity(handles[1])?;
+                            let axis = self.tabs[i].scene.document.get_entity(handles[2])?;
+                            SymmetricConstraintCommand::preselected_refs(
+                                (first, handles[0]),
+                                (second, handles[1]),
+                                (axis, handles[2]),
+                            )
+                        })
+                        .flatten();
                     if let Some([first, second, axis]) = refs {
                         return Some(self.apply_cmd_result(CmdResult::AddSymmetricConstraint {
                             selection: SymmetricConstraintSelection::Objects(first, second),
@@ -1936,9 +2563,6 @@ impl OpenCADStudio {
                     self.command_line.push_error(
                         "Symmetric: select two compatible objects followed by a line axis.",
                     );
-                    let command = SymmetricConstraintCommand::new();
-                    self.command_line.push_info(&command.prompt());
-                    self.tabs[i].active_cmd = Some(Box::new(command));
                 }
             }
 
@@ -1950,7 +2574,8 @@ impl OpenCADStudio {
                     self.command_line.push_info(&sel.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(sel));
                 } else if handles.len() != 1 {
-                    self.command_line.push_output(
+                    self.tabs[i].scene.deselect_all();
+                    self.command_line.push_error(
                         "Select exactly one entity (the circle or line the point should attach to), then run this constraint again.",
                     );
                 } else {
@@ -2012,10 +2637,8 @@ impl OpenCADStudio {
                 // asked for this command.
                 // The reference asks for the circle itself, whatever is
                 // selected, so a pick-first set is left alone.
-                let name = next_radial_parameter_name(
-                    self.tabs[i].scene.named_parameters(),
-                    diameter,
-                );
+                let name =
+                    next_radial_parameter_name(self.tabs[i].scene.named_parameters(), diameter);
                 let command = DimConstraintCommand::new(
                     if diameter {
                         DimConstraintAxis::Diameter
@@ -2036,7 +2659,8 @@ impl OpenCADStudio {
                     self.command_line.push_info(&sel.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(sel));
                 } else if handles.len() != 1 {
-                    self.command_line.push_output(
+                    self.tabs[i].scene.deselect_all();
+                    self.command_line.push_error(
                         "Select exactly one line or circle, then run this constraint again.",
                     );
                 } else {
@@ -2058,9 +2682,12 @@ impl OpenCADStudio {
                             self.command_line.push_info(&new_cmd.prompt());
                             self.tabs[i].active_cmd = Some(Box::new(new_cmd));
                         }
-                        None => self
-                            .command_line
-                            .push_output("Select a line or a circle for a distance constraint."),
+                        None => {
+                            self.tabs[i].scene.deselect_all();
+                            self.command_line.push_error(
+                                "Select a line, circle or arc for a distance constraint.",
+                            );
+                        }
                     }
                 }
             }
@@ -2095,7 +2722,7 @@ impl OpenCADStudio {
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
 
-            "SHELL" | "SOLIDEDIT" => {
+            "SHELL" => {
                 use crate::modules::model::shell_cmd::ShellCommand;
                 let selected = self.tabs[i]
                     .scene
@@ -2105,7 +2732,7 @@ impl OpenCADStudio {
                     .filter(|handle| {
                         matches!(
                             self.tabs[i].scene.document.get_entity(*handle),
-                            Some(codec::EntityType::Solid3D(_))
+                            Some(document::EntityType::Solid3D(_))
                         )
                     })
                     .collect::<Vec<_>>();
@@ -2116,11 +2743,40 @@ impl OpenCADStudio {
                     [handle] => Some(*handle),
                     _ => None,
                 };
-                let new_cmd = if cmd == "SHELL" {
-                    ShellCommand::direct(target)
-                } else {
-                    ShellCommand::solid_edit(target)
-                };
+                let new_cmd = ShellCommand::direct(target);
+                self.command_line.push_info(&new_cmd.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(new_cmd));
+            }
+
+            // SOLIDEDIT, and the ribbon's `SOLIDEDIT FACE EXTRUDE` style
+            // entries that start it at one of its options.
+            _ if cmd == "SOLIDEDIT" || cmd.starts_with("SOLIDEDIT ") => {
+                use crate::modules::model::solidedit_cmd::SolidEditCommand;
+                let new_cmd = SolidEditCommand::new()
+                    .with_options(cmd.strip_prefix("SOLIDEDIT").unwrap_or_default());
+                self.command_line.push_info(&new_cmd.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(new_cmd));
+            }
+
+            "IMPRINT" => {
+                use crate::modules::model::solidedit_cmd::SolidEditCommand;
+                let new_cmd = SolidEditCommand::imprint();
+                self.command_line.push_info(&new_cmd.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(new_cmd));
+            }
+
+            "XEDGES" => {
+                use crate::modules::model::solidedit_cmd::ExtractEdgesCommand;
+                let selected = self.tabs[i]
+                    .scene
+                    .selected_entities()
+                    .into_iter()
+                    .map(|(handle, entity)| (handle, entity.clone()))
+                    .collect();
+                let new_cmd = ExtractEdgesCommand::new(selected);
+                if let Some(result) = new_cmd.ready() {
+                    return Some(self.apply_cmd_result(result));
+                }
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
@@ -2166,12 +2822,12 @@ impl OpenCADStudio {
                             matches!(
                                 scene.document.get_entity(*handle),
                                 Some(
-                                    codec::EntityType::Solid3D(_)
-                                        | codec::EntityType::Region(_)
-                                        | codec::EntityType::Surface(_)
-                                        | codec::EntityType::Mesh(_)
-                                        | codec::EntityType::PolygonMesh(_)
-                                        | codec::EntityType::PolyfaceMesh(_)
+                                    document::EntityType::Solid3D(_)
+                                        | document::EntityType::Region(_)
+                                        | document::EntityType::Surface(_)
+                                        | document::EntityType::Mesh(_)
+                                        | document::EntityType::PolygonMesh(_)
+                                        | document::EntityType::PolyfaceMesh(_)
                                 )
                             )
                         })
@@ -2180,9 +2836,9 @@ impl OpenCADStudio {
                         matches!(
                             scene.document.get_entity(*handle),
                             Some(
-                                codec::EntityType::Mesh(_)
-                                    | codec::EntityType::PolygonMesh(_)
-                                    | codec::EntityType::PolyfaceMesh(_)
+                                document::EntityType::Mesh(_)
+                                    | document::EntityType::PolygonMesh(_)
+                                    | document::EntityType::PolyfaceMesh(_)
                             )
                         )
                     });
@@ -2192,6 +2848,11 @@ impl OpenCADStudio {
                 let subtract = SubtractCommand::new(bases, bases_have_mesh);
                 self.command_line.push_info(&subtract.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(subtract));
+            }
+
+            // SECTIONCULL — erase what lies outside a section object.
+            "SECTIONCULL" => {
+                return Some(self.section_cull());
             }
 
             // INTERFERE — non-destructive intersect: solid from the overlap.
@@ -2218,12 +2879,12 @@ impl OpenCADStudio {
                     .find(|(_, entity)| {
                         matches!(
                             entity,
-                            codec::EntityType::Line(_)
-                                | codec::EntityType::Arc(_)
-                                | codec::EntityType::Circle(_)
-                                | codec::EntityType::Ellipse(_)
-                                | codec::EntityType::LwPolyline(_)
-                                | codec::EntityType::Spline(_)
+                            document::EntityType::Line(_)
+                                | document::EntityType::Arc(_)
+                                | document::EntityType::Circle(_)
+                                | document::EntityType::Ellipse(_)
+                                | document::EntityType::LwPolyline(_)
+                                | document::EntityType::Spline(_)
                         )
                     })
                     .map(|(handle, entity)| (handle, entity.clone()));
@@ -2246,18 +2907,18 @@ impl OpenCADStudio {
                     self.tabs[i].active_cmd = Some(Box::new(command));
                     return Some(iced::Task::none());
                 }
-                use codec::entities::Region;
-                use codec::types::Vector3;
+                use document::entities::Region;
+                use document::types::Vector3;
                 let mut regions = Vec::new();
                 let mut sources = Vec::new();
                 for (handle, e) in self.tabs[i].scene.selected_entities().iter() {
-                    if !matches!(e, codec::EntityType::Region(_)) {
+                    if !matches!(e, document::EntityType::Region(_)) {
                         let Some((plane, loops, true)) =
                             crate::scene::model::presspull_model::profile_geometry(e)
                         else {
                             continue;
                         };
-                        let Some(body) = kernel::brep::planar_region(plane, &loops) else {
+                        let Some(body) = ocs_solid::model::planar_region(plane, &loops) else {
                             continue;
                         };
                         let mut region = Region::new();
@@ -2276,7 +2937,7 @@ impl OpenCADStudio {
                     .filter(|(handle, _)| !sources.contains(handle))
                     .filter_map(|(_, entity)| crate::entities::curve::entity_curve(entity))
                     .collect();
-                let open_plane = kernel::space::common_curve_plane(&open_curves, 1.0e-6);
+                let open_plane = ocs_geom::space::common_curve_plane(&open_curves, 1.0e-6);
                 let open_plane_rejected = !open_curves.is_empty() && open_plane.is_none();
                 if let Some(plane) = open_plane {
                     let working_plane = crate::command::WorkingPlane::new(
@@ -2314,7 +2975,7 @@ impl OpenCADStudio {
                         else {
                             continue;
                         };
-                        let Some(body) = kernel::brep::planar_region(plane, &[curves]) else {
+                        let Some(body) = ocs_solid::model::planar_region(plane, &[curves]) else {
                             continue;
                         };
                         let mut region = Region::new();
@@ -2354,6 +3015,9 @@ impl OpenCADStudio {
                         self.tabs[i].scene.erase_entities(&sources);
                         self.refresh_properties();
                     }
+                    // The command consumes the selection, kept sources included.
+                    self.tabs[i].scene.deselect_all();
+                    self.refresh_properties();
                     self.tabs[i].dirty = true;
                     self.command_line
                         .push_output(crate::tf!("REGION: created {count} region(s).").as_ref());
@@ -2427,10 +3091,10 @@ impl OpenCADStudio {
                         .filter_map(|entity| {
                             matches!(
                                 entity,
-                                codec::EntityType::Solid3D(_)
-                                    | codec::EntityType::Surface(_)
-                                    | codec::EntityType::Region(_)
-                                    | codec::EntityType::Body(_)
+                                document::EntityType::Solid3D(_)
+                                    | document::EntityType::Surface(_)
+                                    | document::EntityType::Region(_)
+                                    | document::EntityType::Body(_)
                             )
                             .then_some(entity.common().handle)
                         })
@@ -2452,10 +3116,10 @@ impl OpenCADStudio {
                         .document
                         .entities()
                         .filter_map(|entity| {
-                            let codec::EntityType::Extended(extended) = entity else {
+                            let document::EntityType::Extended(extended) = entity else {
                                 return None;
                             };
-                            let codec::entities::ExtendedEntityData::SectionObject(data) =
+                            let document::entities::ExtendedEntityData::SectionObject(data) =
                                 &extended.data
                             else {
                                 return None;
@@ -2534,21 +3198,26 @@ impl OpenCADStudio {
             }
 
             // 3DROTATE [X|Y|Z] <angle> — rotate the selected solid about an axis.
+            // 3DROTATE — any objects about an axis through a base point.
             "3DROTATE" | "ROTATE3D" => {
-                use crate::command::SelectThenKeywordCommand;
-                let has_sel = !self.tabs[i].scene.selected_entities().is_empty();
-                let c = SelectThenKeywordCommand::new(
-                    "3DROTATE",
-                    "3DROTATE  rotation axis  [X / Y / Z]:",
-                    vec![
-                        ("X", "X", Some("3DROTATE  angle in degrees:")),
-                        ("Y", "Y", Some("3DROTATE  angle in degrees:")),
-                        ("Z", "Z", Some("3DROTATE  angle in degrees:")),
-                    ],
-                    has_sel,
-                );
-                self.command_line.push_info(&c.prompt());
-                self.tabs[i].active_cmd = Some(Box::new(c));
+                let handles: Vec<_> = self.tabs[i]
+                    .scene
+                    .selected_entities()
+                    .into_iter()
+                    .map(|(h, _)| h)
+                    .collect();
+                if handles.is_empty() {
+                    use crate::modules::draw::select::SelectObjectsCommand;
+                    let cmd = SelectObjectsCommand::new("3DROTATE");
+                    self.command_line.push_info(&cmd.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(cmd));
+                } else {
+                    use crate::modules::draw::modify::rotate::RotateCommand;
+                    let wires = self.tabs[i].scene.wire_models_for(&handles);
+                    let new_cmd = RotateCommand::new_3d(handles, wires);
+                    self.command_line.push_info(&new_cmd.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(new_cmd));
+                }
             }
             cmd if cmd.starts_with("3DROTATE ") || cmd.starts_with("ROTATE3D ") => {
                 let parts: Vec<String> = cmd
@@ -2583,18 +3252,36 @@ impl OpenCADStudio {
                             matches!(
                                 scene.document.get_entity(*handle),
                                 Some(
-                                    codec::EntityType::Solid3D(_)
-                                        | codec::EntityType::Surface(_)
+                                    document::EntityType::Solid3D(_)
+                                        | document::EntityType::Surface(_)
+                                        | document::EntityType::Mesh(_)
+                                        | document::EntityType::PolygonMesh(_)
+                                        | document::EntityType::PolyfaceMesh(_)
                                 )
                             )
                         })
                         .collect::<Vec<_>>();
                     scene.restore_solid_models(&targets);
-                    targets.retain(|handle| scene.solid_models.contains_key(handle));
+                    let mesh_extent = |handle: &document::Handle| {
+                        let entity = scene.document.get_entity(*handle)?;
+                        let (vertices, _) = crate::entities::mesh::mesh_polygons(entity)?;
+                        vertices.iter().fold(None, |bounds, point| {
+                            let (mut min, mut max) = bounds.unwrap_or((*point, *point));
+                            for axis in 0..3 {
+                                min[axis] = f64::min(min[axis], point[axis]);
+                                max[axis] = f64::max(max[axis], point[axis]);
+                            }
+                            Some((min, max))
+                        })
+                    };
+                    targets.retain(|handle| {
+                        scene.solid_models.contains_key(handle) || mesh_extent(handle).is_some()
+                    });
                     let bounds = targets
                         .iter()
-                        .filter_map(|handle| {
-                            crate::scene::model::solid_model::extent(&scene.solid_models[handle])
+                        .filter_map(|handle| match scene.solid_models.get(handle) {
+                            Some(body) => crate::scene::model::solid_model::extent(body),
+                            None => mesh_extent(handle),
                         })
                         .fold(None::<([f64; 3], [f64; 3])>, |bounds, (low, high)| {
                             Some(match bounds {
@@ -2641,7 +3328,7 @@ impl OpenCADStudio {
                             1 => ([0.0, v, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
                             _ => ([0.0, 0.0, v], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
                         };
-                        let plane = kernel::space::Plane::orthonormal(origin, x, normal)
+                        let plane = ocs_geom::space::Plane::orthonormal(origin, x, normal)
                             .expect("fixed world axes define a plane");
                         let side = glam::DVec3::from_array(origin)
                             + glam::DVec3::from_array(normal) * if keep_low { -1.0 } else { 1.0 };
@@ -2667,7 +3354,12 @@ impl OpenCADStudio {
                     let styles = scene.document.text_styles.iter().cloned().collect();
                     (defaults, styles, annotation_multiplier)
                 };
-                let new_cmd = TextCommand::with_defaults(defaults, styles, annotation_multiplier);
+                let new_cmd = TextCommand::with_defaults(
+                    defaults,
+                    styles,
+                    annotation_multiplier,
+                    self.tabs[i].id,
+                );
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
@@ -2680,7 +3372,7 @@ impl OpenCADStudio {
                 let editable = (sel.len() == 1).then(|| sel[0].0).filter(|h| {
                     self.tabs[i].scene.document.get_entity(*h).is_some_and(|e| {
                         super::super::text_inline::read_text_field(e).is_some()
-                            || matches!(e, codec::EntityType::Leader(_))
+                            || matches!(e, document::EntityType::Leader(_))
                     })
                 });
                 if let Some(h) = editable {
@@ -2708,7 +3400,22 @@ impl OpenCADStudio {
                     .header
                     .current_text_style_name
                     .clone();
-                let new_cmd = MTextCommand::with_defaults(height, style);
+                // An annotative style's default height is on paper; the editor
+                // and the entity work in the model height of this scale.
+                let height = if crate::scene::annotative::text_style_is_annotative(
+                    &self.tabs[i].scene.document,
+                    &style,
+                ) {
+                    height * self.tabs[i].scene.creation_annotation_multiplier()
+                } else {
+                    height
+                };
+                let annotative = crate::scene::annotative::text_style_is_annotative(
+                    &self.tabs[i].scene.document,
+                    &style,
+                );
+                let new_cmd =
+                    MTextCommand::with_defaults(height, style).with_annotative(annotative);
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
@@ -2759,7 +3466,7 @@ mod region_tests {
                 .map(|entity| {
                     (
                         entity.common().handle,
-                        matches!(entity, codec::EntityType::Circle(_)),
+                        matches!(entity, document::EntityType::Circle(_)),
                     )
                 })
                 .collect();
@@ -2780,7 +3487,7 @@ mod region_tests {
                 .scene
                 .document
                 .entities()
-                .filter(|entity| matches!(entity, codec::EntityType::Region(_)))
+                .filter(|entity| matches!(entity, document::EntityType::Region(_)))
                 .count();
             assert_eq!(region_count, 1);
 
@@ -2809,5 +3516,410 @@ mod degenerate_constraint_tests {
         app.automation_op(r#"{"op":"run","cmd":"ECONSTRAINT"}"#);
         let lines = app.automation_op(r#"{"op":"query","type":"Line","detail":"geometry"}"#);
         assert_eq!(lines["ok"], true, "{lines}");
+    }
+}
+
+impl OpenCADStudio {
+    /// An edit in the Hatch panel: OK and Cancel end HATCH as Enter and Esc
+    /// do; the rest change the running command's settings.
+    pub(in crate::app) fn on_hatch_panel(
+        &mut self,
+        msg: crate::ui::window::hatch_panel::HatchPanelMsg,
+    ) -> Task<Message> {
+        use crate::command::StepInput;
+        use crate::ui::window::hatch_panel::HatchPanelMsg as M;
+        let i = self.active_tab;
+        let Some(mut settings) = self.tabs[i]
+            .active_cmd
+            .as_ref()
+            .and_then(|command| command.hatch_settings())
+        else {
+            return Task::none();
+        };
+        let number = |typed: &str| typed.trim().replace(',', ".").parse::<f64>().ok();
+        match msg {
+            M::Accept => {
+                let edit = self.tabs[i]
+                    .active_cmd
+                    .as_ref()
+                    .and_then(|command| command.hatch_panel_edit());
+                if let Some((handle, before, after)) = edit {
+                    self.apply_hatch_panel_edit(handle, &before, &after);
+                    return Task::none();
+                }
+                return self.feed_command(StepInput::Enter);
+            }
+            M::Cancel => return self.feed_command(StepInput::Escape),
+            M::Kind(kind) => {
+                use crate::modules::draw::draw::hatch::HatchFill;
+                if kind != crate::ui::window::hatch_panel::kind_code(&settings.fill) {
+                    settings.fill = match kind {
+                        0 => HatchFill::Solid,
+                        1 => HatchFill::Gradient(
+                            crate::scene::model::hatch_model::GradientKind::Linear,
+                            false,
+                        ),
+                        2 => HatchFill::Pattern(
+                            crate::modules::draw::draw::hatch::last_pattern_name("ANSI31"),
+                        ),
+                        _ => HatchFill::User {
+                            spacing: 1.0,
+                            double: false,
+                        },
+                    };
+                }
+            }
+            M::Pattern(name) => {
+                settings.fill = if name.eq_ignore_ascii_case("SOLID") {
+                    crate::modules::draw::draw::hatch::HatchFill::Solid
+                } else {
+                    crate::modules::draw::draw::hatch::HatchFill::Pattern(name)
+                };
+            }
+            M::Gradient(label) => {
+                if let Some((kind, invert)) =
+                    crate::scene::model::hatch_model::GradientKind::from_choice_label(&label)
+                {
+                    settings.fill =
+                        crate::modules::draw::draw::hatch::HatchFill::Gradient(kind, invert);
+                }
+            }
+            M::Angle(typed) => {
+                if let Some(value) = number(&typed).filter(|value| value.is_finite()) {
+                    settings.angle_deg = value;
+                }
+                self.hatch_drafts.angle = Some(typed);
+            }
+            M::Scale(typed) => {
+                if let Some(value) = number(&typed).filter(|value| *value > 0.0) {
+                    settings.scale = value;
+                }
+                self.hatch_drafts.scale = Some(typed);
+            }
+            M::Spacing(typed) => {
+                if let (
+                    Some(value),
+                    crate::modules::draw::draw::hatch::HatchFill::User { spacing, .. },
+                ) = (
+                    number(&typed).filter(|value| *value > 0.0),
+                    &mut settings.fill,
+                ) {
+                    *spacing = value;
+                }
+                self.hatch_drafts.spacing = Some(typed);
+            }
+            M::Double(on) => {
+                if let crate::modules::draw::draw::hatch::HatchFill::User { double, .. } =
+                    &mut settings.fill
+                {
+                    *double = on;
+                }
+            }
+            M::OriginX(typed) => {
+                if let Some(value) = number(&typed).filter(|value| value.is_finite()) {
+                    settings.origin[0] = value;
+                }
+                self.hatch_drafts.origin_x = Some(typed);
+            }
+            M::OriginY(typed) => {
+                if let Some(value) = number(&typed).filter(|value| value.is_finite()) {
+                    settings.origin[1] = value;
+                }
+                self.hatch_drafts.origin_y = Some(typed);
+            }
+            M::Gap(typed) => {
+                if let Some(value) = number(&typed).filter(|value| *value >= 0.0) {
+                    settings.gap_tolerance = value;
+                }
+                self.hatch_drafts.gap = Some(typed);
+            }
+            M::Method(method) => settings.method = method,
+            M::Islands(code) => {
+                settings.islands = crate::ui::window::hatch_panel::island_style(code)
+            }
+            M::Associative(on) => settings.associative = on,
+            M::Separate(on) => settings.separate = on,
+            M::KeepBoundaries(on) => settings.keep_boundaries = on,
+            M::Color(label) => {
+                settings.color = if label == crate::ui::window::hatch_panel::current_label() {
+                    None
+                } else {
+                    crate::ui::window::attman_dialog::parse_color(&label)
+                };
+            }
+            M::Background(label) => {
+                settings.background = if label == crate::ui::window::hatch_panel::none_label() {
+                    None
+                } else {
+                    crate::ui::window::attman_dialog::parse_color(&label)
+                };
+            }
+            M::GradientColor1(label) => {
+                if let Some(color) = crate::ui::window::attman_dialog::parse_color(&label) {
+                    settings.gradient_colors[0] = color;
+                }
+            }
+            M::GradientColor2(label) => {
+                if let Some(color) = crate::ui::window::attman_dialog::parse_color(&label) {
+                    settings.gradient_colors[1] = color;
+                }
+            }
+            M::Layer(name) => {
+                settings.layer =
+                    (name != crate::ui::window::hatch_panel::current_label()).then_some(name);
+            }
+            M::Transparency(typed) => {
+                match typed.trim() {
+                    "" => settings.transparency = None,
+                    text => {
+                        if let Some(value) = text.parse::<u8>().ok().filter(|v| *v <= 90) {
+                            settings.transparency = Some(value);
+                        }
+                    }
+                }
+                self.hatch_drafts.transparency = Some(typed);
+            }
+            M::DrawOrder(order) => settings.draw_order = order.min(4),
+            M::Annotative(on) => settings.annotative = on,
+        }
+        if let Some(command) = self.tabs[i].active_cmd.as_mut() {
+            command.set_hatch_settings(settings);
+        }
+        self.refresh_area_preview(i);
+        Task::none()
+    }
+}
+
+impl OpenCADStudio {
+    /// An edit in Customize User Interface: the user's panels change and the
+    /// My Tools tab follows at once.
+    pub(in crate::app) fn on_ribbon_customize(
+        &mut self,
+        msg: crate::ui::window::ribbon_customize::Msg,
+    ) -> Task<Message> {
+        use crate::ui::window::ribbon_customize::Msg as M;
+        let Some(state) = self.ribbon_customize.as_mut() else {
+            return Task::none();
+        };
+        let mut panels = self.ribbon.custom_panels().to_vec();
+        let selected = state.selected.filter(|index| *index < panels.len());
+        match msg {
+            M::Select(index) => state.selected = Some(index),
+            M::NewPanel => {
+                let title = (1..)
+                    .map(|n| crate::tr!("ribbon-customize", "default-title", n = n))
+                    .find(|title| !panels.iter().any(|panel| panel.title == *title))
+                    .unwrap_or_default();
+                panels.push(crate::ui::ribbon::CustomPanel {
+                    title,
+                    commands: Vec::new(),
+                });
+                state.selected = Some(panels.len() - 1);
+            }
+            M::DeletePanel => {
+                if let Some(index) = selected {
+                    panels.remove(index);
+                    state.selected = (!panels.is_empty()).then(|| index.min(panels.len() - 1));
+                }
+            }
+            M::MovePanel(up) => {
+                if let Some(index) = selected {
+                    let other = if up {
+                        index.checked_sub(1)
+                    } else {
+                        Some(index + 1)
+                    };
+                    if let Some(other) = other.filter(|other| *other < panels.len()) {
+                        panels.swap(index, other);
+                        state.selected = Some(other);
+                    }
+                }
+            }
+            M::Title(title) => {
+                if let Some(panel) = selected.and_then(|index| panels.get_mut(index)) {
+                    panel.title = title;
+                }
+            }
+            M::Draft(text) => {
+                state.draft = text;
+                return Task::none();
+            }
+            M::AddCommand => {
+                let typed = state.draft.trim().to_uppercase();
+                state.draft.clear();
+                if let (Some(panel), false) = (
+                    selected.and_then(|index| panels.get_mut(index)),
+                    typed.is_empty(),
+                ) {
+                    let command = self.resolve_alias(&typed).unwrap_or(typed);
+                    panel.commands.push(command);
+                }
+            }
+            M::PickSuggestion(name) => {
+                state.draft = name;
+                return self.on_ribbon_customize(M::AddCommand);
+            }
+            M::RemoveCommand(at) => {
+                if let Some(panel) = selected.and_then(|index| panels.get_mut(index)) {
+                    if at < panel.commands.len() {
+                        panel.commands.remove(at);
+                    }
+                }
+            }
+            M::MoveCommand(at, up) => {
+                if let Some(panel) = selected.and_then(|index| panels.get_mut(index)) {
+                    let other = if up { at.checked_sub(1) } else { Some(at + 1) };
+                    if let Some(other) = other.filter(|other| *other < panel.commands.len()) {
+                        panel.commands.swap(at, other);
+                    }
+                }
+            }
+            M::Shortcuts => return Task::done(Message::ShortcutsPanelOpen),
+        }
+        self.ribbon.set_custom_panels(panels);
+        self.save_config();
+        Task::none()
+    }
+}
+
+impl OpenCADStudio {
+    /// Where new toolbars line up: past the left dock, under the menu bar
+    /// and the drawing tabs.
+    pub(in crate::app) fn toolbar_origin(&self) -> iced::Point {
+        let left = self.dock_column_width(crate::app::config::DockSide::Left)
+            + crate::ui::dock::DOCK_STRIP_W;
+        iced::Point::new(left + 8.0, 74.0)
+    }
+}
+
+#[cfg(test)]
+mod ribbon_customize_suggestion_tests {
+    use crate::app::OpenCADStudio;
+    use crate::ui::window::ribbon_customize::{suggestions, Msg, State};
+
+    fn app_with_panel() -> OpenCADStudio {
+        let mut app = OpenCADStudio::new_for_test();
+        app.ribbon
+            .set_custom_panels(vec![crate::ui::ribbon::CustomPanel {
+                title: "Mine".into(),
+                commands: Vec::new(),
+            }]);
+        app.ribbon_customize = Some(State {
+            selected: Some(0),
+            draft: String::new(),
+        });
+        app
+    }
+
+    #[test]
+    fn suggestions_rank_prefix_before_substring_and_are_capped() {
+        let none = rustc_hash::FxHashMap::default();
+        let found = suggestions("lin", &[], &none);
+        assert!(!found.is_empty() && found.len() <= 6);
+        assert!(found.contains(&"LINE".to_owned()));
+        let first_substring = found.iter().position(|n| !n.starts_with("LIN"));
+        let last_prefix = found.iter().rposition(|n| n.starts_with("LIN"));
+        if let (Some(sub), Some(pre)) = (first_substring, last_prefix) {
+            assert!(pre < sub, "prefix matches come first: {found:?}");
+        }
+        // Substring match: typed text found inside a name.
+        assert!(suggestions("ayer", &[], &none)
+            .iter()
+            .any(|n| n.contains("AYER")));
+        assert!(suggestions("", &[], &none).is_empty());
+        assert!(suggestions("QQQQZZ", &[], &none).is_empty());
+    }
+
+    #[test]
+    fn suggestions_include_plugin_commands() {
+        let none = rustc_hash::FxHashMap::default();
+        let found = suggestions("zzplug", &["ZzPlugCmd".to_owned()], &none);
+        assert_eq!(found, vec!["ZZPLUGCMD".to_owned()]);
+    }
+
+    #[test]
+    fn picking_a_suggestion_goes_through_the_add_path() {
+        let mut app = app_with_panel();
+        let _ = app.on_ribbon_customize(Msg::PickSuggestion("LINE".to_owned()));
+        assert_eq!(app.ribbon.custom_panels()[0].commands, vec!["LINE"]);
+        assert!(app.ribbon_customize.as_ref().unwrap().draft.is_empty());
+        // The add path resolves an alias to its command, as typing it would.
+        app.command_aliases
+            .insert("QQ".to_owned(), "CIRCLE".to_owned());
+        let _ = app.on_ribbon_customize(Msg::PickSuggestion("QQ".to_owned()));
+        assert_eq!(
+            app.ribbon.custom_panels()[0].commands,
+            vec!["LINE", "CIRCLE"]
+        );
+    }
+
+    /// The customize window as it is drawn: where the label is, when any of
+    /// it shows.
+    fn shown(app: &OpenCADStudio, label: &str) -> Option<iced::Rectangle> {
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            iced::Size::new(1280.0, 900.0),
+            app.view_main(),
+        );
+        ui.find(label.to_string())
+            .ok()
+            .and_then(|found| found.visible_bounds())
+    }
+
+    fn open_window_with_draft(draft: &str) -> (OpenCADStudio, Vec<String>) {
+        let mut app = app_with_panel();
+        app.active_modal = Some(crate::app::ModalKind::RibbonCustomize);
+        let _ = app.on_ribbon_customize(Msg::Draft(draft.to_owned()));
+        let wanted = suggestions(
+            draft,
+            &app.command_line.dynamic_commands,
+            &app.command_aliases,
+        );
+        (app, wanted)
+    }
+
+    /// The window is sized before anything is typed, so the rows must fit in
+    /// the size it has then: every row shows, above the Close row, and the
+    /// Close row stays where it was with an empty box.
+    #[test]
+    fn suggestion_rows_show_without_growing_the_window() {
+        let (empty, none) = open_window_with_draft("");
+        assert!(none.is_empty());
+        let close_before = shown(&empty, "Close").expect("Close shows with an empty box");
+
+        let (typed, wanted) = open_window_with_draft("lin");
+        assert_eq!(wanted.len(), 6, "a full list: {wanted:?}");
+        let close_after = shown(&typed, "Close").expect("Close still shows with the rows");
+        assert_eq!(
+            close_after, close_before,
+            "the rows must not move the Close row"
+        );
+        for name in &wanted {
+            let row = shown(&typed, name).unwrap_or_else(|| panic!("{name} does not show"));
+            assert!(
+                row.height > 10.0 && row.y + row.height <= close_after.y,
+                "{name} {row:?} is cut off or under the Close row {close_after:?}"
+            );
+        }
+    }
+
+    /// A click on a row in the drawn window adds that command.
+    #[test]
+    fn clicking_a_suggestion_row_adds_the_command() {
+        let (mut app, wanted) = open_window_with_draft("lin");
+        let last = wanted.last().expect("a suggestion").clone();
+        let messages: Vec<_> = {
+            let mut ui = iced_test::Simulator::with_size(
+                iced::Settings::default(),
+                iced::Size::new(1280.0, 900.0),
+                app.view_main(),
+            );
+            ui.click(last.clone()).expect("the last row can be clicked");
+            ui.into_messages().collect()
+        };
+        for message in messages {
+            let _ = app.update(message);
+        }
+        assert_eq!(app.ribbon.custom_panels()[0].commands, vec![last]);
     }
 }

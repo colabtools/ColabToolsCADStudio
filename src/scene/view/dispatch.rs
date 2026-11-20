@@ -1,12 +1,12 @@
 // Dispatch entry points for entity editing.
 
-use codec::types::{Color as AcadColor, LineWeight, Transparency};
-use codec::{EntityType, Handle};
+use document::types::{Color as AcadColor, LineWeight, Transparency};
+use document::{EntityType, Handle};
 
-use crate::command::EntityTransform;
 use crate::entities::traits::EntityTypeOps;
-use crate::scene::model::object::{GripDef, PropSection};
+use crate::entities::transform::EntityTransform;
 use crate::scene::cache::properties;
+use crate::scene::model::object::{GripDef, PropSection};
 
 thread_local! {
     /// Which vertex a multi-vertex entity's Properties panel is focused on
@@ -34,12 +34,12 @@ pub fn prop_current_vertex() -> usize {
 /// through untouched. Per-entity grip code works in raw field space, so the
 /// dispatch layer converts: display grips OCS→WCS, incoming edits WCS→OCS.
 fn planar_ocs_normal(entity: &EntityType) -> Option<(f64, f64, f64)> {
+    // Arc, Circle and Solid grips are already world-space (their grip code
+    // places them through the OCS itself); converting them again mirrors
+    // them for a flipped normal.
     let n = match entity {
-        EntityType::Arc(e) => e.normal,
-        EntityType::Circle(e) => e.normal,
         EntityType::LwPolyline(e) => e.normal,
         EntityType::Polyline2D(e) => e.normal,
-        EntityType::Solid(e) => e.normal,
         EntityType::Text(e) => e.normal,
         EntityType::AttributeDefinition(e) => e.normal,
         EntityType::Hatch(e) => e.normal,
@@ -70,6 +70,17 @@ pub fn properties_sectioned(
     entity: &EntityType,
     text_style_names: &[String],
 ) -> Vec<PropSection> {
+    // Picked table cells: General keeps only Transparency, then the cells.
+    if matches!(entity, EntityType::Table(_)) && crate::entities::table::prop_cell_range().is_some()
+    {
+        let mut general = properties::general_section(entity);
+        general
+            .props
+            .retain(|property| property.field == "transparency");
+        let mut sections = vec![general];
+        sections.extend(entity.geometry_properties(text_style_names));
+        return sections;
+    }
     let mut sections = vec![properties::general_section(entity)];
     if let Some(viz) = properties::visualization_section(entity) {
         sections.push(viz);
@@ -81,17 +92,21 @@ pub fn properties_sectioned(
         sections.extend(groups);
     }
     if let Some(thickness) = entity_thickness(entity) {
-        let already_present = sections.iter().flat_map(|section| &section.props).any(|property| {
-            property.field == "thickness"
-                || property.field == "sl_thickness"
-                || property.label == crate::t!("Thickness").as_ref()
-        });
+        let already_present = sections
+            .iter()
+            .flat_map(|section| &section.props)
+            .any(|property| {
+                property.field == "thickness"
+                    || property.field == "sl_thickness"
+                    || property.label == crate::t!("Thickness").as_ref()
+            });
+        // The reference lists an object's thickness as the last General row.
         if !already_present {
-            if let Some(geometry) = sections
+            if let Some(general) = sections
                 .iter_mut()
-                .find(|section| section.title == crate::t!("Geometry").as_ref())
+                .find(|section| section.title == crate::t!("General").as_ref())
             {
-                geometry.props.push(crate::entities::common::edit_prop(
+                general.props.push(crate::entities::common::edit_prop(
                     crate::t!("Thickness").as_ref(),
                     "thickness",
                     thickness,
@@ -104,7 +119,7 @@ pub fn properties_sectioned(
 
 pub fn entity_in_working_plane(
     entity: &EntityType,
-    plane: crate::command::WorkingPlane,
+    plane: crate::entities::transform::WorkingPlane,
 ) -> EntityType {
     let mut local = entity.clone();
     if !plane.is_identity() {
@@ -120,7 +135,7 @@ pub fn apply_geom_prop_in_working_plane(
     entity: &mut EntityType,
     field: &str,
     value: &str,
-    plane: crate::command::WorkingPlane,
+    plane: crate::entities::transform::WorkingPlane,
 ) {
     if plane.is_identity() {
         apply_geom_prop(entity, field, value);
@@ -136,6 +151,11 @@ pub fn apply_geom_prop_in_working_plane(
 }
 
 pub fn apply_common_prop(entity: &mut EntityType, field: &str, value: &str) {
+    if matches!(field, "layer" | "linetype")
+        && crate::scene::block_construction::is_construction(entity.common())
+    {
+        return;
+    }
     let e = entity.as_entity_mut();
     match field {
         "layer" => e.set_layer(value.to_string()),
@@ -232,13 +252,13 @@ pub fn apply_common_prop(entity: &mut EntityType, field: &str, value: &str) {
 ///     stale verbatim block (matched by APPID handle) so the new value wins.
 /// Other applications' verbatim blocks are preserved for round-trip fidelity.
 pub fn set_entity_xdata(
-    doc: &mut codec::CadDocument,
-    handle: codec::Handle,
+    doc: &mut document::Document,
+    handle: document::Handle,
     app: &str,
-    values: Option<Vec<codec::xdata::XDataValue>>,
+    values: Option<Vec<document::xdata::XDataValue>>,
 ) {
     if values.is_some() && !doc.app_ids.contains(app) {
-        let mut a = codec::tables::AppId::new(app);
+        let mut a = document::tables::AppId::new(app);
         a.handle = doc.allocate_handle();
         let _ = doc.app_ids.add(a);
     }
@@ -246,15 +266,27 @@ pub fn set_entity_xdata(
     let Some(entity) = doc.get_entity_mut(handle) else {
         return;
     };
-    let common = entity.common_mut();
-    let mut rebuilt = codec::xdata::ExtendedData::new();
+    replace_xdata_record(entity.common_mut(), app, app_handle, values);
+}
+
+/// Replace one application's XDATA record on an object (`None` drops it).
+/// `app_handle` is the application's registered handle, whose raw DWG copy
+/// goes with it. Used directly for an INSERT's attributes, which are not
+/// document entities of their own.
+pub fn replace_xdata_record(
+    common: &mut document::entities::EntityCommon,
+    app: &str,
+    app_handle: Option<u64>,
+    values: Option<Vec<document::xdata::XDataValue>>,
+) {
+    let mut rebuilt = document::xdata::ExtendedData::new();
     for r in common.extended_data.records() {
         if r.application_name != app {
             rebuilt.add_record(r.clone());
         }
     }
     if let Some(vals) = values {
-        let mut rec = codec::xdata::ExtendedDataRecord::new(app);
+        let mut rec = document::xdata::ExtendedDataRecord::new(app);
         for v in vals {
             rec.add_value(v);
         }
@@ -308,15 +340,30 @@ pub fn set_entity_thickness(entity: &mut EntityType, v: f64) {
 }
 
 pub fn toggle_invisible(entity: &mut EntityType) {
+    if crate::scene::block_construction::is_construction(entity.common()) {
+        return;
+    }
     let cur = entity.as_entity_mut().is_invisible();
     entity.as_entity_mut().set_invisible(!cur);
 }
 
 pub fn apply_color(entity: &mut EntityType, color: AcadColor) {
+    if crate::scene::block_construction::is_construction(entity.common()) {
+        return;
+    }
     entity.as_entity_mut().set_color(color);
     let common = entity.common_mut();
     common.color_name = None;
     common.color_book_handle = None;
+}
+
+/// Like [`apply_color`], but keeps a colour-book identity (`BOOK$NAME`).
+pub fn apply_named_color(entity: &mut EntityType, color: AcadColor, name: Option<String>) {
+    if crate::scene::block_construction::is_construction(entity.common()) {
+        return;
+    }
+    apply_color(entity, color);
+    entity.common_mut().color_name = name;
 }
 
 pub fn apply_line_weight(entity: &mut EntityType, lw: LineWeight) {
@@ -324,10 +371,30 @@ pub fn apply_line_weight(entity: &mut EntityType, lw: LineWeight) {
 }
 
 pub fn apply_geom_prop(entity: &mut EntityType, field: &str, value: &str) {
+    let before = saved_leader_before_edit(entity);
     EntityTypeOps::apply_geom_prop(entity, field, value);
+    invalidate_changed_leader_picture(entity, before);
 }
 
-pub fn apply_grip(entity: &mut EntityType, grip_id: usize, apply: crate::scene::model::object::GripApply) {
+// A picture belongs to the old definition. Keep it for a no-op, but let the
+// ordinary history snapshot restore it together with the definition on undo.
+fn saved_leader_before_edit(entity: &EntityType) -> Option<EntityType> {
+    (matches!(entity, EntityType::Leader(_) | EntityType::MultiLeader(_) | EntityType::Tolerance(_))
+        && entity.common().graphic_data.is_some())
+        .then(|| entity.clone())
+}
+
+fn invalidate_changed_leader_picture(entity: &mut EntityType, before: Option<EntityType>) {
+    if before.as_ref().is_some_and(|original| original != entity) {
+        entity.common_mut().graphic_data = None;
+    }
+}
+
+pub fn apply_grip(
+    entity: &mut EntityType,
+    grip_id: usize,
+    apply: crate::scene::model::object::GripApply,
+) {
     use crate::scene::model::object::GripApply;
     // Grip drags arrive in world space; per-entity apply code writes raw
     // fields, which for planar entities live in OCS — convert first (the
@@ -343,7 +410,9 @@ pub fn apply_grip(entity: &mut EntityType, grip_id: usize, apply: crate::scene::
         }
         (None, a) => a,
     };
+    let before = saved_leader_before_edit(entity);
     EntityTypeOps::apply_grip(entity, grip_id, apply);
+    invalidate_changed_leader_picture(entity, before);
 }
 
 /// Rebuild an arc from its drag-start control points and the point grips moved
@@ -371,11 +440,7 @@ pub fn refit_arc_grips(
             .collect::<Vec<_>>(),
         None => edits.to_vec(),
     };
-    Some(crate::entities::arc::refit_grips(
-        arc,
-        original_arc,
-        &edits,
-    ))
+    Some(crate::entities::arc::refit_grips(arc, original_arc, &edits))
 }
 
 /// Convert a world-space cursor point into the value expected by an
@@ -388,8 +453,7 @@ pub fn grip_menu_point_value(
 ) -> Option<f64> {
     let point = match planar_ocs_normal(entity) {
         Some(normal) => {
-            let (x, y, z) =
-                super::transform::wcs_point_to_ocs((point.x, point.y, point.z), normal);
+            let (x, y, z) = super::transform::wcs_point_to_ocs((point.x, point.y, point.z), normal);
             glam::DVec3::new(x, y, z)
         }
         None => point,
@@ -404,22 +468,22 @@ pub fn apply_transform(entity: &mut EntityType, t: &EntityTransform) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::types::Vector3;
+    use document::types::Vector3;
 
     #[test]
-    fn line_thickness_follows_the_entity_geometry_rows() {
-        let mut line = codec::entities::Line::from_points(Vector3::ZERO, Vector3::UNIT_X);
+    fn line_thickness_is_the_last_general_row() {
+        let mut line = document::entities::Line::from_points(Vector3::ZERO, Vector3::UNIT_X);
         line.thickness = 2.5;
         let sections = properties_sectioned(Handle::NULL, &EntityType::Line(line), &[]);
 
-        assert!(!sections[0]
-            .props
-            .iter()
-            .any(|property| property.field == "thickness"));
-        let geometry = sections
-            .iter()
-            .find(|section| section.props.iter().any(|property| property.field == "start_x"))
-            .unwrap();
-        assert_eq!(geometry.props.last().unwrap().field, "thickness");
+        assert_eq!(sections[0].props.last().unwrap().field, "thickness");
+        assert_eq!(
+            sections
+                .iter()
+                .flat_map(|section| &section.props)
+                .filter(|property| property.field == "thickness")
+                .count(),
+            1
+        );
     }
 }

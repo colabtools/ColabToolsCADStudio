@@ -1,9 +1,10 @@
 // GPU rendering primitives, shader::Program / shader::Primitive impls,
 // and entity render-style helpers for the Scene.
 
-use codec::tables::LineType;
-use codec::types::{Color as AcadColor, LineWeight};
-use codec::{CadDocument, EntityType, Handle};
+use crate::io::plot_style::PlotStyleTableExt as _;
+use document::tables::LineType;
+use document::types::{Color as AcadColor, LineWeight};
+use document::{Document, EntityType, Handle};
 use glam::Mat4;
 use iced::mouse;
 use iced::widget::shader::{self, Viewport};
@@ -11,18 +12,19 @@ use iced::{Rectangle, Size};
 
 use std::sync::Arc;
 
+use crate::scene::convert::tess_util;
+use crate::scene::model::visual_style_model::{resolve_visual_style_handle, MeshVisualStyle};
 use crate::scene::pipeline::viewcube::{hover_id, VIEWCUBE_PX};
 use crate::scene::pipeline::MultiPipeline;
-use crate::scene::convert::tess_util;
-use crate::scene::model::visual_style_model::{
-    resolve_visual_style_handle, MeshVisualStyle,
-};
 use crate::scene::{
     vp_effective_scale, Camera, HatchModel, ImageModel, MeshLodSet, NavPerfSample, Scene,
     SceneLight, Uniforms, ViewportInstance, WireModel,
 };
 
-const DISPLAY_STYLE_CACHE_LIMIT: usize = if cfg!(target_arch = "wasm32") { 4 } else { 24 };
+/// Floor for the display plot style caches. Each entry is a styled copy of a
+/// whole wire set, so the cap follows what one frame draws: a floor of 24 kept
+/// a copy per layout visited until memory ran out (#3260).
+const DISPLAY_STYLE_CACHE_LIMIT: usize = 4;
 const MM_TO_PX: f32 = 96.0 / 25.4;
 
 // ── Camera hover state (shader::Program::State) ───────────────────────────
@@ -52,7 +54,8 @@ struct ViewportDisplaySettings {
 pub(crate) struct CachedDocumentRenderEnvironment {
     pub(crate) fog: Option<([f32; 4], [f32; 4], [f32; 4])>,
     pub(crate) environment: Option<([f32; 4], crate::scene::model::image_model::DecodedImage)>,
-    pub(crate) preset_environment: Option<([f32; 4], crate::scene::model::image_model::DecodedImage)>,
+    pub(crate) preset_environment:
+        Option<([f32; 4], crate::scene::model::image_model::DecodedImage)>,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +130,13 @@ pub struct ViewportData {
     /// in the previous shader Primitive prevented the next UI event from
     /// splicing a changed entity in place and forced a full rebuild.
     pub(in crate::scene) wires: std::sync::Weak<Vec<WireModel>>,
+    /// Keeps `wires` alive when they are a copy made for display (the set
+    /// without its 3D faces, recoloured by a plot style, the sheet's own)
+    /// and not the resident set. Only a bounded cache owns such a copy, and
+    /// it can let the copy go while the frame's other viewports are built:
+    /// the viewport was then left out of the frame and kept showing the
+    /// image it had.
+    pub(in crate::scene) _wires_copy: Option<Arc<Vec<WireModel>>>,
     /// This content viewport's non-rectangular clip boundary (paper layouts
     /// only), as a polygon already projected into the viewport's render-target
     /// NDC. The GPU stamps it into the stencil so content is clipped to the
@@ -139,6 +149,7 @@ pub struct ViewportData {
     /// Non-current scale representations of selected or hovered annotative
     /// entities. Uploaded with the xray highlight instead of the resident set.
     pub(in crate::scene) annotation_context_wires: Arc<Vec<WireModel>>,
+    pub(in crate::scene) selected_annotation_context_wires: Arc<Vec<WireModel>>,
     /// One/few live hatch models for grip editing. Uploaded through a separate
     /// tiny GPU batch so the resident hatch buffer remains untouched.
     pub(in crate::scene) preview_hatches: Arc<Vec<HatchModel>>,
@@ -150,8 +161,7 @@ pub struct ViewportData {
     /// Live grip-drag / command-preview glyph quads. Kept out of the epoch-cached
     /// `text_verts` and uploaded to a per-frame buffer, so text dragged by a grip
     /// stays visible even though it's hidden from the base text set (issue #316).
-    pub(in crate::scene) preview_text_verts:
-        Arc<Vec<crate::scene::pipeline::text_gpu::TextVertex>>,
+    pub(in crate::scene) preview_text_verts: Arc<Vec<crate::scene::pipeline::text_gpu::TextVertex>>,
     /// Per-entity normalized draw-order depth (handle.value() → (0,1)), used
     /// by the wire / face3d pipelines as a clip-z bias. WireModels carry no
     /// depth field (84 construction sites); the bias is looked up by handle
@@ -159,17 +169,21 @@ pub struct ViewportData {
     /// See `Scene::draw_depth_generation`. Cached uploads that bake a depth are
     /// only reusable while this is unchanged.
     pub(in crate::scene) draw_depth_generation: u64,
-    pub(in crate::scene) draw_depths:
-        std::sync::Weak<rustc_hash::FxHashMap<u64, [f32; 2]>>,
+    pub(in crate::scene) draw_depths: std::sync::Weak<rustc_hash::FxHashMap<u64, [f32; 2]>>,
     pub(in crate::scene) hatches: Arc<Vec<HatchModel>>,
     /// Wipeout fills — rendered in a separate pass AFTER wires.
     pub(in crate::scene) wipeout_hatches: Arc<Vec<HatchModel>>,
     pub(in crate::scene) images: Arc<Vec<ImageModel>>,
+    /// Point cloud sprites; empty on the paper sheet and in 2D wireframe.
+    pub(in crate::scene) point_clouds: Arc<crate::scene::model::point_cloud::PointCloudSet>,
+    /// Point cloud lighting and density for this view: `[mode, source,
+    /// drawn fraction, _, light direction x, y, z, _]`.
+    pub(in crate::scene) point_cloud_light: [f32; 12],
+    /// Live-section planes clipping the point clouds (`n·p + d >= 0` kept).
+    pub(in crate::scene) point_cloud_clip: Vec<[f64; 4]>,
     pub(in crate::scene) meshes: Arc<Vec<MeshLodSet>>,
-    pub(in crate::scene) background_image:
-        Option<crate::scene::model::image_model::DecodedImage>,
-    pub(in crate::scene) environment_image:
-        Option<crate::scene::model::image_model::DecodedImage>,
+    pub(in crate::scene) background_image: Option<crate::scene::model::image_model::DecodedImage>,
+    pub(in crate::scene) environment_image: Option<crate::scene::model::image_model::DecodedImage>,
     pub(in crate::scene) uniforms: Uniforms,
     /// World-space camera forward — the parallel view direction. DISPSILH
     /// silhouettes use this alone (not the eye position), so the outline follows
@@ -182,6 +196,7 @@ pub struct ViewportData {
     /// N/E/S/W stay aligned to world even as the cube reorients with the UCS.
     pub(in crate::scene) compass_rotation: Mat4,
     pub(in crate::scene) hover_region: Option<usize>,
+    pub(in crate::scene) viewcube_opacity: f32,
     pub(in crate::scene) show_viewcube: bool,
     /// Set when REDRAW/REDRAWALL requested a forced re-rasterize of this
     /// viewport this frame — bypasses the scene-render cache even if the
@@ -216,6 +231,8 @@ pub struct ViewportData {
     /// occluded by closer geometry are culled by the LessEqual depth
     /// test on the wire passes that follow.
     pub(in crate::scene) hidden_line: bool,
+    /// HiddenLine draws the edges behind faces dashed.
+    pub(in crate::scene) occluded_edges: bool,
     /// Interaction LOD: when true the (per-pixel, GPU-dominating) hatch pass is
     /// skipped this frame because the view is actively being navigated. Folded
     /// into the render signature so the settle frame re-renders hatches once and
@@ -239,12 +256,16 @@ pub struct ViewportData {
     /// so `prepare` can patch just those entities' slabs. `None` ⇒ full build.
     pub(in crate::scene) wire_patch: Option<(u64, Arc<crate::scene::WireGpuPatch>)>,
     /// Selected handles only (no hover) — solid meshes tint these blue.
-    pub(in crate::scene) selected_handles: Arc<rustc_hash::FxHashSet<codec::Handle>>,
+    pub(in crate::scene) selected_handles: Arc<rustc_hash::FxHashSet<document::Handle>>,
     /// Currently hovered selectable unit — solid meshes tint it orange.
-    pub(in crate::scene) hover_handles: Arc<rustc_hash::FxHashSet<codec::Handle>>,
+    pub(in crate::scene) hover_handles: Arc<rustc_hash::FxHashSet<document::Handle>>,
     /// Bumped on selection / hover change. Paired with `wire_content_id` to
     /// decide when the xray overlay batch needs rebuilding.
     pub(in crate::scene) selection_generation: u64,
+    /// Bumped on hover / box-preview / constraint / filter changes only. Lets
+    /// the xray overlay rebuild its (small) hover half on a rollover without
+    /// re-emitting the committed selection's GPU buffers.
+    pub(in crate::scene) hover_generation: u64,
     /// Signature of the *selected set* only (not hover). Gates the static-buffer
     /// re-upload (hatch tint, issue #71) so a hover doesn't re-upload every
     /// hatch / face3d buffer on hatch-heavy drawings.
@@ -269,12 +290,14 @@ pub struct Primitive {
     pub(in crate::scene) selection_color: [f32; 4],
     /// Whether selection visual effect (glow/highlight) is enabled.
     pub(in crate::scene) selection_effect: bool,
+    /// Extra screen pixels the selection highlight is drawn wider.
+    pub(in crate::scene) selection_widen: f32,
     /// One input-to-render sample, carried only when PERF tracing is enabled.
     pub(in crate::scene) nav_perf: Option<NavPerfSample>,
 }
 
 /// Flags the render pipeline consumes, derived from
-/// [`codec::entities::ViewportRenderMode`]. Each shaded variant fills
+/// [`document::entities::ViewportRenderMode`]. Each shaded variant fills
 /// 3D faces and meshes; the pure wireframes drop the fill and keep only
 /// edges. The optimized 2-D wireframe retains planar SOLID interiors and
 /// entity draw order; the 3-D wireframe uses true depth and outlines them.
@@ -296,10 +319,8 @@ pub struct RenderModeFlags {
     pub flat_shade: bool,
 }
 
-pub fn render_mode_flags(
-    mode: codec::entities::ViewportRenderMode,
-) -> RenderModeFlags {
-    use codec::entities::ViewportRenderMode as M;
+pub fn render_mode_flags(mode: document::entities::ViewportRenderMode) -> RenderModeFlags {
+    use document::entities::ViewportRenderMode as M;
     match mode {
         M::Wireframe2D => RenderModeFlags {
             face3d_fill: false,
@@ -374,14 +395,53 @@ impl shader::Primitive for Primitive {
         viewport: &Viewport,
     ) {
         let nav_prepare_started = iced::time::Instant::now();
+        if let Some(gap_ms) = crate::perf::take_view_to_prepare_ms() {
+            if gap_ms >= 1.0 && crate::perf::has_pending_pointer_moves() {
+                crate::perf_record!("[perf] view-to-prepare {:>7.1}ms", gap_ms);
+            }
+        }
         let errors_at_entry = crate::scene::pipeline::gpu_errors_seen();
-        let recovering = pipeline.gpu_error_epoch != errors_at_entry;
+        let mut recovering = pipeline.gpu_error_epoch != errors_at_entry;
+        if recovering {
+            pipeline.gpu_error_streak = pipeline.gpu_error_streak.saturating_add(1);
+            pipeline.gpu_clean_frames = 0;
+        } else {
+            // Not every prepare is followed by a draw that can fail, so one
+            // clean prepare does not end a run of failing frames.
+            pipeline.gpu_clean_frames = pipeline.gpu_clean_frames.saturating_add(1);
+            if pipeline.gpu_clean_frames >= 8 {
+                pipeline.gpu_error_streak = 0;
+            }
+        }
+        // Rebuilding the caches answers a rejected allocation. When the
+        // frame keeps failing after that, the fault is in the draw itself:
+        // rebuilding again only re-uploads the whole scene every frame, and
+        // that memory piles up until the system runs out (#3189). Keep the
+        // caches then, and retry the rebuild only now and then.
+        const REBUILD_TRIES: u32 = 4;
+        const RETRY_EVERY: u32 = 256;
+        let streak = pipeline.gpu_error_streak;
+        if streak > REBUILD_TRIES && streak % RETRY_EVERY != 0 {
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| {
+                eprintln!(
+                    "[gpu] every frame fails the same way; keeping GPU caches instead of rebuilding them each frame"
+                );
+            });
+            pipeline.gpu_error_epoch = errors_at_entry;
+            for inner in &mut pipeline.inners {
+                inner.absorb_gpu_errors(errors_at_entry);
+            }
+            recovering = false;
+        }
         if recovering {
             pipeline.wire_buffer_cache.clear();
+            pipeline.mesh_batch_cache.clear();
             pipeline.block_geometry.clear();
             pipeline.gpu_error_epoch = errors_at_entry;
         }
-        let scale = viewport.scale_factor() as f32;
+        let scale = viewport.scale_factor();
+        DEVICE_SCALE.store(scale.to_bits(), std::sync::atomic::Ordering::Relaxed);
         let instance_ids: Vec<u64> = self.viewports.iter().map(|vp| vp.instance_id).collect();
         let slots = pipeline.resolve_slots(device, queue, &instance_ids);
         for (i, vp) in self.viewports.iter().enumerate() {
@@ -415,9 +475,12 @@ impl shader::Primitive for Primitive {
             let clip_size = placement.size;
             inner.viewport = Some(placement);
             inner.ensure_depth_texture(device, clip_size);
-            let viewcube_side =
-                (crate::scene::VIEWCUBE_RENDER_PX.ceil() * scale).ceil().max(1.0) as u32;
-            inner.viewcube.ensure_depth_texture(device, Size::new(viewcube_side, viewcube_side));
+            let viewcube_side = (crate::scene::VIEWCUBE_RENDER_PX.ceil() * scale)
+                .ceil()
+                .max(1.0) as u32;
+            inner
+                .viewcube
+                .ensure_depth_texture(device, Size::new(viewcube_side, viewcube_side));
             inner.upload_blit_uv(queue, placement.uv_offset, placement.uv_scale);
             inner.upload_background_images(
                 device,
@@ -425,7 +488,14 @@ impl shader::Primitive for Primitive {
                 vp.background_image.as_ref(),
                 vp.environment_image.as_ref(),
             );
-            inner.upload_uniforms(device, queue, &vp.uniforms);
+            // The scene works in logical pixels; an image background keeps
+            // its size in device pixels.
+            let mut uniforms = vp.uniforms;
+            // The image's size and offset are in device pixels.
+            for value in &mut uniforms.background_image_transform {
+                *value /= scale.max(1e-3);
+            }
+            inner.upload_uniforms(device, queue, &uniforms);
 
             // ── Scene-render cache ────────────────────────────────────────
             // A pure cursor move — or any frame where the view, geometry,
@@ -438,7 +508,47 @@ impl shader::Primitive for Primitive {
             // drawing size. The ViewCube is excluded from the signature and
             // keeps updating in its own always-on pass, so cube hover still
             // tracks while the scene is cached.
-            let sig = render_signature(vp, &placement);
+            // Upload simple wire previews before checking the base-scene cache.
+            // Their dedicated overlay pass can then follow a cached resolve
+            // without making the resident geometry dirty on every cursor move.
+            let preview_wires_preuploaded = !vp.preview_wires.is_empty()
+                && vp.preview_hatches.is_empty()
+                && vp.preview_text_verts.is_empty()
+                && vp.clip_boundary_ndc.is_empty();
+            if preview_wires_preuploaded {
+                let Some(draw_depths) = vp.draw_depths.upgrade() else {
+                    inner.render_sig = u64::MAX;
+                    inner.skip_geometry = true;
+                    continue;
+                };
+                inner.upload_preview_wires(device, queue, &vp.preview_wires[..], &draw_depths);
+                // No preview text this frame; drop the last frame's glyphs.
+                inner.text_preview_gpu.clear();
+                // The direct pass draws straight into `surface_dest`, so it
+                // lines up with the cached scene only when that rectangle is
+                // the whole pixel-aligned raster (not cropped off the window).
+                // Instanced block previews cannot use the direct wire overlay.
+                inner.preview_overlay_direct = placement.surface_matches_raster()
+                    && inner
+                        .gpu_preview_block_wires
+                        .iter()
+                        .all(|wire| wire.instance_count == 0)
+                    && inner
+                        .gpu_preview_circles
+                        .iter()
+                        .all(|circle| circle.instance_count == 0)
+                    && inner
+                        .gpu_preview_ellipses
+                        .iter()
+                        .all(|ellipse| ellipse.instance_count == 0)
+                    && inner
+                        .gpu_preview_wires
+                        .iter()
+                        .any(|wire| wire.instance_count > 0);
+            } else {
+                inner.preview_overlay_direct = false;
+            }
+            let sig = render_signature(vp, &placement, inner.preview_overlay_direct);
             // REDRAW bypass: pin render_sig to force a full pass this frame
             // even if the signature is otherwise unchanged. The request is
             // one-shot per viewport (consumed by the builder that produced
@@ -449,9 +559,17 @@ impl shader::Primitive for Primitive {
             let skip = inner.render_sig != u64::MAX && sig == inner.render_sig;
             inner.render_sig = sig;
             inner.skip_geometry = skip;
+            if !skip && !vp.preview_wires.is_empty() && crate::perf::enabled() {
+                crate::perf_record!(
+                    "[perf] preview-render full-scene=1 direct-overlay={} wires={}",
+                    inner.preview_overlay_direct,
+                    vp.preview_wires.len(),
+                );
+            }
             // Interaction LOD: skip the hatch draw this frame while navigating.
             inner.skip_hatch_frame = vp.skip_hatch;
             inner.skip_background = vp.skip_background;
+            inner.occluded_edges = vp.occluded_edges;
             if skip {
                 if vp.show_viewcube {
                     inner.viewcube.upload(
@@ -459,6 +577,7 @@ impl shader::Primitive for Primitive {
                         vp.cam_rotation,
                         vp.compass_rotation,
                         vp.hover_region,
+                        vp.viewcube_opacity,
                         self.viewcube_text_color,
                     );
                 }
@@ -508,31 +627,22 @@ impl shader::Primitive for Primitive {
             let hatch_changed = inner
                 .cached_hatch_source
                 .as_ref()
-                .map_or(true, |source| !Arc::ptr_eq(source, &vp.hatches));
+                .is_none_or(|source| !Arc::ptr_eq(source, &vp.hatches));
             let wipeout_changed = inner
                 .cached_wipeout_source
                 .as_ref()
-                .map_or(true, |source| !Arc::ptr_eq(source, &vp.wipeout_hatches));
+                .is_none_or(|source| !Arc::ptr_eq(source, &vp.wipeout_hatches));
             if hatch_changed || fill_changed {
-                inner.upload_hatches(
-                    device,
-                    queue,
-                    if fill_mode { &vp.hatches[..] } else { &[] },
-                );
+                inner.upload_hatches(device, queue, if fill_mode { &vp.hatches[..] } else { &[] });
                 inner.cached_hatch_source = Some(Arc::clone(&vp.hatches));
             }
             let preview_hatch_changed = inner
                 .cached_preview_hatch_source
                 .as_ref()
-                .map_or(true, |source| !Arc::ptr_eq(source, &vp.preview_hatches));
+                .is_none_or(|source| !Arc::ptr_eq(source, &vp.preview_hatches));
             if preview_hatch_changed || fill_changed {
-                inner.upload_preview_hatches(
-                    device,
-                    queue,
-                    &vp.preview_hatches[..],
-                );
-                inner.cached_preview_hatch_source =
-                    Some(Arc::clone(&vp.preview_hatches));
+                inner.upload_preview_hatches(device, queue, &vp.preview_hatches[..]);
+                inner.cached_preview_hatch_source = Some(Arc::clone(&vp.preview_hatches));
             }
             if wipeout_changed || fill_changed {
                 inner.upload_wipeouts(
@@ -549,17 +659,45 @@ impl shader::Primitive for Primitive {
             if inner
                 .cached_image_source
                 .as_ref()
-                .map_or(true, |source| !Arc::ptr_eq(source, &vp.images))
+                .is_none_or(|source| !Arc::ptr_eq(source, &vp.images))
             {
                 inner.upload_images(device, queue, &vp.images[..]);
                 inner.cached_image_source = Some(Arc::clone(&vp.images));
             }
             if inner
+                .cached_point_cloud_source
+                .as_ref()
+                .is_none_or(|source| !Arc::ptr_eq(source, &vp.point_clouds))
+            {
+                inner.upload_point_clouds(device, queue, &vp.point_clouds);
+                inner.cached_point_cloud_source = Some(Arc::clone(&vp.point_clouds));
+            }
+            // Relative to the eye, as the sprites are positioned.
+            let eye = glam::DVec3::new(
+                vp.uniforms.eye_high[0] as f64 + vp.uniforms.eye_low[0] as f64,
+                vp.uniforms.eye_high[1] as f64 + vp.uniforms.eye_low[1] as f64,
+                vp.uniforms.eye_high[2] as f64 + vp.uniforms.eye_low[2] as f64,
+            );
+            let clip: Vec<[f32; 4]> = vp
+                .point_cloud_clip
+                .iter()
+                .map(|&[x, y, z, d]| {
+                    let offset = glam::DVec3::new(x, y, z).dot(eye) + d;
+                    [x as f32, y as f32, z as f32, offset as f32]
+                })
+                .collect();
+            inner.set_point_cloud_view(queue, vp.point_cloud_light, &clip);
+            let text_source_changed = inner
                 .cached_text_source
                 .as_ref()
-                .map_or(true, |source| !Arc::ptr_eq(source, &vp.text_verts))
-                || vp.wire_content_id != inner.cached_wire_id
-            {
+                .is_none_or(|source| !Arc::ptr_eq(source, &vp.text_verts));
+            // A patch proves the text pass unchanged only when it applies to
+            // the wire set this slot last uploaded.
+            let text_wire_changed = vp.wire_content_id != inner.cached_wire_id
+                && vp.wire_patch.as_ref().is_none_or(|(base, patch)| {
+                    *base != inner.cached_wire_id || patch.text_pass_changed
+                });
+            if text_source_changed || text_wire_changed {
                 inner.upload_text(
                     device,
                     queue,
@@ -567,8 +705,10 @@ impl shader::Primitive for Primitive {
                     &vp_wires[..],
                     &draw_depths,
                 );
-                inner.cached_text_source = Some(Arc::clone(&vp.text_verts));
             }
+            // Advance the source key even when an ordinary wire patch leaves
+            // both document text and block-instance text unchanged.
+            inner.cached_text_source = Some(Arc::clone(&vp.text_verts));
             inner.cached_fill_mode = fill_mode;
             inner.cached_epoch = cur_key;
             // Face3D edge/fill buffers are world-space and selection-independent
@@ -578,26 +718,45 @@ impl shader::Primitive for Primitive {
             // rebuilding it when another entity category alone changes. Never
             // retain `vp.wires` here: Scene needs unique ownership to splice a
             // one-entity edit into the resident set.
-            let face_pass_unchanged = vp
-                .wire_patch
-                .as_ref()
-                .is_some_and(|(_, patch)| !patch.face_pass_changed);
-            let face3d_changed = inner
+            let face_pass_unchanged = vp.wire_patch.as_ref().is_some_and(|(base, patch)| {
+                *base == inner.cached_face3d_key.0 && !patch.face_pass_changed
+            });
+            let face_source_changed = inner
                 .cached_face3d_source
                 .as_ref()
-                .map_or(true, |source| !Arc::ptr_eq(source, &vp.face3d_wires))
-                || inner
-                    .cached_face3d_depth_source
-                    .as_ref()
-                    .and_then(std::sync::Weak::upgrade)
-                    .map_or(true, |source| !Arc::ptr_eq(&source, &draw_depths))
-                || (inner.cached_face3d_key.0 != vp.wire_content_id
-                    && !face_pass_unchanged);
-            if face3d_changed
-                || face3d_fill_active != inner.cached_face3d_key.1
-                || solid_fill_active != inner.cached_face3d_key.2
-                || solid_visibility_key != inner.cached_face3d_key.3
+                .is_none_or(|source| !Arc::ptr_eq(source, &vp.face3d_wires));
+            let face_depth_changed = inner
+                .cached_face3d_depth_source
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .is_none_or(|source| !Arc::ptr_eq(&source, &draw_depths));
+            let face_wire_changed =
+                inner.cached_face3d_key.0 != vp.wire_content_id && !face_pass_unchanged;
+            let face_fill_mode_changed = face3d_fill_active != inner.cached_face3d_key.1;
+            let solid_fill_mode_changed = solid_fill_active != inner.cached_face3d_key.2;
+            let solid_visibility_changed = solid_visibility_key != inner.cached_face3d_key.3;
+            if face_source_changed
+                || face_depth_changed
+                || face_wire_changed
+                || face_fill_mode_changed
+                || solid_fill_mode_changed
+                || solid_visibility_changed
             {
+                if crate::perf::enabled() {
+                    crate::perf_record!(
+                        "[perf] face3d-upload-gate patch_present={} face_pass_changed={} source_changed={} depth_changed={} wire_id_changed={} fill_mode_changed={} solid_mode_changed={} visibility_changed={}",
+                        vp.wire_patch.is_some(),
+                        vp.wire_patch
+                            .as_ref()
+                            .is_none_or(|(_, patch)| patch.face_pass_changed),
+                        face_source_changed,
+                        face_depth_changed,
+                        face_wire_changed,
+                        face_fill_mode_changed,
+                        solid_fill_mode_changed,
+                        solid_visibility_changed,
+                    );
+                }
                 inner.upload_face3d(
                     device,
                     queue,
@@ -643,18 +802,17 @@ impl shader::Primitive for Primitive {
                     .all(|other| other.wire_content_id != vp.wire_content_id);
                 let use_wire_arena = crate::scene::wire_gpu_patch_enabled()
                     && (inner.wire_const_bgl.is_some()
-                        || ((vp.wire_patch.is_some()
-                            || inner.wire_arena_id != u64::MAX)
+                        || ((vp.wire_patch.is_some() || inner.wire_arena_id != u64::MAX)
                             && packed_arena_owner));
                 if use_wire_arena {
                     use crate::scene::pipeline::wire_arena::{
                         self, PersistentWireArena as WireArena,
                     };
                     let const_bgl = inner.wire_const_bgl.as_ref();
-                    let base_ok = vp
-                        .wire_patch
-                        .as_ref()
-                        .map_or(false, |(base, patch)| {
+                    // A full draw-depth rebuild moves every label, which a patch
+                    // of the changed entities alone would leave stale.
+                    let base_ok = inner.wire_arena_depth_generation == vp.draw_depth_generation
+                        && vp.wire_patch.as_ref().is_some_and(|(base, patch)| {
                             inner.wire_arena_id == *base && !patch.changes.is_empty()
                         });
                     let patch = vp.wire_patch.as_ref().map(|(_, patch)| patch);
@@ -672,11 +830,11 @@ impl shader::Primitive for Primitive {
                     // scanned/parses all resident wires repeatedly here even
                     // though WireArena emits just one changed entity.
                     let mut regular_changed: rustc_hash::FxHashMap<
-                        codec::Handle,
+                        document::Handle,
                         Vec<&crate::scene::WireModel>,
                     > = rustc_hash::FxHashMap::default();
                     let mut mesh_changed: rustc_hash::FxHashMap<
-                        codec::Handle,
+                        document::Handle,
                         Vec<&crate::scene::WireModel>,
                     > = rustc_hash::FxHashMap::default();
                     if let Some(patch) = patch {
@@ -692,7 +850,7 @@ impl shader::Primitive for Primitive {
                         }
                     }
                     let fallback_touched = |mesh_edge: bool| {
-                        patch.map_or(true, |patch| {
+                        patch.is_none_or(|patch| {
                             patch.changes.iter().any(|(handle, _)| {
                                 inner.wire_arena_fallback_handles.contains(handle)
                                     || if mesh_edge {
@@ -733,8 +891,7 @@ impl shader::Primitive for Primitive {
                                 &draw_depths,
                             )
                         } else {
-                            inner.wire_arena_fallback_kind == Some(true)
-                                && !fallback_touched(true)
+                            inner.wire_arena_fallback_kind == Some(true) && !fallback_touched(true)
                         };
                     if !reg_ok || !mesh_ok {
                         // Initial upload or a patch that outgrew arena capacity:
@@ -764,15 +921,11 @@ impl shader::Primitive for Primitive {
                                 inner.wire_arena_fallback_handles = regular
                                     .iter()
                                     .filter_map(|wire| {
-                                        wire.name
-                                            .parse::<u64>()
-                                            .ok()
-                                            .map(codec::Handle::new)
+                                        wire.name.parse::<u64>().ok().map(document::Handle::new)
                                     })
                                     .collect();
                             } else if inner.wire_arena_fallback_kind == Some(false) {
-                                inner.wire_arena_fallback =
-                                    std::sync::Arc::new(Vec::new());
+                                inner.wire_arena_fallback = std::sync::Arc::new(Vec::new());
                                 inner.wire_arena_fallback_kind = None;
                                 inner.wire_arena_fallback_handles.clear();
                             }
@@ -801,15 +954,11 @@ impl shader::Primitive for Primitive {
                                 inner.wire_arena_fallback_handles = mesh
                                     .iter()
                                     .filter_map(|wire| {
-                                        wire.name
-                                            .parse::<u64>()
-                                            .ok()
-                                            .map(codec::Handle::new)
+                                        wire.name.parse::<u64>().ok().map(document::Handle::new)
                                     })
                                     .collect();
                             } else if inner.wire_arena_fallback_kind == Some(true) {
-                                inner.wire_arena_fallback =
-                                    std::sync::Arc::new(Vec::new());
+                                inner.wire_arena_fallback = std::sync::Arc::new(Vec::new());
                                 inner.wire_arena_fallback_kind = None;
                                 inner.wire_arena_fallback_handles.clear();
                             }
@@ -817,8 +966,8 @@ impl shader::Primitive for Primitive {
                     }
                     _patched = reg_ok && mesh_ok;
 
-                    let regular_ready = inner.wire_arena.is_some()
-                        || inner.wire_arena_fallback_kind == Some(false);
+                    let regular_ready =
+                        inner.wire_arena.is_some() || inner.wire_arena_fallback_kind == Some(false);
                     let mesh_ready = inner.wire_arena_mesh.is_some()
                         || inner.wire_arena_fallback_kind == Some(true);
                     if regular_ready
@@ -848,54 +997,128 @@ impl shader::Primitive for Primitive {
                                 patch.changes.iter().all(|(handle, _)| {
                                     !inner.partition_contributors.contains(handle)
                                         && !patch.runs.get(handle).is_some_and(|run| {
-                                            run.iter()
-                                                .any(wire_arena::feeds_analytical_uploads)
+                                            run.iter().any(wire_arena::feeds_analytical_uploads)
                                         })
                                 })
                             });
+                        // A move leaves how many analytical instances an object has
+                        // unchanged, only their values: write the new values over the
+                        // old ones instead of rebuilding every block, circle and ellipse
+                        // buffer. Anything else falls through to the full rebuild.
+                        let mut patched_in_place = false;
+                        if !analytical_untouched
+                            && _patched
+                            && crate::scene::pipeline::analytic_patch_enabled()
+                        {
+                            if let Some(patch) = patch {
+                                let t_in_place = _perf.then(iced::time::Instant::now);
+                                match inner.patch_analytic_in_place(
+                                    queue,
+                                    patch,
+                                    &draw_depths,
+                                    vp.draw_depth_generation,
+                                ) {
+                                    Ok(edits) => {
+                                        patched_in_place = true;
+                                        if let Some(started) = t_in_place {
+                                            crate::perf_record!(
+                                                "[perf] analytic-patch in-place edits={edits} {:.1}ms",
+                                                started.elapsed().as_secs_f64() * 1000.0
+                                            );
+                                        }
+                                    }
+                                    Err(reason) => {
+                                        if _perf {
+                                            crate::perf_record!(
+                                                "[perf] analytic-patch rebuild reason={reason}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let analytical_untouched = analytical_untouched || patched_in_place;
                         let t_part = _perf.then(iced::time::Instant::now);
                         let partitioned = (!analytical_untouched)
                             .then(|| wire_arena::partition_wires(&vp_wires, &draw_depths));
-                        let part_ms = t_part
-                            .map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+                        let part_ms = t_part.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
                         let t_blk = _perf.then(iced::time::Instant::now);
                         let mut blk_ms = 0.0f64;
                         let mut curve_ms = 0.0f64;
                         // `None` means the three uploads this slot holds are
                         // still the answer, so they are left alone.
                         if let Some(partitioned) = &partitioned {
-                            inner.gpu_block_wires = std::sync::Arc::new(
-                                inner.upload_block_wires(
+                            let track = crate::scene::pipeline::analytic_patch_enabled();
+                            let (block_gpus, block_tracking) = if track {
+                                inner.upload_block_wires_tracked(
                                     device,
                                     queue,
                                     &partitioned.instanced,
                                     &draw_depths,
                                     &mut pipeline.block_geometry,
-                                ),
-                            );
-                            blk_ms = t_blk
-                                .map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+                                )
+                            } else {
+                                (
+                                    inner.upload_block_wires(
+                                        device,
+                                        queue,
+                                        &partitioned.instanced,
+                                        &draw_depths,
+                                        &mut pipeline.block_geometry,
+                                    ),
+                                    None,
+                                )
+                            };
+                            inner.gpu_block_wires = std::sync::Arc::new(block_gpus);
+                            blk_ms = t_blk.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
                             let t_curve = _perf.then(iced::time::Instant::now);
-                            inner.gpu_circles = std::sync::Arc::new(
-                                inner.upload_circles_from_instances(
+                            let (circle_gpus, circle_slots) = if track {
+                                inner.upload_circles_tracked(
                                     device,
                                     queue,
                                     &partitioned.circle_instances,
-                                ),
-                            );
-                            inner.gpu_ellipses = std::sync::Arc::new(
-                                inner.upload_ellipses_from_instances(
+                                    &partitioned.circle_owners,
+                                )
+                            } else {
+                                (
+                                    inner.upload_circles_from_instances(
+                                        device,
+                                        queue,
+                                        &partitioned.circle_instances,
+                                    ),
+                                    Vec::new(),
+                                )
+                            };
+                            inner.gpu_circles = std::sync::Arc::new(circle_gpus);
+                            let (ellipse_gpus, ellipse_slots) = if track {
+                                inner.upload_ellipses_tracked(
                                     device,
                                     queue,
                                     &partitioned.ellipse_instances,
-                                ),
+                                    &partitioned.ellipse_owners,
+                                )
+                            } else {
+                                (
+                                    inner.upload_ellipses_from_instances(
+                                        device,
+                                        queue,
+                                        &partitioned.ellipse_instances,
+                                    ),
+                                    Vec::new(),
+                                )
+                            };
+                            inner.gpu_ellipses = std::sync::Arc::new(ellipse_gpus);
+                            inner.record_analytic_slots(
+                                block_tracking,
+                                circle_slots,
+                                ellipse_slots,
+                                vp.draw_depth_generation,
                             );
                             inner
                                 .partition_contributors
                                 .clone_from(&partitioned.contributors);
                             inner.partition_depth_generation = vp.draw_depth_generation;
-                            curve_ms = t_curve
-                                .map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+                            curve_ms = t_curve.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
                         }
                         if _perf {
                             // Report counts only when partitioning ran.
@@ -923,8 +1146,7 @@ retained_contributors={}",
                                 &patch.unwrap().index_edits,
                             );
                         } else {
-                            inner.wire_handle_index =
-                                wire_arena::build_handle_index(&vp_wires[..]);
+                            inner.wire_handle_index = wire_arena::build_handle_index(&vp_wires[..]);
                         }
                         // Only claim the content id when the device accepted
                         // the upload; otherwise the slot believes it holds this
@@ -935,6 +1157,7 @@ retained_contributors={}",
                             } else {
                                 u64::MAX
                             };
+                        inner.wire_arena_depth_generation = vp.draw_depth_generation;
                         arena_served = true;
                     } else {
                         inner.wire_arena = None;
@@ -964,10 +1187,7 @@ retained_contributors={}",
                 // `.cloned()` releases the immutable cache borrow before the
                 // miss branch takes a mutable one.
                 if !arena_served {
-                    let cached = pipeline
-                        .wire_buffer_cache
-                        .get(&vp.wire_content_id)
-                        .cloned();
+                    let cached = pipeline.wire_buffer_cache.get(&vp.wire_content_id).cloned();
                     let built = match cached {
                         Some(entry) => entry,
                         None => {
@@ -992,16 +1212,14 @@ retained_contributors={}",
                                 );
                             }
                             let t_upload = _perf.then(iced::time::Instant::now);
-                            let errors_before =
-                                crate::scene::pipeline::gpu_errors_seen();
-                            let entry =
-                                inner.build_wire_buffers(
-                                    device,
-                                    queue,
-                                    &vp_wires[..],
-                                    &draw_depths,
-                                    &mut pipeline.block_geometry,
-                                );
+                            let errors_before = crate::scene::pipeline::gpu_errors_seen();
+                            let entry = inner.build_wire_buffers(
+                                device,
+                                queue,
+                                &vp_wires[..],
+                                &draw_depths,
+                                &mut pipeline.block_geometry,
+                            );
                             if let Some(start) = t_upload {
                                 crate::perf_record!(
                                     "[perf] wire-upload {:.1}ms wires={} content_id={}",
@@ -1033,11 +1251,7 @@ retained_contributors={}",
                 inner.cached_wire_id = vp.wire_content_id;
                 if _perf {
                     let gi: u32 = inner.gpu_wires.iter().map(|w| w.instance_count).sum();
-                    let bi: u32 = inner
-                        .gpu_block_wires
-                        .iter()
-                        .map(|w| w.instance_count)
-                        .sum();
+                    let bi: u32 = inner.gpu_block_wires.iter().map(|w| w.instance_count).sum();
                     let outcome = if !arena_served {
                         "shared-fullupload"
                     } else if _patched {
@@ -1057,24 +1271,28 @@ retained_contributors={}",
                     );
                 }
             }
-            // Selection xray overlay — rebuilt when the selection changes or the
-            // underlying wires changed. A pick bumps only selection_generation,
-            // so this refreshes without re-tessellating or re-uploading the main
-            // wire buffers.
+            // Selection xray overlay — split into two independently cached
+            // halves. The committed-selection half re-emits only when the
+            // selection (or the wires under it) changed: a pick bumps
+            // selection_generation and refreshes the overlay without
+            // re-tessellating or re-uploading the main wire buffers. The
+            // hover half re-emits on rollover / marquee ticks (hover_generation)
+            // and on selection changes, because the hover overlay is
+            // `hovered − selected`.
             let sel_key = (vp.wire_content_id, vp.selection_generation);
-            let highlighted_geometry_unchanged =
-                vp.selected_handles.is_empty() && vp.hover_handles.is_empty()
-                    || vp.wire_patch.as_ref().is_some_and(|(previous, patch)| {
-                        *previous == inner.cached_selection.0
-                            && patch.changes.iter().all(|(handle, _)| {
-                                !vp.selected_handles.contains(handle)
-                                    && !vp.hover_handles.contains(handle)
-                            })
-                    });
+            let highlighted_geometry_unchanged = vp.selected_handles.is_empty()
+                && vp.hover_handles.is_empty()
+                || vp.wire_patch.as_ref().is_some_and(|(previous, patch)| {
+                    *previous == inner.cached_selection.0
+                        && patch.changes.iter().all(|(handle, _)| {
+                            !vp.selected_handles.contains(handle)
+                                && !vp.hover_handles.contains(handle)
+                        })
+                });
             let selection_changed = inner.cached_selection.1 != vp.selection_generation;
-            let highlighted_geometry_changed = inner.cached_selection.0
-                != vp.wire_content_id
-                && !highlighted_geometry_unchanged;
+            let hover_changed = inner.cached_hover_generation != Some(vp.hover_generation);
+            let highlighted_geometry_changed =
+                inner.cached_selection.0 != vp.wire_content_id && !highlighted_geometry_unchanged;
             let annotation_context_changed = inner
                 .cached_annotation_highlight_source
                 .as_ref()
@@ -1082,64 +1300,86 @@ retained_contributors={}",
                     !(previous.is_empty() && vp.annotation_context_wires.is_empty())
                         && !Arc::ptr_eq(previous, &vp.annotation_context_wires)
                 });
-            if selection_changed || highlighted_geometry_changed || annotation_context_changed {
+            let selected_annotation_changed = inner
+                .cached_selected_annotation_source
+                .as_ref()
+                .map_or(!vp.selected_annotation_context_wires.is_empty(), |previous| {
+                    !(previous.is_empty() && vp.selected_annotation_context_wires.is_empty())
+                        && !Arc::ptr_eq(previous, &vp.selected_annotation_context_wires)
+                });
+            let refresh_selected =
+                selection_changed || highlighted_geometry_changed || selected_annotation_changed;
+            let refresh_hover = hover_changed
+                || selection_changed
+                || highlighted_geometry_changed
+                || annotation_context_changed;
+            if refresh_selected || refresh_hover {
+                inner.prepare_highlight_wire_cache(vp.wire_content_id, vp.draw_depth_generation);
                 let sel_color = if self.selection_effect {
                     Some(self.selection_color)
                 } else {
                     None
                 };
-                inner.upload_selected_wires(
-                    device,
-                    queue,
-                    &vp_wires[..],
-                    &vp.selected_handles,
-                    &vp.hover_handles,
-                    &vp.annotation_context_wires,
-                    &draw_depths,
-                    sel_color,
+                // Identity of the hover half's inputs for the text-upload
+                // cache: generations + wire content + depth generation mix,
+                // plus the hover-annotation source pointer (the Arc content
+                // is immutable, so pointer equality is content equality).
+                let hover_key = (
+                    vp.hover_generation
+                        ^ vp.selection_generation.rotate_left(32)
+                        ^ vp.wire_content_id.rotate_left(16)
+                        ^ vp.draw_depth_generation.rotate_left(48),
+                    std::sync::Arc::as_ptr(&vp.annotation_context_wires) as usize as u64,
                 );
-                // Text highlight rides the same selection key: a pick / rollover
-                // recolours the selected / hovered glyphs without touching the
-                // base text buffer.
-                inner.upload_text_highlight(
+                inner.upload_split_highlights(
                     device,
                     queue,
                     &vp_wires[..],
                     &vp.selected_handles,
                     &vp.hover_handles,
+                    &vp.selected_annotation_context_wires,
                     &vp.annotation_context_wires,
                     &draw_depths,
                     sel_color,
+                    vp.wire_content_id,
+                    vp.draw_depth_generation,
+                    refresh_selected,
+                    refresh_hover,
+                    hover_key,
                 );
                 inner.cached_annotation_highlight_source =
                     Some(Arc::clone(&vp.annotation_context_wires));
+                inner.cached_selected_annotation_source =
+                    Some(Arc::clone(&vp.selected_annotation_context_wires));
             }
             // Advance the content id even when an unrelated entity patch kept
             // the existing overlay valid, so future deltas compare to the
             // arena generation actually on screen.
             inner.cached_selection = sel_key;
+            inner.cached_hover_generation = Some(vp.hover_generation);
             // Batched solid meshes stay resident while unrelated entity
             // categories change.
             if inner
                 .cached_mesh_source
                 .as_ref()
-                .map_or(true, |source| !Arc::ptr_eq(source, &vp.meshes))
+                .is_none_or(|source| !Arc::ptr_eq(source, &vp.meshes))
             {
                 let patched = vp.wire_patch.as_ref().is_some_and(|(previous, patch)| {
                     *previous == inner.cached_mesh_content_id
-                        && inner.patch_mesh_batch(
-                            device,
-                            queue,
-                            &vp.meshes[..],
-                            &patch.changes,
-                        )
+                        && inner.patch_mesh_batch(device, queue, &vp.meshes[..], &patch.changes)
                 });
                 if !patched {
-                    inner.upload_mesh_batch(device, queue, &vp.meshes[..]);
+                    inner.upload_mesh_batch(
+                        device,
+                        queue,
+                        &vp.meshes,
+                        &mut pipeline.mesh_batch_cache,
+                    );
                 }
                 inner.cached_mesh_source = Some(Arc::clone(&vp.meshes));
             }
             inner.cached_mesh_content_id = vp.wire_content_id;
+            inner.select_mesh_lods();
             // Selection / hover highlight overlay — tinted copies of just the
             // picked solids, rebuilt only when the highlight set (or geometry)
             // changes. Drawn over the static batch so the base never re-packs.
@@ -1147,19 +1387,27 @@ retained_contributors={}",
                 Arc::as_ptr(&vp.meshes) as usize as u64,
                 vp.selection_generation,
             );
-            if hl_key != inner.cached_highlight_key {
+            if hl_key != inner.cached_highlight_key
+                || inner.cached_mesh_hover_generation != Some(vp.hover_generation)
+                || selected_annotation_changed
+                || annotation_context_changed
+            {
                 inner.update_mesh_highlight(
                     &vp.selected_handles,
                     &vp.hover_handles,
                     &vp.annotation_context_wires,
+                    &vp.selected_annotation_context_wires,
                 );
                 inner.cached_highlight_key = hl_key;
+                inner.cached_mesh_hover_generation = Some(vp.hover_generation);
             }
             // Live overlay (command preview / interim / grip drag) — small and
             // refreshed every frame it's present, so a drag never re-uploads
             // the resident base wire buffer.
-            inner.upload_preview_wires(device, queue, &vp.preview_wires[..], &draw_depths);
-            inner.upload_preview_text(device, queue, &vp.preview_text_verts[..]);
+            if !preview_wires_preuploaded {
+                inner.upload_preview_wires(device, queue, &vp.preview_wires[..], &draw_depths);
+                inner.upload_preview_text(device, queue, &vp.preview_text_verts[..]);
+            }
             // Cull / scissor / LOD project AABBs relative-to-eye (matching the
             // GPU's RTE path) so the math stays precise at UTM-scale coords.
             let view_rot = vp.uniforms.view_rot;
@@ -1180,7 +1428,11 @@ retained_contributors={}",
                 inner.upload_silhouettes(
                     device,
                     queue,
-                    if silhouette_enabled { &vp.meshes[..] } else { &[] },
+                    if silhouette_enabled {
+                        &vp.meshes[..]
+                    } else {
+                        &[]
+                    },
                     vp.wire_content_id,
                     vp.view_dir,
                 );
@@ -1215,9 +1467,8 @@ retained_contributors={}",
                 clip_size.width,
                 clip_size.height,
             );
-            if inner.wire_arena_id == vp.wire_content_id
-                && inner.wire_cull_key != cull_key
-            {
+            if inner.wire_arena_id == vp.wire_content_id && inner.wire_cull_key != cull_key {
+                let t_cull = iced::time::Instant::now();
                 let mut visible = if inner.wire_arena_fallback_kind == Some(false) {
                     inner.wire_arena_fallback.as_ref().clone()
                 } else {
@@ -1244,6 +1495,14 @@ retained_contributors={}",
                         clip_size.height,
                     ));
                 }
+                let cull_ms = t_cull.elapsed().as_secs_f64() * 1000.0;
+                if crate::perf::enabled() {
+                    crate::perf_record!(
+                        "[perf] wire-cull {:>7.2}ms items={}",
+                        cull_ms,
+                        visible.len()
+                    );
+                }
                 inner.gpu_wires = std::sync::Arc::new(visible);
                 inner.wire_cull_key = cull_key;
             }
@@ -1253,6 +1512,7 @@ retained_contributors={}",
                     vp.cam_rotation,
                     vp.compass_rotation,
                     vp.hover_region,
+                    vp.viewcube_opacity,
                     self.viewcube_text_color,
                 );
             }
@@ -1280,9 +1540,9 @@ retained_contributors={}",
                 sample.started.elapsed().as_secs_f64() * 1000.0,
                 self.viewports.len(),
             ));
-        } else if crate::perf::enabled() && prepare_ms >= 5.0 {
+        } else if crate::perf::enabled() {
             crate::perf_record!(
-                "[perf] frame-prepare {:>7.1}ms viewports={}",
+                "[perf] frame-prepare {:>7.2}ms viewports={}",
                 prepare_ms,
                 self.viewports.len(),
             );
@@ -1308,7 +1568,9 @@ retained_contributors={}",
         clip: &Rectangle<u32>,
     ) {
         let nav_render_started = iced::time::Instant::now();
-        pipeline.frame_rendered.store(true, std::sync::atomic::Ordering::Relaxed);
+        pipeline
+            .frame_rendered
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let clip_right = clip.x + clip.width;
         let clip_bottom = clip.y + clip.height;
         for vp in &self.viewports {
@@ -1327,8 +1589,12 @@ retained_contributors={}",
             let surface_clip = Rectangle {
                 x: left,
                 y: top,
-                width: (surface_dest.x + surface_dest.width).min(clip_right).saturating_sub(left),
-                height: (surface_dest.y + surface_dest.height).min(clip_bottom).saturating_sub(top),
+                width: (surface_dest.x + surface_dest.width)
+                    .min(clip_right)
+                    .saturating_sub(left),
+                height: (surface_dest.y + surface_dest.height)
+                    .min(clip_bottom)
+                    .saturating_sub(top),
             };
             if surface_clip.width == 0 || surface_clip.height == 0 {
                 continue;
@@ -1351,11 +1617,16 @@ retained_contributors={}",
             // The ViewCube renders directly to the surface in the top-right corner
             // of the viewport. Skip it only when the top-right corner is off-canvas
             // or the visible area cannot fit the cube.
-            if vp.show_viewcube && inner.viewcube.should_render(surface_dest, surface_clip, clip) {
+            if vp.show_viewcube
+                && inner
+                    .viewcube
+                    .should_render(surface_dest, surface_clip, clip)
+            {
                 inner.viewcube.render(encoder, target, surface_clip);
             }
         }
         let render_ms = nav_render_started.elapsed().as_secs_f64() * 1000.0;
+        crate::perf::note_frame_render(render_ms);
         if let Some(sample) = self.nav_perf {
             crate::perf::record(format_args!(
                 "[perf] nav-render op={} space={} mode={} encode={:.2}ms elapsed={:.2}ms viewports={}",
@@ -1382,11 +1653,14 @@ retained_contributors={}",
 /// scene-render cache in `Primitive::prepare` / `Pipeline::render`).
 ///
 /// Deliberately EXCLUDES `hover_region` — the ViewCube highlight renders in its
-/// own always-on pass, so cube hover must not force a full scene re-render. The
-/// live preview IS included (its coordinates), so a rubber-band tracking the
-/// cursor still renders, and the frame where the preview clears erases it
-/// instead of freezing the last overlay on screen.
-fn render_signature(vp: &ViewportData, placement: &PhysicalViewport) -> u64 {
+/// own always-on pass, so cube hover must not force a full scene re-render. Most
+/// live previews remain in the signature; simple unclipped wires use a separate
+/// surface overlay and do not dirty the cached resident scene.
+fn render_signature(
+    vp: &ViewportData,
+    placement: &PhysicalViewport,
+    direct_wire_preview: bool,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
     // Camera + per-view shading flags all live in the uniforms (view_rot, eye
@@ -1411,8 +1685,19 @@ fn render_signature(vp: &ViewportData, placement: &PhysicalViewport) -> u64 {
         std::sync::Arc::as_ptr(&vp.meshes) as usize
     }
     .hash(&mut h);
+    if vp.point_clouds.clouds.is_empty() {
+        std::ptr::null()
+    } else {
+        std::sync::Arc::as_ptr(&vp.point_clouds)
+    }
+    .hash(&mut h);
+    vp.point_cloud_light.map(f32::to_bits).hash(&mut h);
+    for plane in &vp.point_cloud_clip {
+        plane.map(f64::to_bits).hash(&mut h);
+    }
     vp.geometry_epoch.hash(&mut h);
     vp.selection_generation.hash(&mut h);
+    vp.hover_generation.hash(&mut h);
     vp.selected_sig.hash(&mut h);
     vp.wire_content_id.hash(&mut h);
     vp.fill_mode.hash(&mut h);
@@ -1422,6 +1707,7 @@ fn render_signature(vp: &ViewportData, placement: &PhysicalViewport) -> u64 {
     vp.show_3d_edges.hash(&mut h);
     vp.display_silhouette.hash(&mut h);
     vp.hidden_line.hash(&mut h);
+    vp.occluded_edges.hash(&mut h);
     // ViewCube visibility is excluded from the *scene* signature elsewhere only
     // for the live-hover pass; here it MUST invalidate the cache so toggling the
     // cube (NAVVCUBE) re-renders and actually clears the last cube frame
@@ -1433,19 +1719,19 @@ fn render_signature(vp: &ViewportData, placement: &PhysicalViewport) -> u64 {
     vp.skip_background.hash(&mut h);
     placement.size.width.hash(&mut h);
     placement.size.height.hash(&mut h);
-    for value in [placement.raster.x, placement.raster.y, placement.raster.width, placement.raster.height] {
+    for value in [
+        placement.raster.x,
+        placement.raster.y,
+        placement.raster.width,
+        placement.raster.height,
+    ] {
         value.to_bits().hash(&mut h);
     }
     // Live overlay (command preview / interim / grip drag). Small — a handful
     // of wires — so hashing its coordinates is cheap and catches the endpoint
     // moving with the cursor as well as the preview appearing / clearing.
-    for w in vp.preview_wires.iter() {
-        w.points.len().hash(&mut h);
-        for p in &w.points {
-            p[0].to_bits().hash(&mut h);
-            p[1].to_bits().hash(&mut h);
-            p[2].to_bits().hash(&mut h);
-        }
+    if !direct_wire_preview && !vp.preview_wires.is_empty() {
+        hash_preview_wires(&vp.preview_wires, &mut h);
     }
     // Live hatch preview. Pattern-origin grip drags keep the boundary fixed and
     // move only the family anchors, so hash both geometry and pattern data.
@@ -1516,6 +1802,144 @@ fn render_signature(vp: &ViewportData, placement: &PhysicalViewport) -> u64 {
     h.finish()
 }
 
+/// The multiplier model-space linetypes take from the annotation scale, or
+/// `None` when they keep their drawing-unit lengths (MSLTSCALE off, or no usable
+/// CANNOSCALEVALUE).
+pub(in crate::scene) fn model_linetype_ratio(document: &Document) -> Option<f32> {
+    if !crate::scene::annotative::model_linetypes_follow_annotation(document) {
+        return None;
+    }
+    let ratio = 1.0 / document.header.annotation_scale_value;
+    (ratio.is_finite() && ratio > 1e-9).then_some(ratio as f32)
+}
+
+/// FROM uses the overlay tracking cadence in pixels, independent of zoom and
+/// annotation / paper-space linetype scaling. GPU wire patterns are world units.
+fn scale_from_guide_dashes(wires: &mut [WireModel], world_per_pixel: f32, linetype_scale: f32) {
+    let raw_scale = world_per_pixel / linetype_scale;
+    let scale = raw_scale.max(1e-6);
+    for wire in wires.iter_mut().filter(|wire| wire.name == "from_guide") {
+        if scale > raw_scale {
+            // Keep GPU dash activation above its epsilon, with equivalent stations.
+            let length = wire.point_world(0, 1.0).distance(wire.point_world(1, 1.0));
+            let station = (length * (scale / raw_scale) as f64) as f32;
+            wire.pattern_stations = vec![0.0, station, station];
+        }
+        wire.pattern_length *= scale;
+        for element in &mut wire.pattern {
+            *element *= scale;
+        }
+    }
+}
+
+/// The overlay Vec is rebuilt by build_primitive even on unrelated UI events.
+/// Hash rendered content, never its allocation address. Include low residuals
+/// (UTM-scale motion), style and analytical curves as well as high coordinates.
+fn hash_preview_wires(wires: &[WireModel], h: &mut impl std::hash::Hasher) {
+    use crate::scene::model::wire_model::TangentGeom;
+    use std::hash::Hash;
+    wires.len().hash(h);
+    for w in wires {
+        w.name.hash(h);
+        for data in [&w.points, &w.points_low, &w.fill_tris, &w.fill_tris_low] {
+            bytemuck::cast_slice::<_, u8>(data).hash(h);
+        }
+        for data in [
+            &w.taper_widths[..],
+            &w.pattern_stations,
+            &w.color,
+            &w.pattern,
+        ] {
+            bytemuck::cast_slice::<_, u8>(data).hash(h);
+        }
+        for value in [w.pattern_length, w.line_weight_px, w.world_width] {
+            value.to_bits().hash(h);
+        }
+        w.depth_override.map(f32::to_bits).hash(h);
+        w.dash_closure.hash(h);
+        w.plinegen.hash(h);
+        w.dash_from_start.hash(h);
+        w.display_visible.hash(h);
+        w.fill_is_3d.hash(h);
+        w.fill_is_2d_solid.hash(h);
+        w.solid_normal.map(|normal| normal.map(f32::to_bits)).hash(h);
+        bytemuck::cast_slice::<_, u8>(&w.text_verts).hash(h);
+        w.point_marker.is_some().hash(h);
+        if let Some(marker) = w.point_marker {
+            for v in [marker.origin, marker.normal, marker.axis_x, marker.axis_y] {
+                v.to_array().map(f64::to_bits).hash(h);
+            }
+            marker.viewport_percent.to_bits().hash(h);
+        }
+        w.tangent_geoms.len().hash(h);
+        for geometry in &w.tangent_geoms {
+            std::mem::discriminant(geometry).hash(h);
+            match geometry {
+                TangentGeom::Line { p1, p2 } => {
+                    p1.map(f32::to_bits).hash(h);
+                    p2.map(f32::to_bits).hash(h);
+                }
+                TangentGeom::Circle { center, radius } => {
+                    center.map(f32::to_bits).hash(h);
+                    radius.to_bits().hash(h);
+                }
+                TangentGeom::PlanarCircle {
+                    center,
+                    axis_x,
+                    axis_y,
+                    radius,
+                } => {
+                    for v in [center, axis_x, axis_y] {
+                        v.map(f64::to_bits).hash(h);
+                    }
+                    radius.to_bits().hash(h);
+                }
+                TangentGeom::Arc {
+                    center,
+                    axis_x,
+                    axis_y,
+                    radius,
+                    start_angle,
+                    end_angle,
+                } => {
+                    for v in [center, axis_x, axis_y] {
+                        v.map(f64::to_bits).hash(h);
+                    }
+                    for v in [radius, start_angle, end_angle] {
+                        v.to_bits().hash(h);
+                    }
+                }
+                TangentGeom::PlanarEllipse {
+                    center,
+                    major_axis,
+                    normal,
+                    minor_axis_ratio,
+                    start_param,
+                    end_param,
+                } => {
+                    for v in [center, major_axis, normal] {
+                        v.map(f64::to_bits).hash(h);
+                    }
+                    for v in [minor_axis_ratio, start_param, end_param] {
+                        v.to_bits().hash(h);
+                    }
+                }
+            }
+        }
+        w.render_instance.is_some().hash(h);
+        if let Some(instance) = w.render_instance {
+            instance.source_id.hash(h);
+            instance.translation.map(f64::to_bits).hash(h);
+        }
+        w.stub.is_some().hash(h);
+        if let Some(stub) = &w.stub {
+            Arc::as_ptr(&stub.prototype).hash(h);
+            stub.delta.map(f64::to_bits).hash(h);
+            stub.depth_delta.to_bits().hash(h);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(in crate::scene) struct PhysicalViewport {
     size: Size<u32>,
@@ -1523,6 +1947,18 @@ pub(in crate::scene) struct PhysicalViewport {
     surface: Rectangle<u32>,
     uv_offset: [f32; 2],
     uv_scale: [f32; 2],
+}
+
+impl PhysicalViewport {
+    /// The visible surface rectangle maps 1:1 onto the offscreen raster: the
+    /// viewport lies fully inside the window and on whole pixels.
+    fn surface_matches_raster(&self) -> bool {
+        self.uv_scale == [1.0, 1.0]
+            && self.raster.x == 0.0
+            && self.raster.y == 0.0
+            && self.raster.width == self.size.width as f32
+            && self.raster.height == self.size.height as f32
+    }
 }
 
 fn physical_viewport(rect: Rectangle, window: Size<u32>) -> PhysicalViewport {
@@ -1552,6 +1988,59 @@ fn physical_viewport(rect: Rectangle, window: Size<u32>) -> PhysicalViewport {
         },
         uv_offset: [(left - x) / width, (top - y) / height],
         uv_scale: [visible_w / width, visible_h / height],
+    }
+}
+
+#[cfg(test)]
+mod preview_signature_tests {
+    use super::*;
+    use std::hash::Hasher;
+
+    #[test]
+    fn from_guide_uses_tracking_pixel_dashes_at_each_viewport_scale() {
+        use crate::command::CadCommand;
+        let mut command = crate::command::FromPointCommand::new(None);
+        command.on_point(glam::DVec3::ZERO);
+        for world_per_pixel in [1e-8_f32, 0.001, 1.0, 10000.0] {
+            for linetype_scale in [0.25_f32, 1.0, 16.0] {
+                let mut wires = command.on_preview_wires(glam::DVec3::new(100.0, 0.0, 0.0));
+                scale_from_guide_dashes(&mut wires, world_per_pixel, linetype_scale);
+                let guide = &wires[0];
+                let station_scale = guide.pattern_stations.get(1).copied().unwrap_or(100.0) / 100.0;
+                let pixels = |world: f32| world * linetype_scale / world_per_pixel / station_scale;
+                assert!((pixels(guide.pattern_length) - 10.0).abs() < 1e-4);
+                assert!((pixels(guide.pattern[0]) - 6.0).abs() < 1e-4);
+                assert!((pixels(guide.pattern[1]) + 4.0).abs() < 1e-4);
+                assert!(guide.pattern[1].abs() * linetype_scale >= world_per_pixel);
+                assert!(guide.dash_from_start);
+            }
+        }
+    }
+
+    fn signature(wires: &[WireModel]) -> u64 {
+        let mut h = rustc_hash::FxHasher::default();
+        hash_preview_wires(wires, &mut h);
+        h.finish()
+    }
+
+    #[test]
+    fn preview_signature_tracks_content_instead_of_allocations() {
+        let wires = Arc::new(vec![WireModel::solid_f64(
+            "rubber_band".into(),
+            vec![[6_000_000.0, 0.0, 0.0], [6_000_010.0, 1.0, 0.0]],
+            WireModel::CYAN,
+            false,
+        )]);
+        let mut rebuilt = Arc::new(wires.as_ref().clone());
+        assert!(!Arc::ptr_eq(&wires, &rebuilt));
+        assert_eq!(signature(&wires), signature(&rebuilt));
+        // Sub-f32 motion must still invalidate at large world coordinates.
+        Arc::make_mut(&mut rebuilt)[0].points_low[1][0] += 0.001;
+        assert_ne!(signature(&wires), signature(&rebuilt));
+        let mut style = wires.as_ref().clone();
+        style[0].color = WireModel::WHITE;
+        assert_ne!(signature(&wires), signature(&style));
+        assert_ne!(signature(&wires), signature(&[]));
     }
 }
 
@@ -1936,8 +2425,8 @@ fn normalized_direction(value: [f64; 3], fallback: [f32; 3]) -> [f32; 3] {
 }
 
 fn solar_direction(
-    sun: &codec::objects::Sun,
-    geo: &codec::objects::GeoData,
+    sun: &document::objects::Sun,
+    geo: &document::objects::GeoData,
 ) -> Option<[f32; 3]> {
     if sun.julian_day < 1_000_000 {
         return None;
@@ -1947,8 +2436,7 @@ fn solar_direction(
     } else {
         0.0
     };
-    let jd = sun.julian_day as f64
-        + (sun.milliseconds as f64 - daylight_ms) / 86_400_000.0;
+    let jd = sun.julian_day as f64 + (sun.milliseconds as f64 - daylight_ms) / 86_400_000.0;
     let days = jd - 2_451_545.0;
     let mean_longitude = (280.460 + 0.985_647_4 * days).to_radians();
     let mean_anomaly = (357.528 + 0.985_600_3 * days).to_radians();
@@ -1965,10 +2453,10 @@ fn solar_direction(
         - std::f64::consts::PI;
     let latitude = geo.reference_point.y.to_radians();
     let east_component = -declination.cos() * hour_angle.sin();
-    let north_component = declination.sin() * latitude.cos()
-        - declination.cos() * hour_angle.cos() * latitude.sin();
-    let up_component = declination.sin() * latitude.sin()
-        + declination.cos() * hour_angle.cos() * latitude.cos();
+    let north_component =
+        declination.sin() * latitude.cos() - declination.cos() * hour_angle.cos() * latitude.sin();
+    let up_component =
+        declination.sin() * latitude.sin() + declination.cos() * hour_angle.cos() * latitude.cos();
     if up_component <= 0.0 {
         return None;
     }
@@ -2005,6 +2493,11 @@ fn solar_direction(
 /// numbers move a handful of times. RSS is deliberately not used — the
 /// allocator and the driver both retain high-water memory that RSS cannot tell
 /// apart from live resources.
+#[cfg(all(test, feature = "performance-audit"))]
+pub(crate) fn performance_audit_report_gpu_live(pipeline: &crate::scene::pipeline::MultiPipeline) {
+    report_gpu_live(pipeline);
+}
+
 fn report_gpu_live(pipeline: &crate::scene::pipeline::MultiPipeline) {
     use std::cell::Cell;
     if !crate::perf::enabled() {
@@ -2032,17 +2525,31 @@ text_atlas={:.1} wire_arena={:.1} block_geometry={:.1}",
             mib(now.wire_arena),
             mib(now.block_geometry),
         );
+        // Exact byte counts for automated comparisons. The human-readable
+        // diagnostic above remains compatible with existing traces.
+        crate::perf_record!(
+            "[perf] gpu-live-json {}",
+            serde_json::json!({
+                "schema": 1,
+                "scope": "logical live resources; excludes driver heaps/alignment, staging, iced and ViewCube; Depth24Plus estimated",
+                "total_bytes": now.total(),
+                "categories": now,
+            })
+        );
     });
 }
 
 impl Scene {
-    fn model_tile_vport(&self, index: usize) -> Option<&codec::tables::VPort> {
+    /// The model-space viewport record of the active tile.
+    pub(crate) fn active_tile_vport_handle(&self) -> Option<Handle> {
+        self.model_tile_vport(self.active_model_tile.get())
+            .map(|value| value.handle)
+    }
+
+    fn model_tile_vport(&self, index: usize) -> Option<&document::tables::VPort> {
         let rect = self.model_tiles.borrow().get(index)?.rect;
         let lower_left = [rect.x as f64, (1.0 - rect.y - rect.height) as f64];
-        let upper_right = [
-            (rect.x + rect.width) as f64,
-            (1.0 - rect.y) as f64,
-        ];
+        let upper_right = [(rect.x + rect.width) as f64, (1.0 - rect.y) as f64];
         const EPSILON: f64 = 1e-5;
         let exact = self
             .document
@@ -2084,8 +2591,8 @@ impl Scene {
         })
     }
 
-    fn geolocation(&self) -> Option<&codec::objects::GeoData> {
-        use codec::objects::ObjectType;
+    fn geolocation(&self) -> Option<&document::objects::GeoData> {
+        use document::objects::ObjectType;
 
         crate::entities::object_data::geo_objects(&self.object_data_cache)
             .iter()
@@ -2095,7 +2602,10 @@ impl Scene {
                         && value.reference_point.x.is_finite()
                         && value.reference_point.y.is_finite()
                         && value.reference_point.x.abs() <= 180.0
-                        && value.reference_point.y.abs() <= 90.0 => Some(value),
+                        && value.reference_point.y.abs() <= 90.0 =>
+                {
+                    Some(value)
+                }
                 _ => None,
             })
     }
@@ -2105,9 +2615,9 @@ impl Scene {
         target_block: Handle,
         frozen: &rustc_hash::FxHashSet<Handle>,
     ) -> Vec<SceneLight> {
-        use codec::objects::{ClassObjectData, ObjectType};
+        use document::objects::{ClassObjectData, ObjectType};
 
-        fn converted(scene: &Scene, light: &codec::entities::Light) -> Option<SceneLight> {
+        fn converted(scene: &Scene, light: &document::entities::Light) -> Option<SceneLight> {
             if !light.status {
                 return None;
             }
@@ -2149,8 +2659,7 @@ impl Scene {
             if light.photometric_mode {
                 if let Some(photo) = light.photometric_data.as_ref() {
                     let solid_angle = if light.is_spot() && light.falloff_angle > 0.0 {
-                        2.0 * std::f64::consts::PI
-                            * (1.0 - (light.falloff_angle * 0.5).cos())
+                        2.0 * std::f64::consts::PI * (1.0 - (light.falloff_angle * 0.5).cos())
                     } else {
                         4.0 * std::f64::consts::PI
                     };
@@ -2186,9 +2695,8 @@ impl Scene {
                         } else {
                             138.517_731_223_1 * (kelvin - 10.0).ln() - 305.044_792_730_7
                         };
-                        let lamp = [red, green, blue].map(|channel| {
-                            (channel.clamp(0.0, 255.0) / 255.0) as f32
-                        });
+                        let lamp = [red, green, blue]
+                            .map(|channel| (channel.clamp(0.0, 255.0) / 255.0) as f32);
                         for index in 0..3 {
                             color[index] *= lamp[index];
                         }
@@ -2248,8 +2756,7 @@ impl Scene {
                 attenuation_end,
                 cast_shadows: light.cast_shadows,
                 shadow_softness: light.shadow_map_softness as f32 / 255.0 + area_softness,
-                shadow_map_size: u32::try_from(light.shadow_map_size.max(0))
-                    .unwrap_or(0),
+                shadow_map_size: u32::try_from(light.shadow_map_size.max(0)).unwrap_or(0),
                 web_profile,
                 web_rotation,
                 web_enabled,
@@ -2257,17 +2764,11 @@ impl Scene {
         }
 
         let mut lights = Vec::new();
-        for &handle in crate::entities::object_data::light_entities(
-            &self.object_data_cache,
-        ) {
+        for &handle in crate::entities::object_data::light_entities(&self.object_data_cache) {
             if let Some(EntityType::Light(light)) = self.document.get_entity(handle) {
                 let common = &light.common;
                 if self.layer_frozen_in(&common.layer, Some(frozen))
-                    || !self.belongs_to_visible_block(
-                        handle,
-                        common.owner_handle,
-                        target_block,
-                    )
+                    || !self.belongs_to_visible_block(handle, common.owner_handle, target_block)
                 {
                     continue;
                 }
@@ -2334,9 +2835,11 @@ impl Scene {
         let cache = self.lighting_cache.borrow();
         let lights = cache.get(&key).map(Vec::as_slice).unwrap_or_default();
         let settings = self.viewport_lighting_settings(viewport);
-        let visible_lights: Vec<&SceneLight> = lights
-            .iter()
-            .filter(|light| match self.document.get_entity(light.handle) {
+        let visible_lights: Vec<&SceneLight> =
+            lights
+                .iter()
+                .filter(|light| {
+                    match self.document.get_entity(light.handle) {
                 Some(EntityType::Light(entity)) => {
                     let common = &entity.common;
                     !common.invisible
@@ -2353,14 +2856,15 @@ impl Scene {
                 None => self.document.objects.get(&light.handle).is_some_and(|object| {
                     matches!(
                         object,
-                        codec::objects::ObjectType::ClassObject(value)
-                            if matches!(&value.data, codec::objects::ClassObjectData::Sun(_))
+                        document::objects::ObjectType::ClassObject(value)
+                            if matches!(&value.data, document::objects::ClassObjectData::Sun(_))
                     ) && (!settings.sun_handle.is_valid()
                         || settings.sun_handle == light.handle)
                 }),
-            })
-            .take(4)
-            .collect();
+            }
+                })
+                .take(4)
+                .collect();
         uniforms.lighting[1..4].copy_from_slice(&settings.ambient);
         if settings.force_default || visible_lights.is_empty() {
             Self::apply_default_lighting(uniforms, &viewport.camera, settings.default_type);
@@ -2391,22 +2895,15 @@ impl Scene {
                 light.direction[2],
                 light.intensity,
             ];
-            uniforms.light_color_hotspot[index] = [
-                color[0],
-                color[1],
-                color[2],
-                light.hotspot_cos,
-            ];
+            uniforms.light_color_hotspot[index] = [color[0], color[1], color[2], light.hotspot_cos];
             uniforms.light_attenuation[index] = [
                 light.attenuation_type,
                 light.attenuation_start,
                 light.attenuation_end,
                 light.falloff_cos,
             ];
-            uniforms.light_web_profile_a[index]
-                .copy_from_slice(&light.web_profile[..4]);
-            uniforms.light_web_profile_b[index]
-                .copy_from_slice(&light.web_profile[4..]);
+            uniforms.light_web_profile_a[index].copy_from_slice(&light.web_profile[..4]);
+            uniforms.light_web_profile_b[index].copy_from_slice(&light.web_profile[4..]);
             uniforms.light_web_rotation[index] = [
                 light.web_rotation[0],
                 light.web_rotation[1],
@@ -2433,16 +2930,13 @@ impl Scene {
                 .max(viewport.camera.distance * 0.25)
                 .max(1.0);
             let shadow_view_proj = if light.light_type < 1.5 {
-                let direction = glam::Vec3::from_array(light.direction)
-                    .normalize_or(glam::Vec3::NEG_Z);
+                let direction =
+                    glam::Vec3::from_array(light.direction).normalize_or(glam::Vec3::NEG_Z);
                 let light_eye = target - direction * radius * 2.0;
-                let view = glam::camera::rh::view::look_at_mat4(
-                    light_eye,
-                    target,
-                    up_for(direction),
-                );
-                let aspect = (uniforms.viewport_size[0] / uniforms.viewport_size[1].max(1.0))
-                    .max(1.0);
+                let view =
+                    glam::camera::rh::view::look_at_mat4(light_eye, target, up_for(direction));
+                let aspect =
+                    (uniforms.viewport_size[0] / uniforms.viewport_size[1].max(1.0)).max(1.0);
                 let projection = glam::camera::rh::proj::directx::orthographic(
                     -radius * aspect,
                     radius * aspect,
@@ -2461,8 +2955,7 @@ impl Scene {
                 let direction = if light.light_type < 2.5 {
                     (target - position).normalize_or(glam::Vec3::NEG_Z)
                 } else {
-                    glam::Vec3::from_array(light.direction)
-                        .normalize_or(glam::Vec3::NEG_Z)
+                    glam::Vec3::from_array(light.direction).normalize_or(glam::Vec3::NEG_Z)
                 };
                 let view = glam::camera::rh::view::look_at_mat4(
                     position,
@@ -2480,12 +2973,7 @@ impl Scene {
                 } else {
                     radius * 5.0
                 };
-                glam::camera::rh::proj::directx::perspective(
-                    fov,
-                    1.0,
-                    0.01,
-                    far.max(0.02),
-                ) * view
+                glam::camera::rh::proj::directx::perspective(fov, 1.0, 0.01, far.max(0.02)) * view
             };
             uniforms.shadow_view_proj = shadow_view_proj;
             let requested_size = light.shadow_map_size.max(256) as f32;
@@ -2498,22 +2986,19 @@ impl Scene {
         }
     }
 
-    fn viewport_lighting_settings(
-        &self,
-        viewport: &ViewportInstance,
-    ) -> ViewportLightingSettings {
+    fn viewport_lighting_settings(&self, viewport: &ViewportInstance) -> ViewportLightingSettings {
         let ambient = |color: &AcadColor| {
             color.rgb().map_or([0.18; 3], |(r, g, b)| {
                 [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]
             })
         };
-        let from_entity = |value: &codec::entities::Viewport| ViewportLightingSettings {
+        let from_entity = |value: &document::entities::Viewport| ViewportLightingSettings {
             force_default: value.default_lighting,
             default_type: value.default_lighting_type,
             ambient: ambient(&value.ambient_color),
             sun_handle: value.sun_handle,
         };
-        let from_table = |value: &codec::tables::VPort| ViewportLightingSettings {
+        let from_table = |value: &document::tables::VPort| ViewportLightingSettings {
             force_default: value.use_default_lights,
             default_type: value.default_lighting_type,
             ambient: ambient(&value.ambient_color),
@@ -2538,10 +3023,7 @@ impl Scene {
         ViewportLightingSettings::default()
     }
 
-    fn viewport_display_settings(
-        &self,
-        viewport: &ViewportInstance,
-    ) -> ViewportDisplaySettings {
+    fn viewport_display_settings(&self, viewport: &ViewportInstance) -> ViewportDisplaySettings {
         // What lies behind a viewport depends on what the viewport is. The
         // full-canvas paper sheet shows the desk, and the page is drawn on top
         // of it by `paper_sheet_fill` — give the desk the page's own colour and
@@ -2550,7 +3032,7 @@ impl Scene {
         // paints no canvas at all; anything else would erase the page beneath
         // it. Only model space clears to the editor background.
         let canvas_background = if viewport.paper_sheet {
-            crate::scene::PAPER_DESK_COLOR
+            self.desk_bg_color
         } else if self.current_layout != "Model" {
             // This viewport paints no canvas of its own (`skip_background`),
             // but shading and fog still blend toward whatever is behind it —
@@ -2563,12 +3045,8 @@ impl Scene {
                      brightness: f64,
                      contrast: f64,
                      background_handle: Handle| {
-            let visual_style = resolve_visual_style_handle(
-                &self.document,
-                visual_style_handle,
-            );
-            let mut background = self
-                .viewport_background(background_handle, canvas_background, 0);
+            let visual_style = resolve_visual_style_handle(&self.document, visual_style_handle);
+            let mut background = self.viewport_background(background_handle, canvas_background, 0);
             self.apply_document_render_environment(&mut background);
             ViewportDisplaySettings {
                 visual_style,
@@ -2581,30 +3059,45 @@ impl Scene {
         if viewport.paper_sheet {
             let handle = self.current_layout_sheet_viewport_handle();
             if let Some(EntityType::Viewport(value)) = self.document.get_entity(handle) {
+                // The sheet keeps its page and desk: a paper-space view's
+                // background is kept with the layout but not drawn.
                 return build(
                     value.visual_style_handle,
                     value.brightness,
                     value.contrast,
-                    value.background_handle,
+                    Handle::NULL,
                 );
             }
         } else if viewport.handle.is_valid() {
             if let Some(EntityType::Viewport(value)) = self.document.get_entity(viewport.handle) {
+                let flat = value.render_mode == document::entities::ViewportRenderMode::Wireframe2D;
                 return build(
                     value.visual_style_handle,
                     value.brightness,
                     value.contrast,
-                    value.background_handle,
+                    if flat {
+                        Handle::NULL
+                    } else {
+                        value.background_handle
+                    },
                 );
             }
         } else if self.current_layout == "Model" {
             let index = viewport.tile_idx.unwrap_or(0);
             if let Some(value) = self.model_tile_vport(index) {
+                // A 2D wireframe view shows no background, as in the reference.
+                let flat = self.model_tiles.borrow().get(index).is_some_and(|tile| {
+                    tile.render_mode == document::entities::ViewportRenderMode::Wireframe2D
+                });
                 return build(
                     value.visual_style_handle,
                     value.brightness,
                     value.contrast,
-                    value.background_handle,
+                    if flat {
+                        Handle::NULL
+                    } else {
+                        value.background_handle
+                    },
                 );
             }
         }
@@ -2704,16 +3197,23 @@ impl Scene {
                 candidates.push(base.join(&source));
                 if let Some(name) = source.file_name() {
                     candidates.push(base.join(name));
-                    for folder in ["Photometric", "photometric", "Web", "web", "Lights", "lights"] {
+                    for folder in [
+                        "Photometric",
+                        "photometric",
+                        "Web",
+                        "web",
+                        "Lights",
+                        "lights",
+                    ] {
                         candidates.push(base.join(folder).join(name));
                     }
                 }
             }
             let path = candidates.into_iter().find(|path| path.is_file())?;
             let contents = std::fs::read_to_string(path).ok()?;
-            let tilt_start = contents.lines().position(|line| {
-                line.trim_start().to_ascii_uppercase().starts_with("TILT=")
-            })?;
+            let tilt_start = contents
+                .lines()
+                .position(|line| line.trim_start().to_ascii_uppercase().starts_with("TILT="))?;
             let lines: Vec<&str> = contents.lines().collect();
             let tilt = lines[tilt_start]
                 .trim()
@@ -2724,7 +3224,9 @@ impl Scene {
             }
             let values: Vec<f64> = lines[tilt_start + 1..]
                 .iter()
-                .flat_map(|line| line.split(|character: char| character.is_whitespace() || character == ','))
+                .flat_map(|line| {
+                    line.split(|character: char| character.is_whitespace() || character == ',')
+                })
                 .filter(|token| !token.is_empty())
                 .filter_map(|token| token.parse::<f64>().ok())
                 .collect();
@@ -2784,88 +3286,116 @@ impl Scene {
     }
 
     fn resolve_document_render_environment(&self) -> CachedDocumentRenderEnvironment {
-        use codec::objects::{ClassObjectData, ObjectType};
+        use document::objects::{ClassObjectData, ObjectType};
 
         let mut result = CachedDocumentRenderEnvironment::default();
 
-        let (environment, preset) = if crate::entities::object_data::cache_is_prepared(&self.object_data_cache) {
-            let env = crate::entities::object_data::render_environments(&self.object_data_cache)
-                .iter()
-                .find_map(|handle| match self.document.objects.get(handle) {
-                    Some(ObjectType::ClassObject(value)) => match &value.data {
-                        ClassObjectData::RenderEnvironment(environment) => {
-                            Some((*handle, environment))
+        let (environment, preset) =
+            if crate::entities::object_data::cache_is_prepared(&self.object_data_cache) {
+                let env =
+                    crate::entities::object_data::render_environments(&self.object_data_cache)
+                        .iter()
+                        .find_map(|handle| match self.document.objects.get(handle) {
+                            Some(ObjectType::ClassObject(value)) => match &value.data {
+                                ClassObjectData::RenderEnvironment(environment) => {
+                                    Some((*handle, environment))
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .map(|(_, environment)| environment);
+
+                let pre = crate::entities::object_data::render_settings(&self.object_data_cache)
+                    .iter()
+                    .filter_map(|handle| match self.document.objects.get(handle) {
+                        Some(ObjectType::ClassObject(value)) => {
+                            let settings = match &value.data {
+                                ClassObjectData::RenderSettings(settings) => settings,
+                                ClassObjectData::MentalRayRenderSettings(settings) => {
+                                    &settings.base
+                                }
+                                ClassObjectData::RapidRtRenderSettings(settings) => &settings.base,
+                                _ => return None,
+                            };
+                            (settings.environment_image_enabled
+                                && !settings.environment_image_filename.is_empty())
+                            .then_some((*handle, settings))
                         }
                         _ => None,
-                    },
-                    _ => None,
-                })
-                .map(|(_, environment)| environment);
+                    })
+                    .min_by_key(|(handle, settings)| (!settings.has_predefined, handle.value()))
+                    .map(|(_, settings)| settings);
 
-            let pre = crate::entities::object_data::render_settings(&self.object_data_cache)
-                .iter()
-                .filter_map(|handle| match self.document.objects.get(handle) {
-                    Some(ObjectType::ClassObject(value)) => {
-                        let settings = match &value.data {
-                            ClassObjectData::RenderSettings(settings) => settings,
-                            ClassObjectData::MentalRayRenderSettings(settings) => &settings.base,
-                            ClassObjectData::RapidRtRenderSettings(settings) => &settings.base,
-                            _ => return None,
-                        };
-                        (settings.environment_image_enabled
-                            && !settings.environment_image_filename.is_empty())
-                            .then_some((*handle, settings))
-                    }
-                    _ => None,
-                })
-                .min_by_key(|(handle, settings)| (!settings.has_predefined, handle.value()))
-                .map(|(_, settings)| settings);
+                (env, pre)
+            } else {
+                let mut best_env: Option<(
+                    document::Handle,
+                    &document::objects::RenderEnvironment,
+                )> = None;
+                let mut best_preset: Option<(
+                    document::Handle,
+                    &document::objects::RenderSettings,
+                )> = None;
 
-            (env, pre)
-        } else {
-            let mut best_env: Option<(codec::Handle, &codec::objects::RenderEnvironment)> = None;
-            let mut best_preset: Option<(codec::Handle, &codec::objects::RenderSettings)> = None;
-
-            for (handle, object) in &self.document.objects {
-                if let ObjectType::ClassObject(value) = object {
-                    match &value.data {
-                        ClassObjectData::RenderEnvironment(env) => {
-                            if best_env.as_ref().map_or(true, |(best_h, _)| handle.value() < best_h.value()) {
-                                best_env = Some((*handle, env));
-                            }
-                        }
-                        ClassObjectData::RenderSettings(settings) => {
-                            if settings.environment_image_enabled && !settings.environment_image_filename.is_empty() {
-                                let key = (!settings.has_predefined, handle.value());
-                                if best_preset.as_ref().map_or(true, |(best_h, best_s)| key < (!best_s.has_predefined, best_h.value())) {
-                                    best_preset = Some((*handle, settings));
+                for (handle, object) in &self.document.objects {
+                    if let ObjectType::ClassObject(value) = object {
+                        match &value.data {
+                            ClassObjectData::RenderEnvironment(env) => {
+                                if best_env
+                                    .as_ref()
+                                    .is_none_or(|(best_h, _)| handle.value() < best_h.value())
+                                {
+                                    best_env = Some((*handle, env));
                                 }
                             }
-                        }
-                        ClassObjectData::MentalRayRenderSettings(settings) => {
-                            let base = &settings.base;
-                            if base.environment_image_enabled && !base.environment_image_filename.is_empty() {
-                                let key = (!base.has_predefined, handle.value());
-                                if best_preset.as_ref().map_or(true, |(best_h, best_s)| key < (!best_s.has_predefined, best_h.value())) {
-                                    best_preset = Some((*handle, base));
+                            ClassObjectData::RenderSettings(settings) => {
+                                if settings.environment_image_enabled
+                                    && !settings.environment_image_filename.is_empty()
+                                {
+                                    let key = (!settings.has_predefined, handle.value());
+                                    if best_preset.as_ref().is_none_or(|(best_h, best_s)| {
+                                        key < (!best_s.has_predefined, best_h.value())
+                                    }) {
+                                        best_preset = Some((*handle, settings));
+                                    }
                                 }
                             }
-                        }
-                        ClassObjectData::RapidRtRenderSettings(settings) => {
-                            let base = &settings.base;
-                            if base.environment_image_enabled && !base.environment_image_filename.is_empty() {
-                                let key = (!base.has_predefined, handle.value());
-                                if best_preset.as_ref().map_or(true, |(best_h, best_s)| key < (!best_s.has_predefined, best_h.value())) {
-                                    best_preset = Some((*handle, base));
+                            ClassObjectData::MentalRayRenderSettings(settings) => {
+                                let base = &settings.base;
+                                if base.environment_image_enabled
+                                    && !base.environment_image_filename.is_empty()
+                                {
+                                    let key = (!base.has_predefined, handle.value());
+                                    if best_preset.as_ref().is_none_or(|(best_h, best_s)| {
+                                        key < (!best_s.has_predefined, best_h.value())
+                                    }) {
+                                        best_preset = Some((*handle, base));
+                                    }
                                 }
                             }
+                            ClassObjectData::RapidRtRenderSettings(settings) => {
+                                let base = &settings.base;
+                                if base.environment_image_enabled
+                                    && !base.environment_image_filename.is_empty()
+                                {
+                                    let key = (!base.has_predefined, handle.value());
+                                    if best_preset.as_ref().is_none_or(|(best_h, best_s)| {
+                                        key < (!best_s.has_predefined, best_h.value())
+                                    }) {
+                                        best_preset = Some((*handle, base));
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
-            }
-            (best_env.map(|(_, env)| env), best_preset.map(|(_, pre)| pre))
-        };
+                (
+                    best_env.map(|(_, env)| env),
+                    best_preset.map(|(_, pre)| pre),
+                )
+            };
 
         if let Some(environment) = environment {
             if environment.fog_enabled {
@@ -2895,7 +3425,8 @@ impl Scene {
                 result.fog = Some((fog_color, fog_params, fog_distances));
             }
             if environment.environment_image_enabled {
-                if let Some(image) = self.background_image(&environment.environment_image_filename) {
+                if let Some(image) = self.background_image(&environment.environment_image_filename)
+                {
                     result.environment = Some(([1.0, 0.0, 0.25, 0.35], image));
                 }
             }
@@ -2910,10 +3441,7 @@ impl Scene {
         result
     }
 
-    fn apply_document_render_environment(
-        &self,
-        background: &mut ViewportBackgroundSettings,
-    ) {
+    fn apply_document_render_environment(&self, background: &mut ViewportBackgroundSettings) {
         let key = (self.geometry_epoch, self.document.objects.len());
         let needs_build = match self.document_render_env_cache.borrow().as_ref() {
             Some((epoch, len, _)) => *epoch != key.0 || *len != key.1,
@@ -2950,7 +3478,7 @@ impl Scene {
         canvas: [f32; 4],
         depth: usize,
     ) -> ViewportBackgroundSettings {
-        use codec::objects::{ClassObjectData, ObjectType};
+        use document::objects::{ClassObjectData, ObjectType};
 
         if depth > 4 || !handle.is_valid() {
             return ViewportBackgroundSettings::canvas(canvas);
@@ -2960,9 +3488,9 @@ impl Scene {
         };
         match &value.data {
             ClassObjectData::SolidBackground(background) => {
-                let mut result = ViewportBackgroundSettings::canvas(
-                    Self::packed_background_color(background.color),
-                );
+                let mut result = ViewportBackgroundSettings::canvas(Self::packed_background_color(
+                    background.color,
+                ));
                 result.params[0] = 1.0;
                 result
             }
@@ -2976,7 +3504,8 @@ impl Scene {
                     2.0,
                     background.horizon as f32,
                     background.height as f32,
-                    background.rotation as f32,
+                    // Stored in degrees.
+                    (background.rotation as f32).to_radians(),
                 ];
                 result
             }
@@ -3002,11 +3531,13 @@ impl Scene {
                         background.use_tiling as u8 as f32,
                         image.width as f32 / image.height.max(1) as f32,
                     ];
+                    // Offset, then the image's size in pixels at its scale:
+                    // an image not fitted to the screen keeps its pixel size.
                     result.image_transform = [
                         background.offset.x as f32,
                         background.offset.y as f32,
-                        background.scale.x as f32,
-                        background.scale.y as f32,
+                        background.scale.x as f32 * image.width as f32,
+                        background.scale.y as f32 * image.height as f32,
                     ];
                     result.params[0] = 4.0;
                     result.image = Some(image);
@@ -3014,19 +3545,11 @@ impl Scene {
                 result
             }
             ClassObjectData::IblBackground(background) => {
-                let mut result = self.viewport_background(
-                    background.secondary_background,
-                    canvas,
-                    depth + 1,
-                );
+                let mut result =
+                    self.viewport_background(background.secondary_background, canvas, depth + 1);
                 if background.enabled {
                     if let Some(environment) = self.background_image(&background.name) {
-                        result.environment_params = [
-                            1.0,
-                            background.rotation as f32,
-                            0.25,
-                            0.35,
-                        ];
+                        result.environment_params = [1.0, background.rotation as f32, 0.25, 0.35];
                         if background.display_image {
                             result.params = [5.0, 0.0, 0.0, background.rotation as f32];
                             result.image_params[3] =
@@ -3050,9 +3573,8 @@ impl Scene {
                 {
                     if let ClassObjectData::Sun(sun) = &value.data {
                         if sun.is_on {
-                            if let Some(direction) = self
-                                .geolocation()
-                                .and_then(|geo| solar_direction(sun, geo))
+                            if let Some(direction) =
+                                self.geolocation().and_then(|geo| solar_direction(sun, geo))
                             {
                                 result.params[1..4].copy_from_slice(&[
                                     -direction[0],
@@ -3060,12 +3582,8 @@ impl Scene {
                                     -direction[2],
                                 ]);
                                 let color = tess_util::aci_to_rgba(&sun.color);
-                                result.colors[1] = [
-                                    color[0],
-                                    color[1],
-                                    color[2],
-                                    sun.intensity.max(0.0) as f32,
-                                ];
+                                result.colors[1] =
+                                    [color[0], color[1], color[2], sun.intensity.max(0.0) as f32];
                             }
                         }
                     }
@@ -3077,17 +3595,26 @@ impl Scene {
     }
 
     fn apply_default_lighting(uniforms: &mut Uniforms, camera: &Camera, default_type: i16) {
+        // Soft studio light: a key and a fill not much weaker, over a raised
+        // ambient floor, so faces turned away keep their colour.
         let sources = [
-            (glam::Vec3::new(0.5, 0.8, 0.6), 0.6_f32),
+            (glam::Vec3::new(0.5, 0.8, 0.6), 0.55_f32),
             (glam::Vec3::new(-0.7, 0.3, 0.4), 0.4_f32),
         ];
         let count = if default_type == 0 { 1 } else { 2 };
         uniforms.lighting[0] = count as f32;
+        for ambient in &mut uniforms.lighting[1..4] {
+            *ambient = ambient.max(0.3);
+        }
         for (index, (view_direction, two_light_intensity)) in
             sources.into_iter().take(count).enumerate()
         {
             let toward_source = (camera.rotation * view_direction).normalize_or_zero();
-            let intensity = if count == 1 { 1.0 } else { two_light_intensity };
+            let intensity = if count == 1 {
+                0.85
+            } else {
+                two_light_intensity
+            };
             uniforms.light_position_type[index][3] = 1.0;
             uniforms.light_direction_intensity[index] = [
                 -toward_source.x,
@@ -3101,7 +3628,10 @@ impl Scene {
     }
 
     /// Returns (entity_color, pattern_length, pattern, line_weight_px, aci).
-    pub(in crate::scene) fn render_style(&self, e: &EntityType) -> ([f32; 4], f32, [f32; 8], f32, u8) {
+    pub(in crate::scene) fn render_style(
+        &self,
+        e: &EntityType,
+    ) -> ([f32; 4], f32, [f32; 8], f32, u8) {
         let (color, pl, pat, lw, aci) = render_style_for(&self.document, e);
         let bg = if self.current_layout == "Model" {
             self.bg_color
@@ -3119,6 +3649,33 @@ impl Scene {
         (final_color, pl, pat, lw, aci)
     }
 
+    /// Whether lines are drawn at their lineweights on screen. `$LWDISPLAY`
+    /// decides it in model space and in every layout alike: a layout that
+    /// displays plot styles takes its lineweights from the style table, but
+    /// AutoCAD and DWG TrueView still draw them hairline while LWDISPLAY is
+    /// off.
+    pub(crate) fn lineweights_on_screen(&self) -> bool {
+        self.document.header.lineweight_display
+    }
+
+    /// How many wire sets one frame of the shown layout draws at most: the
+    /// sheet's and one for every content viewport, each of which can have a
+    /// set of its own (a scale, a set of frozen layers). A cache of the
+    /// copies made from those sets has to hold that many, or it empties and
+    /// fills again on every frame, as the resident sets did (#1769).
+    pub(in crate::scene) fn frame_wire_set_count(&self) -> usize {
+        if self.current_layout == "Model" {
+            1
+        } else {
+            self.paper_viewport_handles().2.len() + 1
+        }
+    }
+
+    /// Entries the display plot style caches hold before they are emptied.
+    fn display_style_cache_limit(&self) -> usize {
+        DISPLAY_STYLE_CACHE_LIMIT.max(self.frame_wire_set_count() + 1)
+    }
+
     fn display_plot_style(&self) -> Option<Arc<crate::io::plot_style::PlotStyleTable>> {
         if self.current_layout == "Model" {
             return None;
@@ -3134,8 +3691,10 @@ impl Scene {
         if let Some(style) = self.display_plot_style_cache.borrow().get(&key) {
             return style.clone();
         }
-        let style = crate::io::plot_style::PlotStyleTable::load_named(
+        let base = crate::io::drawing_dir(&self.document);
+        let style = crate::io::plot_style::PlotStyleTable::load_named_at(
             &settings.current_style_sheet,
+            base,
         )
         .ok()
         .map(Arc::new);
@@ -3158,10 +3717,7 @@ impl Scene {
             color[..3].copy_from_slice(&rgb);
         }
         let screening = style.resolve_screening(aci);
-        for (channel, paper) in color[..3]
-            .iter_mut()
-            .zip(self.paper_bg_color[..3].iter())
-        {
+        for (channel, paper) in color[..3].iter_mut().zip(self.paper_bg_color[..3].iter()) {
             *channel = *channel * screening + *paper * (1.0 - screening);
         }
     }
@@ -3178,7 +3734,9 @@ impl Scene {
         if let Some((gen, wires)) = self.styled_wire_cache.borrow().get(&key) {
             return (Arc::clone(wires), *gen);
         }
-        let mut wires = source.as_ref().clone();
+        // A repeated block's further copies are stubs drawn in their
+        // prototype's colour; expand them so each copy takes the style (#2030).
+        let mut wires = crate::scene::model::instance_model::expand_stubs(&source).into_owned();
         for wire in &mut wires {
             self.apply_display_plot_style(&mut wire.color, wire.aci, &style);
             if wire.aci > 0 {
@@ -3194,16 +3752,17 @@ impl Scene {
                 if let Some(mm) = style.resolve_lineweight(wire.aci) {
                     wire.line_weight_px = (mm * MM_TO_PX).max(1.0);
                 }
+                let aci = wire.aci;
                 for vertex in &mut wire.text_verts {
-                    self.apply_display_plot_style(&mut vertex.color, wire.aci, &style);
+                    self.apply_display_plot_style(&mut vertex.color, aci, &style);
                 }
             }
         }
         let wires = Arc::new(wires);
-        let gen = crate::scene::WIRE_CONTENT_GEN
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let gen = crate::scene::WIRE_CONTENT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let limit = self.display_style_cache_limit();
         let mut cache = self.styled_wire_cache.borrow_mut();
-        if cache.len() >= DISPLAY_STYLE_CACHE_LIMIT {
+        if cache.len() >= limit {
             cache.clear();
         }
         cache.insert(key, (gen, Arc::clone(&wires)));
@@ -3233,11 +3792,12 @@ impl Scene {
         for hatch in &mut hatches {
             self.apply_display_plot_style(&mut hatch.color, hatch.aci, &style);
             if hatch.aci > 0 {
-                if matches!(hatch.pattern, crate::scene::model::hatch_model::HatchPattern::Solid) {
-                    if let Some(fill_style) = style
-                        .aci_entries
-                        .get(hatch.aci as usize)
-                        .and_then(|entry| {
+                if matches!(
+                    hatch.pattern,
+                    crate::scene::model::hatch_model::HatchPattern::Solid
+                ) {
+                    if let Some(fill_style) =
+                        style.aci_entries.get(hatch.aci as usize).and_then(|entry| {
                             crate::scene::model::hatch_model::plot_style_fill_pattern(
                                 entry.fill_style,
                             )
@@ -3250,9 +3810,8 @@ impl Scene {
                 if let Some(mm) = style.resolve_lineweight(hatch.aci) {
                     hatch.line_weight_px = (mm * MM_TO_PX).max(1.0);
                 }
-                if let crate::scene::model::hatch_model::HatchPattern::Gradient {
-                    color2, ..
-                } = &mut hatch.pattern
+                if let crate::scene::model::hatch_model::HatchPattern::Gradient { color2, .. } =
+                    &mut hatch.pattern
                 {
                     self.apply_display_plot_style(color2, hatch.aci, &style);
                 }
@@ -3262,9 +3821,10 @@ impl Scene {
             hatches.extend(wire_fills.iter().cloned());
         }
         let hatches = Arc::new(hatches);
+        let limit = self.display_style_cache_limit() * 2;
         let mut cache = self.styled_hatch_cache.borrow_mut();
         cache.retain(|(epoch, _, _, _, _), _| *epoch == self.geometry_epoch);
-        if cache.len() >= DISPLAY_STYLE_CACHE_LIMIT * 2 {
+        if cache.len() >= limit {
             cache.clear();
         }
         cache.insert(key, Arc::clone(&hatches));
@@ -3294,21 +3854,18 @@ impl Scene {
         }
         let depths = self.draw_depth_map();
         let mut hatches = Vec::new();
-        for wire in wires.iter().filter(|wire| wire.fill_is_2d_solid && wire.aci > 0) {
-            let Some(pattern) = style
-                .aci_entries
-                .get(wire.aci as usize)
-                .and_then(|entry| {
-                    (65..=72)
-                        .contains(&entry.fill_style)
-                        .then(|| {
-                            crate::scene::model::hatch_model::plot_style_fill_pattern(
-                                entry.fill_style,
-                            )
-                        })
-                        .flatten()
-                })
-            else {
+        for wire in wires
+            .iter()
+            .filter(|wire| wire.fill_is_2d_solid && wire.aci > 0)
+        {
+            let Some(pattern) = style.aci_entries.get(wire.aci as usize).and_then(|entry| {
+                (65..=72)
+                    .contains(&entry.fill_style)
+                    .then(|| {
+                        crate::scene::model::hatch_model::plot_style_fill_pattern(entry.fill_style)
+                    })
+                    .flatten()
+            }) else {
                 continue;
             };
             let mut color = wire.color;
@@ -3326,8 +3883,10 @@ impl Scene {
                 }
                 boundary.push(boundary[0]);
                 hatches.push(HatchModel {
+                    entity: None,
+                    effective_layer: wire.effective_layer.clone(),
                     pattern_origin: None,
-                    render_instance: wire.render_instance.clone(),
+                    render_instance: wire.render_instance,
                     world_origin: [0.0, 0.0],
                     boundary: Arc::new(boundary),
                     boundary_wcs: None,
@@ -3336,7 +3895,7 @@ impl Scene {
                     boundary_exterior: None,
                     boundary_sources: None,
                     boundary_paths: None,
-                    style: codec::entities::HatchStyleType::Normal,
+                    style: document::entities::HatchStyleType::Normal,
                     pattern: pattern.clone(),
                     name: "PLOTSTYLE".to_string(),
                     color,
@@ -3349,15 +3908,14 @@ impl Scene {
                     // child label (or None for top-level wires) — either way
                     // it would place the fill outside its host's depth band
                     // and let sibling wipes/masks bury it.
-                    draw_depth: crate::scene::pipeline::wire_gpu::wire_draw_depth(
-                        wire, &depths,
-                    ),
+                    draw_depth: crate::scene::pipeline::wire_gpu::wire_draw_depth(wire, &depths),
                 });
             }
         }
         let hatches = Arc::new(hatches);
+        let limit = self.display_style_cache_limit();
         let mut cache = self.styled_wire_fill_cache.borrow_mut();
-        if cache.len() >= DISPLAY_STYLE_CACHE_LIMIT {
+        if cache.len() >= limit {
             cache.clear();
         }
         cache.insert(key, Arc::clone(&hatches));
@@ -3365,57 +3923,77 @@ impl Scene {
     }
 }
 
-/// Whether an entity sits on a locked layer (via the document's layer table).
-/// Document-only so it is safe from the parallel tessellation path.
-pub(in crate::scene) fn layer_locked(document: &CadDocument, e: &EntityType) -> bool {
+/// Whether a named layer is currently locked (safe from parallel tessellation).
+pub(in crate::scene) fn layer_locked_by_name(document: &Document, layer: &str) -> bool {
     document
         .layers
-        .get(&e.common().layer)
-        .map(|l| l.is_locked())
-        .unwrap_or(false)
+        .get(layer)
+        .is_some_and(|l| l.is_locked())
+}
+
+/// Whether an entity sits on a locked layer (via the document's layer table).
+/// Document-only so it is safe from the parallel tessellation path.
+pub(in crate::scene) fn layer_locked(document: &Document, e: &EntityType) -> bool {
+    layer_locked_by_name(document, &e.common().layer)
 }
 
 // ── Document-only render-style helpers (no &self, safe to call from parallel contexts) ──
 
 /// Resolves the effective linetype name for an entity, falling back to the
 /// layer's linetype when the entity's own linetype is "ByLayer".
-pub(in crate::scene) fn linetype_name_for<'a>(document: &'a CadDocument, e: &'a EntityType) -> &'a str {
+pub(in crate::scene) fn linetype_name_for<'a>(
+    document: &'a Document,
+    e: &'a EntityType,
+) -> &'a str {
     linetype_name_for_viewport(document, e, None)
 }
 
-pub(in crate::scene) fn linetype_name_for_common_viewport<'a>(
-    document: &'a CadDocument,
-    common: &'a codec::entities::EntityCommon,
+pub(crate) fn linetype_name_for_common_viewport<'a>(
+    document: &'a Document,
+    common: &'a document::entities::EntityCommon,
     viewport: Option<Handle>,
 ) -> &'a str {
     let elt = &common.linetype;
     if elt.is_empty() || elt.eq_ignore_ascii_case("bylayer") {
-        if viewport.is_some() {
-            if let Some(handle) = viewport_override(
-                document,
-                &common.layer,
-                viewport,
-                codec::objects::KnownXRecordKind::LayerViewportLinetypeOverride,
-            )
-            .and_then(|value| value.as_handle())
-            {
-                if let Some(line_type) = document.line_types.iter().find(|line_type| line_type.handle == handle) {
-                    return line_type.name.as_str();
-                }
-            }
-        }
-        document
-            .layers
-            .get(&common.layer)
-            .map(|l| l.line_type.as_str())
-            .unwrap_or("Continuous")
+        layer_linetype_name_for_viewport(document, &common.layer, viewport)
     } else {
         elt.as_str()
     }
 }
 
+/// A layer's linetype name, with its viewport override when it has one.
+pub(crate) fn layer_linetype_name_for_viewport<'a>(
+    document: &'a Document,
+    layer: &str,
+    viewport: Option<Handle>,
+) -> &'a str {
+    if viewport.is_some() {
+        if let Some(handle) = viewport_override(
+            document,
+            layer,
+            viewport,
+            document::objects::KnownXRecordKind::LayerViewportLinetypeOverride,
+        )
+        .and_then(|value| value.as_handle())
+        {
+            if let Some(line_type) = document
+                .line_types
+                .iter()
+                .find(|line_type| line_type.handle == handle)
+            {
+                return line_type.name.as_str();
+            }
+        }
+    }
+    document
+        .layers
+        .get(layer)
+        .map(|l| l.line_type.as_str())
+        .unwrap_or("Continuous")
+}
+
 pub(in crate::scene) fn linetype_name_for_viewport<'a>(
-    document: &'a CadDocument,
+    document: &'a Document,
     e: &'a EntityType,
     viewport: Option<Handle>,
 ) -> &'a str {
@@ -3425,62 +4003,127 @@ pub(in crate::scene) fn linetype_name_for_viewport<'a>(
 /// Returns `(entity_color, pattern_length, pattern, line_weight_px, aci)` for
 /// an entity, resolving ByLayer color and linetype from the document.
 pub(in crate::scene) fn render_style_for(
-    document: &CadDocument,
+    document: &Document,
     e: &EntityType,
 ) -> ([f32; 4], f32, [f32; 8], f32, u8) {
     render_style_for_viewport(document, e, None)
 }
 
-fn viewport_override(
-    document: &CadDocument,
-    layer_name: &str,
+/// A viewport layer colour override as the format packs it (code 420): the
+/// top byte says what follows — 0xC3 an index colour in the low byte, 0xC2 a
+/// 24-bit true colour, 0xC0 / 0xC1 ByLayer / ByBlock. A bare 24-bit value is
+/// read as true colour.
+pub(crate) fn layer_override_color(value: i32) -> AcadColor {
+    match (value as u32) >> 24 {
+        0xC0 => AcadColor::ByLayer,
+        0xC1 => AcadColor::ByBlock,
+        0xC3 => AcadColor::Index((value & 0xFF) as u8),
+        _ => AcadColor::from_true_color_value(value),
+    }
+}
+
+/// [`layer_override_color`] the other way round; `None` for a colour an
+/// override cannot hold.
+pub(crate) fn pack_layer_override_color(color: &AcadColor) -> Option<i32> {
+    let packed = match color {
+        AcadColor::Index(index) => 0xC300_0000u32 | *index as u32,
+        AcadColor::Rgb { r, g, b } => {
+            0xC200_0000u32 | (*r as u32) << 16 | (*g as u32) << 8 | *b as u32
+        }
+        _ => return None,
+    };
+    Some(packed as i32)
+}
+
+fn viewport_override_for_layer(
+    document: &Document,
+    layer: Option<&document::tables::Layer>,
     viewport: Option<Handle>,
-    kind: codec::objects::KnownXRecordKind,
-) -> Option<codec::objects::XRecordValue> {
+    kind: document::objects::KnownXRecordKind,
+) -> Option<document::objects::XRecordValue> {
     let viewport = viewport.filter(|handle| handle.is_valid())?;
-    let layer = document.layers.get(layer_name)?;
+    let layer = layer?;
     document
         .layer_viewport_overrides(layer.handle, kind)
         .into_iter()
         .find_map(|(handle, value)| (handle == viewport).then_some(value))
 }
 
+fn viewport_override(
+    document: &Document,
+    layer_name: &str,
+    viewport: Option<Handle>,
+    kind: document::objects::KnownXRecordKind,
+) -> Option<document::objects::XRecordValue> {
+    viewport.filter(|handle| handle.is_valid())?;
+    viewport_override_for_layer(document, document.layers.get(layer_name), viewport, kind)
+}
+
+fn layer_linetype_for_layer<'a>(
+    document: &'a Document,
+    layer: Option<&'a document::tables::Layer>,
+    viewport: Option<Handle>,
+) -> &'a str {
+    if viewport.is_some() {
+        if let Some(handle) = viewport_override_for_layer(
+            document,
+            layer,
+            viewport,
+            document::objects::KnownXRecordKind::LayerViewportLinetypeOverride,
+        )
+        .and_then(|value| value.as_handle())
+        {
+            if let Some(line_type) = document
+                .line_types
+                .iter()
+                .find(|line_type| line_type.handle == handle)
+            {
+                return line_type.name.as_str();
+            }
+        }
+    }
+    layer
+        .map(|l| l.line_type.as_str())
+        .unwrap_or("Continuous")
+}
+
 pub(crate) fn render_style_for_common_viewport(
-    document: &CadDocument,
-    common: &codec::entities::EntityCommon,
+    document: &Document,
+    common: &document::entities::EntityCommon,
     viewport: Option<Handle>,
 ) -> ([f32; 4], f32, [f32; 8], f32, u8) {
+    if crate::scene::block_construction::is_construction(common) {
+        return crate::scene::block_construction::display_style();
+    }
     let layer_name = &common.layer;
+    let layer = document.layers.get(layer_name);
     let (entity_color, aci) = {
         let book_color = common
             .color_book_handle
             .filter(|handle| handle.is_valid())
             .and_then(|handle| document.objects.get(&handle))
             .and_then(|object| match object {
-                codec::objects::ObjectType::BookColor(book) => Some(&book.color),
+                document::objects::ObjectType::BookColor(book) => Some(&book.color),
                 _ => None,
             });
         let ec = book_color.unwrap_or(&common.color);
-        let viewport_color = (book_color.is_none() && *ec == AcadColor::ByLayer && viewport.is_some())
-            .then(|| {
-                viewport_override(
-                    document,
-                    layer_name,
-                    viewport,
-                    codec::objects::KnownXRecordKind::LayerViewportColorOverride,
-                )
-                .and_then(|value| value.as_i32())
-                .map(AcadColor::from_true_color_value)
-            })
-            .flatten();
+        let viewport_color =
+            (book_color.is_none() && *ec == AcadColor::ByLayer && viewport.is_some())
+                .then(|| {
+                    viewport_override_for_layer(
+                        document,
+                        layer,
+                        viewport,
+                        document::objects::KnownXRecordKind::LayerViewportColorOverride,
+                    )
+                    .and_then(|value| value.as_i32())
+                    .map(layer_override_color)
+                })
+                .flatten();
         let resolved = if *ec == AcadColor::ByLayer {
-            viewport_color.as_ref().unwrap_or_else(|| {
-                document
-                    .layers
-                    .get(layer_name)
-                    .map(|l| &l.color)
-                    .unwrap_or(&AcadColor::WHITE)
-            })
+            viewport_color
+                .as_ref()
+                .unwrap_or_else(|| layer.map(|l| &l.color).unwrap_or(&AcadColor::WHITE))
         } else {
             ec
         };
@@ -3491,19 +4134,19 @@ pub(crate) fn render_style_for_common_viewport(
         let [r, g, b, _] = tess_util::aci_to_rgba(resolved);
         let transparency = if common.transparency.is_by_layer() {
             let vp_trans = if viewport.is_some() {
-                viewport_override(
+                viewport_override_for_layer(
                     document,
-                    layer_name,
+                    layer,
                     viewport,
-                    codec::objects::KnownXRecordKind::LayerViewportAlphaOverride,
+                    document::objects::KnownXRecordKind::LayerViewportAlphaOverride,
                 )
                 .and_then(|value| value.as_i32())
-                .map(|value| codec::types::Transparency::from_alpha_value(value as u32))
+                .map(|value| document::types::Transparency::from_alpha_value(value as u32))
             } else {
                 None
             };
             vp_trans
-                .or_else(|| document.layers.get(layer_name).map(|layer| layer.transparency))
+                .or_else(|| layer.map(|l| l.transparency))
                 .unwrap_or(common.transparency)
         } else {
             common.transparency
@@ -3512,29 +4155,35 @@ pub(crate) fn render_style_for_common_viewport(
         ([r, g, b, alpha], aci)
     };
 
-    let lt_name = linetype_name_for_common_viewport(document, common, viewport);
+    let elt = &common.linetype;
+    let lt_name = if elt.is_empty() || elt.eq_ignore_ascii_case("bylayer") {
+        layer_linetype_for_layer(document, layer, viewport)
+    } else {
+        elt.as_str()
+    };
     // Effective scale = global LTSCALE × per-entity scale (both default to 1.0).
     let lt_scale = document.header.linetype_scale as f32 * common.linetype_scale as f32;
     let (pattern_length, pattern) = resolve_pattern(&document.line_types, lt_name, lt_scale);
 
     let line_weight_px = {
         let ew = &common.line_weight;
-        let viewport_lineweight = (viewport.is_some() && matches!(ew, LineWeight::ByLayer | LineWeight::Default))
-            .then(|| {
-                viewport_override(
-                    document,
-                    layer_name,
-                    viewport,
-                    codec::objects::KnownXRecordKind::LayerViewportLineweightOverride,
-                )
-                .and_then(|value| value.as_i32())
-                .map(|value| LineWeight::from_value(value as i16))
-            })
-            .flatten();
+        let viewport_lineweight = (viewport.is_some()
+            && matches!(ew, LineWeight::ByLayer | LineWeight::Default))
+        .then(|| {
+            viewport_override_for_layer(
+                document,
+                layer,
+                viewport,
+                document::objects::KnownXRecordKind::LayerViewportLineweightOverride,
+            )
+            .and_then(|value| value.as_i32())
+            .map(|value| LineWeight::from_value(value as i16))
+        })
+        .flatten();
         let resolved = match ew {
             LineWeight::ByLayer | LineWeight::ByBlock | LineWeight::Default => viewport_lineweight
                 .as_ref()
-                .or_else(|| document.layers.get(layer_name).map(|l| &l.line_weight))
+                .or_else(|| layer.map(|l| &l.line_weight))
                 .unwrap_or(&LineWeight::Default),
             _ => ew,
         };
@@ -3545,7 +4194,7 @@ pub(crate) fn render_style_for_common_viewport(
 }
 
 pub(crate) fn render_style_for_viewport(
-    document: &CadDocument,
+    document: &Document,
     e: &EntityType,
     viewport: Option<Handle>,
 ) -> ([f32; 4], f32, [f32; 8], f32, u8) {
@@ -3553,17 +4202,17 @@ pub(crate) fn render_style_for_viewport(
 }
 
 pub(crate) fn has_resolved_book_color_common(
-    document: &CadDocument,
-    common: &codec::entities::EntityCommon,
+    document: &Document,
+    common: &document::entities::EntityCommon,
 ) -> bool {
     common
         .color_book_handle
         .filter(|handle| handle.is_valid())
         .and_then(|handle| document.objects.get(&handle))
-        .is_some_and(|object| matches!(object, codec::objects::ObjectType::BookColor(_)))
+        .is_some_and(|object| matches!(object, document::objects::ObjectType::BookColor(_)))
 }
 
-pub(crate) fn has_resolved_book_color(document: &CadDocument, e: &EntityType) -> bool {
+pub(crate) fn has_resolved_book_color(document: &Document, e: &EntityType) -> bool {
     has_resolved_book_color_common(document, e.common())
 }
 
@@ -3579,10 +4228,26 @@ pub struct InheritStyle {
     pub lw_px: f32,
 }
 
+/// An INSERT's dash pattern as its ByBlock children inherit it: the linetype is
+/// the INSERT's, but the linetype scale that applies is the child's own.
+pub(crate) fn insert_pattern_for_children(
+    common: &document::entities::EntityCommon,
+    pat_len: f32,
+    pat: [f32; 8],
+) -> (f32, [f32; 8]) {
+    let own_scale = common.linetype_scale as f32;
+    if !own_scale.is_finite() || own_scale.abs() <= 1.0e-9 {
+        return (pat_len, pat);
+    }
+    (pat_len / own_scale, pat.map(|value| value / own_scale))
+}
+
 /// Convert a concrete (already layer-resolved) lineweight to display pixels.
+/// Kept below 1 px for thin weights so plots and SVG get the true width;
+/// the GPU paths draw at least 1 px (#1749).
 pub(crate) fn lineweight_to_px(lw: &LineWeight) -> f32 {
     lw.millimeters()
-        .map(|mm| (mm as f32 * MM_TO_PX).max(1.0))
+        .map(|mm| mm as f32 * MM_TO_PX)
         .unwrap_or(1.0)
 }
 
@@ -3592,12 +4257,12 @@ pub(crate) fn lineweight_to_px(lw: &LineWeight) -> f32 {
 /// reference's layer through this. Color is returned RAW (background adaptation
 /// happens at emit time). Falls back to white / Continuous / 1 px when the
 /// layer is missing.
-pub(crate) fn layer_render_style(document: &CadDocument, layer_name: &str) -> InheritStyle {
+pub(crate) fn layer_render_style(document: &Document, layer_name: &str) -> InheritStyle {
     layer_render_style_viewport(document, layer_name, None)
 }
 
 pub(crate) fn layer_render_style_viewport(
-    document: &CadDocument,
+    document: &Document,
     layer_name: &str,
     viewport: Option<Handle>,
 ) -> InheritStyle {
@@ -3608,10 +4273,10 @@ pub(crate) fn layer_render_style_viewport(
             document,
             layer_name,
             viewport,
-            codec::objects::KnownXRecordKind::LayerViewportColorOverride,
+            document::objects::KnownXRecordKind::LayerViewportColorOverride,
         )
         .and_then(|value| value.as_i32())
-        .map(AcadColor::from_true_color_value)
+        .map(layer_override_color)
     } else {
         None
     };
@@ -3625,10 +4290,10 @@ pub(crate) fn layer_render_style_viewport(
             document,
             layer_name,
             viewport,
-            codec::objects::KnownXRecordKind::LayerViewportAlphaOverride,
+            document::objects::KnownXRecordKind::LayerViewportAlphaOverride,
         )
         .and_then(|value| value.as_i32())
-        .map(|value| codec::types::Transparency::from_alpha_value(value as u32))
+        .map(|value| document::types::Transparency::from_alpha_value(value as u32))
         .or_else(|| layer.map(|layer| layer.transparency))
         .map(|transparency| 1.0 - transparency.as_percent() as f32)
         .unwrap_or(1.0)
@@ -3643,15 +4308,22 @@ pub(crate) fn layer_render_style_viewport(
             document,
             layer_name,
             viewport,
-            codec::objects::KnownXRecordKind::LayerViewportLinetypeOverride,
+            document::objects::KnownXRecordKind::LayerViewportLinetypeOverride,
         )
         .and_then(|value| value.as_handle())
-        .and_then(|handle| document.line_types.iter().find(|line_type| line_type.handle == handle))
+        .and_then(|handle| {
+            document
+                .line_types
+                .iter()
+                .find(|line_type| line_type.handle == handle)
+        })
         .map(|line_type| line_type.name.as_str())
         .or_else(|| layer.map(|layer| layer.line_type.as_str()))
         .unwrap_or("Continuous")
     } else {
-        layer.map(|layer| layer.line_type.as_str()).unwrap_or("Continuous")
+        layer
+            .map(|layer| layer.line_type.as_str())
+            .unwrap_or("Continuous")
     };
     let lt_scale = document.header.linetype_scale as f32;
     let (pat_len, pat) = resolve_pattern(&document.line_types, lt_name, lt_scale);
@@ -3660,7 +4332,7 @@ pub(crate) fn layer_render_style_viewport(
             document,
             layer_name,
             viewport,
-            codec::objects::KnownXRecordKind::LayerViewportLineweightOverride,
+            document::objects::KnownXRecordKind::LayerViewportLineweightOverride,
         )
         .and_then(|value| value.as_i32())
         .map(|value| LineWeight::from_value(value as i16))
@@ -3697,7 +4369,7 @@ pub(crate) fn is_effective_layer_zero(layer_name: &str) -> bool {
 /// *layer* style (`l0`). Explicit properties always win. Call this for
 /// exploded block sub-entities so color/linetype/lineweight propagate right.
 pub(crate) fn render_style_for_block_sub(
-    document: &CadDocument,
+    document: &Document,
     e: &EntityType,
     insert_color: [f32; 4],
     insert_pat_len: f32,
@@ -3718,7 +4390,7 @@ pub(crate) fn render_style_for_block_sub(
 }
 
 pub(crate) fn render_style_for_block_sub_viewport(
-    document: &CadDocument,
+    document: &Document,
     e: &EntityType,
     insert_color: [f32; 4],
     insert_pat_len: f32,
@@ -3748,8 +4420,7 @@ pub(crate) fn render_style_for_block_sub_viewport(
     };
     let final_color = [resolved_rgb[0], resolved_rgb[1], resolved_rgb[2], alpha];
 
-    let lt_bylayer =
-        common.linetype.is_empty() || common.linetype.eq_ignore_ascii_case("bylayer");
+    let lt_bylayer = common.linetype.is_empty() || common.linetype.eq_ignore_ascii_case("bylayer");
     let (final_pat_len, final_pat) = if common.linetype.eq_ignore_ascii_case("byblock") {
         (insert_pat_len, insert_pat)
     } else if on_l0 && lt_bylayer {
@@ -3760,7 +4431,12 @@ pub(crate) fn render_style_for_block_sub_viewport(
 
     let final_lw = if matches!(common.line_weight, LineWeight::ByBlock) {
         insert_lw_px
-    } else if on_l0 && matches!(common.line_weight, LineWeight::ByLayer | LineWeight::Default) {
+    } else if on_l0
+        && matches!(
+            common.line_weight,
+            LineWeight::ByLayer | LineWeight::Default
+        )
+    {
         l0.lw_px
     } else {
         lw_px
@@ -3817,8 +4493,9 @@ pub(crate) fn resolve_colors_for_bg(wires: &mut [WireModel], bg: [f32; 4]) {
         } else {
             adapt_to_bg(adapt.raw_color, contrast)
         };
-        if !adapt.preserve_color {
-            for (vertex, raw) in wire.text_verts.iter_mut().zip(&adapt.text_raw_colors) {
+        if !adapt.preserve_color && !wire.text_verts.is_empty() {
+            let geom = std::sync::Arc::make_mut(&mut wire.geom);
+            for (vertex, raw) in geom.text_verts.iter_mut().zip(&adapt.text_raw_colors) {
                 vertex.color = adapt_to_bg(*raw, contrast);
             }
         }
@@ -3880,33 +4557,35 @@ impl Scene {
                 return arc;
             }
         }
-        let mut out: Vec<crate::scene::pipeline::text_gpu::TextVertex> = Vec::new();
-        for w in wires {
-            if !w.display_visible {
-                continue;
-            }
-            if w.render_instance.is_some() {
-                continue;
-            }
-            if !w.text_verts.is_empty() {
-                // Bake the host wire's draw-order depth into its glyphs so
-                // text layers like the rest of the entity: its own background
-                // fill lands at the same biased depth (glyphs draw after fills
-                // and win the LessEqual test), and a hatch later in draw order
-                // still covers the text. A tessellation-time value (block-local
-                // compose) survives as an offset on top of the wire's depth.
-                let d = crate::scene::pipeline::wire_gpu::wire_draw_depth(w, depth_map);
-                if d == 0.0 {
-                    out.extend_from_slice(&w.text_verts);
-                } else {
-                    out.extend(w.text_verts.iter().map(|tv| {
+        // Most wires carry no text, but finding the ones that do touches
+        // every wire, so the walk runs across the cores; the ordered collect
+        // keeps the glyphs in submission order.
+        let out: Vec<crate::scene::pipeline::text_gpu::TextVertex> = {
+            use crate::par::prelude::*;
+            wires
+                .par_iter()
+                .filter(|w| {
+                    w.display_visible && w.render_instance.is_none() && !w.text_verts.is_empty()
+                })
+                .flat_map_iter(|w| {
+                    // Bake the host wire's draw-order depth into its glyphs so
+                    // text layers like the rest of the entity: its own
+                    // background fill lands at the same biased depth (glyphs
+                    // draw after fills and win the LessEqual test), and a
+                    // hatch later in draw order still covers the text. A
+                    // tessellation-time value (block-local compose) survives
+                    // as an offset on top of the wire's depth.
+                    let d = crate::scene::pipeline::wire_gpu::wire_draw_depth(w, depth_map);
+                    w.text_verts.iter().map(move |tv| {
                         let mut tv = *tv;
-                        tv.draw_depth += d;
+                        if d != 0.0 {
+                            tv.draw_depth += d;
+                        }
                         tv
-                    }));
-                }
-            }
-        }
+                    })
+                })
+                .collect()
+        };
         let verts = Arc::new(out);
         {
             let mut cache = self.sdf_text_cache.borrow_mut();
@@ -3926,20 +4605,21 @@ impl Scene {
         verts
     }
 
-    fn annotation_context_highlight_wires(
+    pub(in crate::scene) fn annotation_context_highlight_wires(
         &self,
         inst: &ViewportInstance,
+        selected_part: bool,
     ) -> Arc<Vec<WireModel>> {
         if self.selected.is_empty()
             && self.hover_highlight.is_none()
             && self.constraint_hover_highlights.is_empty()
+            && self.box_hover_highlights.is_empty()
         {
             return Arc::new(Vec::new());
         }
 
-        let content_viewport = !inst.paper_sheet
-            && inst.tile_idx.is_none()
-            && inst.handle != Handle::NULL;
+        let content_viewport =
+            !inst.paper_sheet && inst.tile_idx.is_none() && inst.handle != Handle::NULL;
         let target_block = if inst.paper_sheet {
             self.current_layout_block_handle()
         } else {
@@ -3978,63 +4658,109 @@ impl Scene {
             self.paper_bg_color
         };
         let all_visible = self.annotation_all_visible();
+        // The outline of a solid is built for the size its edges show at, so
+        // in a drawing that has solids the wires follow the steps of this
+        // view's scale. A perspective view shows an edge at more than one
+        // size and outlines the solids in full.
+        let interaction_meshes = self.interaction_meshes_arc();
+        let outline_step = (!interaction_meshes.is_empty()
+            && inst.camera.projection == crate::scene::view::camera::Projection::Orthographic)
+            .then(|| {
+                crate::scene::outline_detail::step(
+                    (inst.screen_rect.height * 0.5 / inst.camera.ortho_size() * device_scale())
+                        as f64,
+                )
+            })
+            .flatten();
+        // While the view is being zoomed the outlines stay the ones it had:
+        // they are built again once it rests, not at every step it crosses.
+        let outline_step = {
+            let mut steps = self.outline_steps.borrow_mut();
+            let view = (inst.handle, inst.tile_idx);
+            match (outline_step, steps.get(&view)) {
+                (Some(_), Some(kept)) if self.navigating_lod() => *kept,
+                _ => {
+                    steps.insert(view, outline_step);
+                    outline_step
+                }
+            }
+        };
 
         let mut key = 0xcbf2_9ce4_8422_2325_u64;
-        let mut mix = |value: u64| {
-            key = key.rotate_left(17) ^ value.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        };
+        let mut mix =
+            |value: u64| key = key.rotate_left(17) ^ value.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         mix(self.geometry_epoch);
-        mix(self.selection_generation);
+        mix(outline_step.map_or(u64::MAX, |step| step as u32 as u64));
+        if !selected_part {
+            // The hover part is `hovered − selected`: it changes on a rollover
+            // or marquee tick (hover_generation) and on a selection change.
+            mix(self.selection_generation);
+            mix(self.hover_generation);
+        }
         mix(target_block.value());
         mix(annotation_scale_handle.map_or(0, |handle| handle.value()));
         mix(annotation_scale.to_bits() as u64);
         mix(u64::from(content_viewport));
         mix(u64::from(all_visible));
+        mix(crate::scene::annotative::selection_anno_display() as u64);
         mix(self.active_viewport.map_or(0, |handle| handle.value()));
         mix(crate::scene::text::sdf_atlas::generation());
-        for component in bg {
+        for component in bg.into_iter().chain(self.selection_color) {
             mix(component.to_bits() as u64);
         }
         let mut frozen_sig = frozen.len() as u64;
         for handle in &frozen {
-            frozen_sig ^= handle
-                .value()
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            frozen_sig ^= handle.value().wrapping_mul(0x9E37_79B9_7F4A_7C15);
         }
         mix(frozen_sig);
 
-        if let Some(wires) = self.annotation_highlight_cache.borrow().get(&key) {
+        if selected_part {
+            if let Some((selected, segments, wires)) =
+                self.annotation_selected_cache.borrow().get(&key)
+            {
+                if selected == &self.selected && segments == &self.sub_segments {
+                    return Arc::clone(wires);
+                }
+            }
+        } else if let Some(wires) = self.annotation_highlight_cache.borrow().get(&key) {
             return Arc::clone(wires);
         }
 
-        let mut highlighted: Vec<(Handle, bool)> = self
-            .selected
-            .iter()
-            .copied()
-            .map(|handle| (handle, true))
-            .collect();
-        highlighted.extend(
+        let mut highlighted: Vec<(Handle, bool)> = if selected_part {
+            self.selected.iter().copied().map(|handle| (handle, true)).collect()
+        } else {
             self.hover_highlight_handles()
                 .into_iter()
                 .filter(|handle| !self.selected.contains(handle))
-                .map(|handle| (handle, false)),
-        );
+                .map(|handle| (handle, false))
+                .collect()
+        };
         highlighted.sort_unstable_by_key(|(handle, _)| handle.value());
 
         let empty_selection = rustc_hash::FxHashSet::default();
-        let interaction_meshes = self.interaction_meshes_arc();
+        // Avoid rescanning every mesh for every highlighted entity. A large
+        // cumulative selection contains mostly non-mesh entities, so index
+        // the comparatively small mesh set once for this rebuild.
+        let mut meshes_by_handle = rustc_hash::FxHashMap::<Handle, Vec<_>>::default();
+        for mesh in interaction_meshes.iter() {
+            if let Some(handle) = mesh.entity_handle() {
+                meshes_by_handle.entry(handle).or_default().push(mesh);
+            }
+        }
         let mut wires = Vec::new();
+        let mut edge_prototypes = rustc_hash::FxHashMap::default();
+        let mut outline_detail = OutlineDetail::new(outline_step);
         for (handle, selected) in highlighted {
             let Some(entity) = self.document.get_entity(handle) else {
                 continue;
             };
             if !self.resident_entity_visible(
-                    entity,
-                    target_block,
-                    Some(&frozen),
-                    annotation_scale_handle,
-                    true,
-                ) {
+                entity,
+                target_block,
+                Some(&frozen),
+                annotation_scale_handle,
+                true,
+            ) {
                 continue;
             }
 
@@ -4043,39 +4769,42 @@ impl Scene {
             } else {
                 WireModel::HOVER
             };
-            for set in interaction_meshes
-                .iter()
-                .filter(|set| set.entity_handle() == Some(handle))
+            if let Some(points) = selected
+                .then(|| self.picked_segment_points(handle))
+                .flatten()
             {
-                let (edges, edges_low) = set.geometry_edges();
+                wires.push(WireModel::solid_f64(
+                    handle.value().to_string(),
+                    points,
+                    tint,
+                    true,
+                ));
+                continue;
+            }
+            for set in meshes_by_handle.get(&handle).into_iter().flatten() {
+                let name = format!("mesh-edge:{}", handle.value());
+                let level = outline_detail.step_of(set);
+                if let Some(stub) = moved_edge_outline(
+                    set,
+                    &mut edge_prototypes,
+                    &mut outline_detail,
+                    level,
+                    &name,
+                    tint,
+                    selected,
+                ) {
+                    wires.push(stub);
+                    continue;
+                }
+                let (edges, _) = set.geometry_edges();
                 if edges.len() < 2 {
                     continue;
                 }
-                let mut points = Vec::with_capacity(edges.len() / 2 * 3);
-                for pair_start in (0..edges.len() - 1).step_by(2) {
-                    for index in [pair_start, pair_start + 1] {
-                        let high = edges[index];
-                        let low = edges_low.get(index).copied().unwrap_or([0.0; 3]);
-                        let local = codec::types::Vector3::new(
-                            high[0] as f64 + low[0] as f64,
-                            high[1] as f64 + low[1] as f64,
-                            high[2] as f64 + low[2] as f64,
-                        );
-                        let world = set
-                            .instance_transform
-                            .map_or(local, |transform| transform.apply(local));
-                        points.push([world.x, world.y, world.z]);
-                    }
-                    points.push([f64::NAN; 3]);
-                }
-                let mut edge_wire = WireModel::solid_f64(
-                    format!("mesh-edge:{}", handle.value()),
-                    points,
-                    tint,
-                    selected,
+                let points = placed_edge_points(
+                    &outline_detail.edges(set, level),
+                    set.instance_transform.as_ref(),
                 );
-                edge_wire.line_weight_px = 2.0;
-                wires.push(edge_wire);
+                wires.push(edge_outline(name, points, tint, selected));
             }
 
             if matches!(entity, EntityType::Hatch(_)) {
@@ -4099,17 +4828,20 @@ impl Scene {
                 continue;
             }
 
-            if !crate::scene::annotative::is_annotative(&self.document, entity) {
+            // SELECTIONANNODISPLAY: a selected annotative object shows its
+            // other scale representations; a hovered one does not.
+            if !selected
+                || crate::scene::annotative::selection_anno_display() == 0
+                || !crate::scene::annotative::is_annotative(&self.document, entity)
+            {
                 continue;
             }
 
-            let mut scales: Vec<Handle> = crate::scene::annotative::object_scale_memberships(
-                &self.document,
-                handle,
-            )
-            .into_iter()
-            .map(|(_, scale)| scale)
-            .collect();
+            let mut scales: Vec<Handle> =
+                crate::scene::annotative::object_scale_memberships(&self.document, handle)
+                    .into_iter()
+                    .map(|(_, scale)| scale)
+                    .collect();
             scales.sort_unstable_by_key(Handle::value);
             scales.dedup();
 
@@ -4134,8 +4866,8 @@ impl Scene {
                     continue;
                 }
                 let context_scale = match self.document.objects.get(&scale) {
-                    Some(codec::objects::ObjectType::Scale(value)) => {
-                        (value.inverse_factor() / self.annotation_scale_unit_factor()) as f32
+                    Some(document::objects::ObjectType::Scale(value)) => {
+                        value.inverse_factor() as f32
                     }
                     _ => annotation_scale,
                 };
@@ -4151,13 +4883,23 @@ impl Scene {
                     Some(&block_cache),
                     None,
                     None,
-                    content_viewport,
+                    content_viewport.then_some(1.0),
+                    self.reference_only.handles(),
                 );
+                // Dimmed: the selection colour halfway to the background,
+                // without the selected object's own highlight (measured: the
+                // other scales draw only in the halo colour).
+                let dim = [
+                    tint[0] + (bg[0] - tint[0]) * 0.5,
+                    tint[1] + (bg[1] - tint[1]) * 0.5,
+                    tint[2] + (bg[2] - tint[2]) * 0.5,
+                    tint[3],
+                ];
                 for wire in &mut context_wires {
-                    wire.color = tint;
-                    wire.selected = selected;
+                    wire.color = dim;
+                    wire.selected = false;
                     for vertex in &mut wire.text_verts {
-                        vertex.color = [tint[0], tint[1], tint[2], vertex.color[3]];
+                        vertex.color = [dim[0], dim[1], dim[2], vertex.color[3]];
                     }
                 }
                 wires.extend(context_wires);
@@ -4165,11 +4907,26 @@ impl Scene {
         }
 
         let wires = Arc::new(wires);
-        let mut cache = self.annotation_highlight_cache.borrow_mut();
-        if cache.len() > 16 {
-            cache.clear();
+        if selected_part {
+            let mut cache = self.annotation_selected_cache.borrow_mut();
+            if cache.len() > 16 {
+                cache.clear();
+            }
+            cache.insert(
+                key,
+                (
+                    self.selected.clone(),
+                    self.sub_segments.clone(),
+                    Arc::clone(&wires),
+                ),
+            );
+        } else {
+            let mut cache = self.annotation_highlight_cache.borrow_mut();
+            if cache.len() > 16 {
+                cache.clear();
+            }
+            cache.insert(key, Arc::clone(&wires));
         }
-        cache.insert(key, Arc::clone(&wires));
         wires
     }
 
@@ -4180,7 +4937,7 @@ impl Scene {
     pub fn build_viewports(
         &self,
         bounds: Rectangle,
-        model_render_mode: codec::entities::ViewportRenderMode,
+        model_render_mode: document::entities::ViewportRenderMode,
         _hover_region: Option<usize>,
         show_viewcube: bool,
         show_interaction: bool,
@@ -4191,8 +4948,10 @@ impl Scene {
         // Hover comes from the scene cell driven by the app-level
         // `CursorMoved` handler — the cube overlay sits above the shader
         // and would otherwise mask the move event from `Program::update`.
-        let hover_region = show_interaction.then(|| self.viewcube_hover.get()).flatten();
-        self.selection.borrow_mut().vp_size = (bounds.width, bounds.height);
+        let hover_region = show_interaction
+            .then(|| self.viewcube_hover.get())
+            .flatten();
+        self.selection.borrow_mut().view.vp_size = (bounds.width, bounds.height);
         if bounds.height > 0.0 {
             self.set_render_aspect(bounds.width / bounds.height);
             self.set_render_pixel_scale(bounds.width, bounds.height);
@@ -4229,6 +4988,7 @@ impl Scene {
             viewcube_text_color,
             selection_color: self.selection_color,
             selection_effect: self.selection_effect,
+            selection_widen: self.selection_widen,
             nav_perf: perf_nav,
         }
     }
@@ -4243,12 +5003,14 @@ impl Scene {
         &self,
         bounds: Rectangle,
         tile_idx: usize,
-        model_render_mode: codec::entities::ViewportRenderMode,
+        model_render_mode: document::entities::ViewportRenderMode,
         show_viewcube: bool,
         show_interaction: bool,
         viewcube_text_color: [f32; 4],
     ) -> Primitive {
-        let hover_region = show_interaction.then(|| self.viewcube_hover.get()).flatten();
+        let hover_region = show_interaction
+            .then(|| self.viewcube_hover.get())
+            .flatten();
         let canvas = (bounds.width.max(1.0), bounds.height.max(1.0));
         let bg_color = [0.0, 0.0, 0.0, 0.0];
         let tiles = self.model_tiles.borrow();
@@ -4259,6 +5021,7 @@ impl Scene {
                 viewcube_text_color,
                 selection_color: self.selection_color,
                 selection_effect: self.selection_effect,
+                selection_widen: self.selection_widen,
                 nav_perf: None,
             };
         };
@@ -4321,6 +5084,7 @@ impl Scene {
             viewcube_text_color,
             selection_color: self.selection_color,
             selection_effect: self.selection_effect,
+            selection_widen: self.selection_widen,
             nav_perf: perf_nav,
         }
     }
@@ -4338,6 +5102,22 @@ impl Scene {
         show_interaction: bool,
         force_rasterize: bool,
     ) -> Option<ViewportData> {
+        // Cumulative stage times for the PERF trace: which step of building a
+        // viewport's data is slow after an edit. The clock covers the whole
+        // body, the wire-source acquisition included — it used to start after
+        // that acquisition, one line below the `vp_mark("wires")` meant to
+        // report it, so `vp-build wires=` read 0.0 ms however long it took and
+        // an edit frame measured at `build=141.52ms` reported 0.0 ms for every
+        // stage it had.
+        let vp_started = crate::perf::enabled().then(iced::time::Instant::now);
+        let vp_mark = |stage: &str| {
+            if let Some(started) = vp_started {
+                crate::perf_record!(
+                    "[perf] vp-build {stage}={:.1}ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        };
         let display = self.viewport_display_settings(inst);
         let mut flags = render_mode_flags(inst.render_mode);
         if let Some(style) = display.visual_style.as_ref() {
@@ -4378,27 +5158,46 @@ impl Scene {
         // are all skipped while the content is unchanged, and
         // `render_signature` stays stable so paper hits the single-blit scene
         // cache exactly like Model.
-        let base_arc = if let Some(tile_idx) = inst.tile_idx {
+        let (base_arc, wire_source) = if let Some(tile_idx) = inst.tile_idx {
             let aspect = if full.height > 0.0 {
                 full.width / full.height
             } else {
                 1.0
             };
-            self.model_tile_wires_arc(tile_idx, &inst.camera, aspect, full.height)
+            (
+                self.model_tile_wires_arc(tile_idx, &inst.camera, aspect, full.height),
+                "tile",
+            )
         } else if inst.paper_sheet {
             // The sheet renders the paper block's own entities + viewport
             // borders — NOT the projected viewport content (the GPU content
             // viewports draw that themselves).
-            self.paper_sheet_wires_arc()
-        } else if inst.handle == codec::Handle::NULL {
-            self.entity_wires_arc()
+            (self.paper_sheet_wires_arc(), "sheet")
+        } else if inst.handle == document::Handle::NULL {
+            (self.entity_wires_arc(), "entity")
         } else {
-            self.model_wires_for_viewport_arc(inst.handle, full.height)
+            (
+                self.model_wires_for_viewport_arc(inst.handle, full.height),
+                "viewport",
+            )
         };
+        // Which source paid, and for how many wires: the four branches are
+        // very different amounts of work and the cumulative stage line cannot
+        // tell them apart.
+        if let Some(started) = vp_started {
+            crate::perf_record!(
+                "[perf] vp-wires {:>7.2}ms source={} wires={}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                wire_source,
+                base_arc.len(),
+            );
+        }
+        vp_mark("wires");
         let source_gen = self.last_model_wire_gen.get();
         let styled_fill_source = Arc::clone(&base_arc);
         let (base_arc, styled_gen) = self.display_styled_wires(base_arc, source_gen);
         self.last_model_wire_gen.set(styled_gen);
+        vp_mark("styled");
         // Wire-buffer content id for the upload gate. Preview / interim wires
         // are NOT part of this buffer anymore (they go in a separate per-frame
         // overlay buffer below), so the base id is the source's stable content
@@ -4410,7 +5209,12 @@ impl Scene {
         // memoized rather than re-walking every wire (handle lookup + clone)
         // each frame — for every source, since all ids are stable now.
         let (face3d_wires, other_arc) = {
-            let cached = { self.split_cache.borrow().get(&base_wire_content_id).cloned() };
+            let cached = {
+                self.split_cache
+                    .borrow()
+                    .get(&base_wire_content_id)
+                    .cloned()
+            };
             let inherited_empty = if let Some((base, patch)) = base_wire_patch.as_ref() {
                 if patch.face_pass_changed {
                     None
@@ -4455,10 +5259,15 @@ impl Scene {
                         (Arc::new(Vec::new()), None)
                     }
                 };
-                let mut c = self.split_cache.borrow_mut();
                 // Ids change on rebuild, so old keys die naturally; the cap
-                // just bounds pathological churn.
-                if c.len() > 8 {
+                // just bounds pathological churn. It stays above what one
+                // frame draws: below it, the cache emptied on every frame.
+                // Each entry splits a whole set, so no fixed floor beyond
+                // that: other layouts' splits held memory until it ran out
+                // (#3260).
+                let cap = self.frame_wire_set_count() + 1;
+                let mut c = self.split_cache.borrow_mut();
+                if c.len() > cap {
                     c.clear();
                 }
                 c.insert(base_wire_content_id, (fa.clone(), oa.clone()));
@@ -4475,70 +5284,107 @@ impl Scene {
         // per-frame buffer so the (potentially huge) base buffer stays resident
         // and unchanged while a command preview or grip drag is live.
         let all_wires = other_arc;
+        vp_mark("split");
         // The 3-D wireframe deliberately ignores entity draw order and lets
         // true depth decide overlaps. Tag its resident wire id separately so
         // switching between the 2-D and 3-D styles rebuilds the GPU constants
         // even though the world-space geometry itself did not change. The
         // incremental patch's base id receives the same tag, preserving the
         // arena fast path after the first mode switch.
-        let wire_mode_tag = u64::from(
-            inst.render_mode == codec::entities::ViewportRenderMode::Wireframe3D,
-        );
+        let wire_mode_tag =
+            u64::from(inst.render_mode == document::entities::ViewportRenderMode::Wireframe3D);
         let wire_content_id = base_wire_content_id
             .wrapping_mul(2)
             .wrapping_add(wire_mode_tag);
-        let wire_patch = base_wire_patch.map(|(base, patch)| {
-            (
-                base.wrapping_mul(2).wrapping_add(wire_mode_tag),
-                patch,
-            )
-        });
+        let wire_patch = base_wire_patch
+            .map(|(base, patch)| (base.wrapping_mul(2).wrapping_add(wire_mode_tag), patch));
         // A live overlay belongs to one drawing space, but every viewport that
         // displays that space must project the same world-space preview. In a
         // paper layout, model-space overlays go to all content viewports while
         // paper-space overlays stay on the sheet. This also keeps model-space
         // coordinates out of the full-canvas sheet pass (#540).
-        let show_live_overlay = show_interaction && if self.current_layout == "Model" {
-            true
-        } else if self.active_viewport.is_some() {
-            !inst.paper_sheet
+        let show_live_overlay = show_interaction
+            && if self.current_layout == "Model" {
+                true
+            } else if self.active_viewport.is_some() {
+                !inst.paper_sheet
+            } else {
+                inst.paper_sheet
+            };
+        let (selected_annotation_context_wires, annotation_context_wires) = if show_live_overlay {
+            (
+                self.annotation_context_highlight_wires(inst, true),
+                self.annotation_context_highlight_wires(inst, false),
+            )
         } else {
-            inst.paper_sheet
+            (Arc::new(Vec::new()), Arc::new(Vec::new()))
         };
-        let annotation_context_wires = if show_live_overlay {
-            self.annotation_context_highlight_wires(inst)
+        vp_mark("annotation-highlight");
+        // 2D wireframe draws no cloud points; the clouds show their extents
+        // and a message there instead (drawn with the live overlays).
+        let wireframe_2d = inst.render_mode == document::entities::ViewportRenderMode::Wireframe2D;
+        let cloud_2d_wires = if wireframe_2d && show_live_overlay && !inst.paper_sheet {
+            self.point_cloud_2d_wires()
         } else {
-            Arc::new(Vec::new())
+            Vec::new()
         };
-        let preview_wires = if !show_live_overlay
-            || (self.interim_wire.is_none()
-                && self.preview_wires.is_empty()
-                && self.constraint_hover_wires.is_empty())
+        let (indicator_wires, indicator_hatches) = if show_live_overlay {
+            let pixel = 2.0 * inst.camera.ortho_size() as f64 / f64::from(full.height.max(1.0));
+            let (wires, mut hatches) = self.table_indicator_overlay(pixel);
+            hatches.extend(self.anno_monitor_overlay(pixel));
+            (wires, hatches)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let (interim_wire, command_preview) = self.shown_rubber_band();
+        let mut preview_wires = if !show_live_overlay
+            || (interim_wire.is_none()
+                && command_preview.is_empty()
+                && self.constraint_hover_wires.is_empty()
+                && self.ducs_face_wires.is_empty()
+                && self.cv_net_wires.is_empty()
+                && cloud_2d_wires.is_empty()
+                && indicator_wires.is_empty())
         {
             Arc::new(Vec::new())
         } else {
             let mut v: Vec<WireModel> = Vec::with_capacity(
-                self.preview_wires.len() + self.constraint_hover_wires.len() + 1,
+                command_preview.len()
+                    + self.constraint_hover_wires.len()
+                    + cloud_2d_wires.len()
+                    + 1,
             );
-            if let Some(iw) = &self.interim_wire {
+            if let Some(iw) = interim_wire {
                 v.push(iw.clone());
             }
-            v.extend(self.preview_wires.iter().cloned());
+            v.extend(command_preview.iter().cloned());
             v.extend(self.constraint_hover_wires.iter().cloned());
+            v.extend(self.ducs_face_wires.iter().cloned());
+            v.extend(self.cv_net_wires.values().flatten().cloned());
+            v.extend(cloud_2d_wires);
+            v.extend(indicator_wires);
             Arc::new(v)
         };
         let preview_hatches = if show_live_overlay {
-            Arc::clone(&self.preview_hatches)
+            let hatches = self.render_preview_hatches();
+            if indicator_hatches.is_empty() {
+                hatches
+            } else {
+                let mut all = (*hatches).clone();
+                all.extend(indicator_hatches);
+                Arc::new(all)
+            }
         } else {
             Arc::new(Vec::new())
         };
+        vp_mark("preview-hatches");
 
         // Per-viewport frozen-layer set for a paper content viewport. Content
         // viewports hide special fills, media, meshes and lights on VP-frozen
         // layers too, matching the already-filtered resident wire set.
         let vp_frozen: rustc_hash::FxHashSet<Handle> = if !inst.paper_sheet
             && inst.tile_idx.is_none()
-            && inst.handle != codec::Handle::NULL
+            && inst.handle != document::Handle::NULL
         {
             self.viewport_hidden_handles(inst.handle)
         } else {
@@ -4565,15 +5411,7 @@ impl Scene {
             width: full.width.max(1.0),
             height: full.height.max(1.0),
         };
-        let display_plot_lineweights = self.current_layout != "Model"
-            && self.effective_plot_settings().is_some_and(|settings| {
-                settings.flags.show_plot_styles && settings.flags.print_lineweights
-            });
-        let mut uniforms = Uniforms::new(
-            &inst.camera,
-            full_bounds,
-            self.document.header.lineweight_display || display_plot_lineweights,
-        );
+        let mut uniforms = Uniforms::new(&inst.camera, full_bounds, self.lineweights_on_screen());
         if self.current_layout == "Model" {
             uniforms.lineweight_scale = -self.model_lineweight_scale;
         } else {
@@ -4582,30 +5420,35 @@ impl Scene {
             uniforms.lineweight_scale = paper_units_per_mm / paper_per_pixel / MM_TO_PX;
         }
 
-        // Model space: scale linetypes using the current annotation scale so their
-        // appearance can match a paper-space viewport at the same drawing scale.
+        // Model space: scale linetypes by the current annotation scale's ratio
+        // (1:100 draws them 100 times longer) so they match a paper-space
+        // viewport at that scale. The ratio alone: a linetype is defined in
+        // drawing units, so the paper-millimetre conversion that
+        // `annotation_scale` carries shrank a metre drawing's dashes 1000
+        // times, below a pixel, and they drew solid (#2036).
         if self.current_layout == "Model" {
-            if self.annotation_scale.is_finite() && self.annotation_scale > 1e-9 {
-                uniforms.linetype_scale = self.annotation_scale;
+            if let Some(ratio) = model_linetype_ratio(&self.document) {
+                uniforms.linetype_scale = ratio;
             }
-        } else if self.document.header.paper_space_linetype_scaling
-            && !inst.paper_sheet
-            && inst.handle != Handle::NULL
-        {
-            if let Some(EntityType::Viewport(vp)) = self.document.get_entity(inst.handle) {
-                let viewport_scale =
-                    vp_effective_scale(vp.custom_scale, vp.view_height, vp.height);
-
-                if viewport_scale.is_finite() && viewport_scale > 1e-9 {
-                    uniforms.linetype_scale = (1.0 / viewport_scale) as f32;
-                }
+        } else if !inst.paper_sheet && inst.handle != Handle::NULL {
+            if let Some(factor) = self.viewport_psltscale_factor(inst.handle) {
+                uniforms.linetype_scale = factor;
             }
+        }
+        if preview_wires.iter().any(|wire| wire.name == "from_guide") {
+            scale_from_guide_dashes(
+                Arc::make_mut(&mut preview_wires).as_mut_slice(),
+                uniforms.world_per_pixel,
+                uniforms.linetype_scale,
+            );
         }
         // Crop the rotation-only RTE view-projection to the visible sub-rect.
         uniforms.view_rot = crop_view_proj(uniforms.view_rot, uo, vo, us, vs);
         uniforms.viewport_size = [visible_w, visible_h];
         uniforms.flat_shade = if flags.flat_shade { 1.0 } else { 0.0 };
         uniforms.transparency_enable = if self.transparency_display { 1.0 } else { 0.0 };
+        uniforms.highlight_widen = self.selection_widen;
+        uniforms.edge_rgb = crate::scene::pipeline::uniforms::edge_rgb_bits(self.edge_color);
         uniforms.viewport_background = display.background.base;
         uniforms.view_tone = [display.brightness, display.contrast, 0.0, 0.0];
         uniforms.background_top = display.background.colors[0];
@@ -4636,7 +5479,7 @@ impl Scene {
             let highlight = if style.face_modifier & 2 != 0 {
                 (style.face_specular / 100.0).clamp(0.0, 1.0)
             } else {
-                -1.0
+                crate::scene::pipeline::uniforms::DEFAULT_HIGHLIGHT
             };
             uniforms.visual_style = [
                 style.face_color_mode as f32,
@@ -4644,10 +5487,11 @@ impl Scene {
                 highlight,
                 (style.brightness / 10.0).clamp(-1.0, 1.0),
             ];
-            uniforms.visual_style_color =
-                style.mono_color.unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            uniforms.visual_style_color = style.mono_color.unwrap_or([1.0, 1.0, 1.0, 1.0]);
         }
+        vp_mark("before-lighting");
         self.apply_document_lighting(&mut uniforms, lighting_block, &vp_frozen, inst);
+        vp_mark("lighting");
 
         // `screen_rect` carries the *visible* sub-rectangle in normalized
         // canvas coords — that's what `Pipeline::prepare` uses to size
@@ -4674,12 +5518,13 @@ impl Scene {
                 self.paper_sheet_render_models_for_view(show_interaction);
             (hatches, wipeouts, Some(images))
         } else {
-            (
-                self.hatch_models_for_viewport(inst.handle, &vp_frozen, show_interaction),
-                self.wipeout_models_for_viewport(inst.handle, &vp_frozen),
-                None,
-            )
+            let hatches = self.hatch_models_for_viewport(inst.handle, &vp_frozen, show_interaction);
+            vp_mark("hatch-models");
+            let wipeouts = self.wipeout_models_for_viewport(inst.handle, &vp_frozen);
+            vp_mark("wipeout-models");
+            (hatches, wipeouts, None)
         };
+        vp_mark("hatches");
         let viewport_scale = if inst.paper_sheet {
             1.0
         } else {
@@ -4703,11 +5548,13 @@ impl Scene {
             styled_wire_fills.as_ref().filter(|fills| !fills.is_empty()),
             pattern_scale,
         );
+        vp_mark("styled-hatches");
         let images = if let Some(images) = paper_images {
             images
         } else {
             self.images_for_viewport(inst.handle, &vp_frozen)
         };
+        vp_mark("images");
         // The paper sheet shows the layout's own 2-D content (fills, borders,
         // annotation) — never the model's 3-D solids. Those are drawn inside
         // the floating content viewports, whose model camera + per-viewport
@@ -4720,6 +5567,12 @@ impl Scene {
         } else {
             self.meshes_for_viewport(inst.handle, &vp_frozen)
         };
+        let point_clouds = self.point_clouds_for_viewport(
+            inst.handle,
+            &vp_frozen,
+            inst.paper_sheet || wireframe_2d,
+        );
+        vp_mark("meshes-clouds");
 
         // SDF text quads (behind OCS_TEXT_SDF). The glyph quads ride on each
         // entity's own wire (produced by the tessellator, transformed for
@@ -4741,24 +5594,21 @@ impl Scene {
             0x1000_0000_0000_0000
         } else if inst.paper_sheet {
             0x2000_0000_0000_0000 | self.current_layout_block_handle().value()
-        } else if inst.handle == codec::Handle::NULL {
+        } else if inst.handle == document::Handle::NULL {
             0x4000_0000_0000_0000 | self.current_layout_block_handle().value()
         } else {
             0x3000_0000_0000_0000 | inst.handle.value()
         };
-        let draw_depths = if inst.render_mode
-            == codec::entities::ViewportRenderMode::Wireframe3D
+        let draw_depths = if inst.render_mode == document::entities::ViewportRenderMode::Wireframe3D
         {
             Arc::clone(&self.no_draw_depths)
         } else {
             self.draw_depth_map()
         };
-        let text_verts = self.gather_text_verts(
-            &all_wires,
-            wire_content_id,
-            text_source_key,
-            &draw_depths,
-        );
+        vp_mark("meshes-depths");
+        let text_verts =
+            self.gather_text_verts(&all_wires, wire_content_id, text_source_key, &draw_depths);
+        vp_mark("text");
         // Grip-drag / command-preview glyphs, excluded from the epoch-cached base
         // gather above. Two sources, both tiny (one operation's worth) and walked
         // per frame: the overlay wires' own glyphs (MOVE / COPY / ROTATE / SCALE /
@@ -4778,16 +5628,9 @@ impl Scene {
             }
             Arc::new(pv)
         };
-        // Stable per-viewport identity (tagged so tile / sheet / content /
-        // implicit-model instances never collide), so a reused pipeline slot
-        // can tell it changed occupant and reset its caches.
-        let instance_id: u64 = if let Some(t) = inst.tile_idx {
-            0x1000_0000_0000_0000 | (t as u64)
-        } else if inst.paper_sheet {
-            0x2000_0000_0000_0000
-        } else {
-            0x3000_0000_0000_0000 | inst.handle.value()
-        };
+        // Stable per-viewport identity, so a reused pipeline slot can tell it
+        // changed occupant and reset its caches.
+        let instance_id = self.render_instance_id(inst);
         // A paper content viewport with a non-rectangular clip entity gets its
         // boundary projected into this render target's NDC (paper shape mapped
         // through the same visible-sub-rect crop as the content). Rectangular
@@ -4795,7 +5638,7 @@ impl Scene {
         // rectangle and need no stencil boundary.
         let clip_boundary_ndc = if !inst.paper_sheet
             && inst.tile_idx.is_none()
-            && inst.handle != codec::Handle::NULL
+            && inst.handle != document::Handle::NULL
             && self.current_layout != "Model"
         {
             Arc::new(self.viewport_clip_boundary_ndc(inst.handle, uo, vo, us, vs))
@@ -4803,13 +5646,56 @@ impl Scene {
             Arc::new(vec![])
         };
         let navigating = !inst.paper_sheet && self.navigating_lod();
+        let point_cloud_light = {
+            use crate::scene::model::point_cloud::{setting, setting_value};
+            let value = |name| setting(name).map_or(0, |s| setting_value(&self.document, s)) as f32;
+            // Lit only in the shaded styles, as the reference.
+            let lighting = if flags.mesh_fill && !flags.hidden_line {
+                value("POINTCLOUDLIGHTING")
+            } else {
+                0.0
+            };
+            let source = value("POINTCLOUDLIGHTSOURCE");
+            // The lights follow the view (measured from the reference in
+            // view coordinates: right, up, toward the viewer): the default
+            // lighting is a key light from the upper left and a fill light
+            // from the lower right, the other source one light from above.
+            let view = |x: f32, y: f32, z: f32| {
+                (inst.camera.rotation * glam::Vec3::new(x, y, z)).normalize_or(glam::Vec3::Z)
+            };
+            // Hand-tuned light-direction fixture: the `0.318` component only
+            // looks like 1/π, so keep the tuned value verbatim.
+            #[allow(clippy::approx_constant)]
+            let (first, second) = if source > 0.5 {
+                (view(-0.034, 0.987, 0.158), glam::Vec3::ZERO)
+            } else {
+                (view(-0.512, 0.500, 0.698), view(0.834, -0.451, 0.318))
+            };
+            // While the view moves, POINTCLOUDRTDENSITY per cent of the points.
+            let fraction = if navigating {
+                value("POINTCLOUDRTDENSITY") / 100.0
+            } else {
+                1.0
+            };
+            [
+                lighting, source, fraction, 0.0, first.x, first.y, first.z, 0.0, second.x,
+                second.y, second.z, 0.0,
+            ]
+        };
+        // Cached per (selection, hover) generation: rebuilding the two sets
+        // and the signature every frame per viewport scaled with the selection
+        // size even while idle.
+        let (interaction_selected, interaction_hover, interaction_sig) =
+            self.cached_viewport_interaction_sets(show_interaction);
         Some(ViewportData {
             instance_id,
             force_rasterize,
             wires: Arc::downgrade(&all_wires),
+            _wires_copy: (!self.is_resident_wire_set(&all_wires)).then(|| Arc::clone(&all_wires)),
             clip_boundary_ndc,
             preview_wires,
             annotation_context_wires,
+            selected_annotation_context_wires,
             preview_hatches,
             face3d_wires,
             text_verts,
@@ -4819,6 +5705,13 @@ impl Scene {
             hatches,
             wipeout_hatches,
             images,
+            point_cloud_clip: if point_clouds.clouds.is_empty() {
+                Vec::new()
+            } else {
+                self.live_section_clip_planes()
+            },
+            point_clouds,
+            point_cloud_light,
             meshes,
             background_image: display.background.image.clone(),
             environment_image: display.background.environment.clone(),
@@ -4828,6 +5721,7 @@ impl Scene {
             compass_rotation: inst.camera.view_rotation_mat(),
             // Only the active viewport gets the hovered-region highlight.
             hover_region: if inst.active { hover_region } else { None },
+            viewcube_opacity: self.viewcube_opacity.get(),
             // The cube shows only on the active viewport, and only while the
             // caller (the widget) says there is room for it beside the render
             // bar — so it hides adaptively when the viewport gets narrow.
@@ -4837,37 +5731,47 @@ impl Scene {
             show_2d_solid_fills: flags.show_2d_solid_fills,
             mesh_fill: flags.mesh_fill,
             show_3d_edges: flags.show_3d_edges,
+            // The wireframe styles show silhouettes by DISPSILH alone; the
+            // style's silhouette edges apply to the shaded and hidden ones.
             display_silhouette: flags.hidden_line
-                || display.visual_style.as_ref().is_some_and(|style| {
-                    style.silhouette_width > 0 && style.edges_visible()
-                })
-                || self.document.header.display_silhouette,
+                || self.document.header.display_silhouette
+                || (!view_wireframe
+                    && display.visual_style.as_ref().is_some_and(|style| {
+                        style.silhouette_width > 0 && style.edges_visible()
+                    })),
             hidden_line: flags.hidden_line,
+            // VSOCCLUDEDEDGES, or the style's obscured edge flag (4).
+            occluded_edges: flags.hidden_line
+                && (self.occluded_edges
+                    || display
+                        .visual_style
+                        .as_ref()
+                        .is_some_and(|style| style.edge_style & 4 != 0)),
             // Interaction LOD: suppress the costly hatch pass while the view is
             // actively moving; the scene-render cache holds the full-quality
             // (hatched) frame once it settles. Only applied to the on-screen
             // Model / paper content — the paper *sheet* keeps its fills.
             skip_hatch: self.hatch_lod_enabled() && navigating,
-            skip_background: !inst.paper_sheet && self.current_layout != "Model",
+            // A floating viewport shows the page behind it unless it has a
+            // background of its own.
+            skip_background: !inst.paper_sheet
+                && self.current_layout != "Model"
+                && display.background.params[0] < 0.5,
             geometry_epoch: self.geometry_epoch,
             camera_generation: self.camera_generation,
             wire_content_id,
             wire_patch,
-            selected_handles: Arc::new(if show_interaction {
-                self.selected.iter().copied().collect()
-            } else {
-                rustc_hash::FxHashSet::default()
-            }),
-            hover_handles: Arc::new(if show_interaction {
-                self.hover_highlight_handles()
-            } else {
-                rustc_hash::FxHashSet::default()
-            }),
+            selected_handles: interaction_selected,
+            hover_handles: interaction_hover,
             selection_generation: self
                 .selection_generation
                 .wrapping_mul(2)
                 .wrapping_add(u64::from(!show_interaction)),
-            selected_sig: if show_interaction { self.selected_set_sig() } else { 0 },
+            hover_generation: self
+                .hover_generation
+                .wrapping_mul(2)
+                .wrapping_add(u64::from(!show_interaction)),
+            selected_sig: interaction_sig,
             screen_rect,
         })
     }
@@ -4900,7 +5804,10 @@ impl Scene {
         }
     }
 
-    pub(in crate::scene) fn viewcube_mouse_interaction(&self, state: &CameraState) -> mouse::Interaction {
+    pub(in crate::scene) fn viewcube_mouse_interaction(
+        &self,
+        state: &CameraState,
+    ) -> mouse::Interaction {
         if state.hover_region.is_some() {
             mouse::Interaction::Pointer
         } else {
@@ -4912,7 +5819,7 @@ impl Scene {
 // ── Linetype pattern helper ───────────────────────────────────────────────
 
 pub(crate) fn resolve_pattern(
-    table: &codec::tables::Table<LineType>,
+    table: &document::tables::Table<LineType>,
     name: &str,
     scale: f32,
 ) -> (f32, [f32; 8]) {
@@ -4933,7 +5840,7 @@ pub(crate) fn resolve_pattern(
     }
 
     // Keep dots (element length exactly 0) as 0.0 so the shader can render
-    // them as a fixed ~1 px mark; trailing array slots stay 0.0 padding and
+    // them round at the stroke's width; trailing array slots stay 0.0 padding and
     // the shader tells the two apart by position (a 0.0 before the last
     // non-zero element is a dot, trailing 0.0s are padding). The old code
     // encoded dots as `0.01 * scale` — a tiny world-length dash that went
@@ -4958,7 +5865,7 @@ pub(crate) fn resolve_pattern(
 /// Whether a wire belongs to a Face3D entity, by document handle lookup —
 /// so no changes to WireModel are needed.
 #[allow(dead_code)]
-fn is_face3d_wire(w: &WireModel, document: &codec::CadDocument) -> bool {
+fn is_face3d_wire(w: &WireModel, document: &document::Document) -> bool {
     w.name
         .parse::<u64>()
         .ok()
@@ -4973,7 +5880,7 @@ fn is_face3d_wire(w: &WireModel, document: &codec::CadDocument) -> bool {
 #[allow(dead_code)]
 fn split_face3d_wires(
     wires: &[WireModel],
-    document: &codec::CadDocument,
+    document: &document::Document,
 ) -> (Vec<WireModel>, Vec<WireModel>) {
     let face3d_handles: rustc_hash::FxHashSet<u64> = document
         .entities()
@@ -5017,14 +5924,14 @@ fn split_face3d_wires_with_handles(
 #[cfg(test)]
 mod layer0_inherit_tests {
     use super::*;
-    use codec::entities::Line;
-    use codec::tables::Layer;
-    use codec::types::{Color, Transparency};
+    use document::entities::Line;
+    use document::tables::Layer;
+    use document::types::{Color, Transparency};
 
     // ACI: 1 = red, 3 = green, 7 = white. Distinct, so the assertions below
     // can tell "inherited the insert layer" from "kept layer 0".
-    fn doc() -> CadDocument {
-        let mut d = CadDocument::new();
+    fn doc() -> Document {
+        let mut d = Document::new();
         let mut walls = Layer::new("Walls");
         walls.color = Color::Index(1); // red
         d.layers.add_or_replace(walls);
@@ -5044,7 +5951,7 @@ mod layer0_inherit_tests {
         EntityType::Line(l)
     }
 
-    fn resolve(d: &CadDocument, e: &EntityType, ins: [f32; 4]) -> [f32; 4] {
+    fn resolve(d: &Document, e: &EntityType, ins: [f32; 4]) -> [f32; 4] {
         // Insert sits on "Walls"; its layer style is the layer-0 target.
         let l0 = layer_render_style(d, "Walls");
         render_style_for_block_sub(d, e, ins, l0.pat_len, l0.pat, l0.lw_px, l0).0
@@ -5056,8 +5963,16 @@ mod layer0_inherit_tests {
         let walls = layer_render_style(&d, "Walls").color;
         let zero = layer_render_style(&d, "0").color;
         let c = resolve(&d, &child("0", Color::ByLayer), walls);
-        assert_eq!(&c[..3], &walls[..3], "layer-0 child must show the insert's layer (Walls)");
-        assert_ne!(&c[..3], &zero[..3], "layer-0 child must NOT show layer 0's own color");
+        assert_eq!(
+            &c[..3],
+            &walls[..3],
+            "layer-0 child must show the insert's layer (Walls)"
+        );
+        assert_ne!(
+            &c[..3],
+            &zero[..3],
+            "layer-0 child must NOT show layer 0's own color"
+        );
     }
 
     #[test]
@@ -5066,7 +5981,11 @@ mod layer0_inherit_tests {
         let walls = layer_render_style(&d, "Walls").color;
         let other = layer_render_style(&d, "Other").color;
         let c = resolve(&d, &child("Other", Color::ByLayer), walls);
-        assert_eq!(&c[..3], &other[..3], "a child on a normal layer keeps its own layer");
+        assert_eq!(
+            &c[..3],
+            &other[..3],
+            "a child on a normal layer keeps its own layer"
+        );
     }
 
     #[test]
@@ -5090,8 +6009,16 @@ mod layer0_inherit_tests {
         }
         let after = render_style_for(&d, &e).0;
         let green = tess_util::aci_to_rgba(&Color::Index(3));
-        assert_eq!(&after[..3], &green[..3], "top-level layer-0 ByLayer must follow layer 0's colour");
-        assert_ne!(&before[..3], &after[..3], "colour must change after recolour");
+        assert_eq!(
+            &after[..3],
+            &green[..3],
+            "top-level layer-0 ByLayer must follow layer 0's colour"
+        );
+        assert_ne!(
+            &before[..3],
+            &after[..3],
+            "colour must change after recolour"
+        );
     }
 
     #[test]
@@ -5100,7 +6027,11 @@ mod layer0_inherit_tests {
         let walls = layer_render_style(&d, "Walls").color;
         let green = tess_util::aci_to_rgba(&Color::Index(3));
         let c = resolve(&d, &child("0", Color::Index(3)), walls);
-        assert_eq!(&c[..3], &green[..3], "an explicit color must win even on layer 0");
+        assert_eq!(
+            &c[..3],
+            &green[..3],
+            "an explicit color must win even on layer 0"
+        );
     }
 
     #[test]
@@ -5113,7 +6044,11 @@ mod layer0_inherit_tests {
         l.common.transparency = Transparency::from_percent(0.5); // 50% transparent
         let c = resolve(&d, &EntityType::Line(l), walls);
         assert_eq!(&c[..3], &walls[..3], "RGB inherited from the insert layer");
-        assert!((c[3] - 0.5).abs() < 0.02, "child's own 50% transparency is kept, got {}", c[3]);
+        assert!(
+            (c[3] - 0.5).abs() < 0.02,
+            "child's own 50% transparency is kept, got {}",
+            c[3]
+        );
     }
 
     #[test]
@@ -5134,14 +6069,65 @@ mod layer0_inherit_tests {
         assert_eq!(color[3], 1.0);
     }
 
+    /// A layout that displays plot styles and plots lineweights still draws
+    /// hairlines while LWDISPLAY is off, as AutoCAD 2025 does on such a
+    /// drawing; turning LWDISPLAY on shows the lineweights.
+    #[test]
+    fn displayed_plot_styles_do_not_turn_lineweights_on() {
+        let mut scene = Scene::new();
+        scene.set_current_layout("Layout1".into());
+        let mut settings = scene.effective_plot_settings().expect("layout settings");
+        settings.current_style_sheet = crate::io::plot_style::MONOCHROME_PLOT_STYLE.into();
+        settings.flags.show_plot_styles = true;
+        settings.flags.print_lineweights = true;
+        assert!(scene.set_layout_plot_settings("Layout1", &settings));
+
+        scene.document.header.lineweight_display = false;
+        assert!(!scene.lineweights_on_screen());
+        scene.document.header.lineweight_display = true;
+        assert!(scene.lineweights_on_screen());
+    }
+
+    /// Displayed plot styles recolour a repeated block's stubbed copies too,
+    /// not only its first copy. (#2030)
+    #[test]
+    fn display_plot_style_reaches_stubbed_block_copies() {
+        use crate::scene::model::instance_model::{expand_stubs, stub_wire, RenderInstance};
+        let mut scene = Scene::new();
+        scene.set_current_layout("Layout1".into());
+        let mut settings = scene.effective_plot_settings().expect("layout settings");
+        settings.current_style_sheet = crate::io::plot_style::MONOCHROME_PLOT_STYLE.into();
+        settings.flags.show_plot_styles = true;
+        assert!(scene.set_layout_plot_settings("Layout1", &settings));
+        let magenta = [1.0, 0.0, 1.0, 1.0];
+        let points = vec![[0.0; 3], [1.0, 0.0, 0.0]];
+        let mut copy = WireModel::solid("1".into(), points, magenta, false);
+        copy.aci = 6;
+        copy.render_instance = Some(RenderInstance {
+            source_id: 1,
+            translation: [0.0; 3],
+        });
+        let mut stub = stub_wire(
+            Arc::new(vec![copy]),
+            [0.0, 0.0, 1.0, 0.0],
+            [5.0, 0.0, 0.0],
+            0.0,
+        );
+        stub.name = "1".into();
+        let (styled, _) = scene.display_styled_wires(Arc::new(vec![stub]), 1);
+        let styled = expand_stubs(&styled);
+        assert_eq!(styled.len(), 1);
+        assert_eq!(styled[0].color[..3], [0.0; 3]);
+    }
+
     #[test]
     fn render_environment_caching_and_face3d_fast_path() {
         let mut scene = Scene::new();
         assert!(!scene.has_face3d());
 
-        scene.add_entity(EntityType::Line(codec::entities::Line::from_points(
-            codec::types::Vector3::new(0.0, 0.0, 0.0),
-            codec::types::Vector3::new(10.0, 10.0, 0.0),
+        scene.add_entity(EntityType::Line(document::entities::Line::from_points(
+            document::types::Vector3::new(0.0, 0.0, 0.0),
+            document::types::Vector3::new(10.0, 10.0, 0.0),
         )));
         assert!(!scene.has_face3d());
 
@@ -5158,17 +6144,17 @@ mod layer0_inherit_tests {
         assert_eq!(bg.fog_params, bg2.fog_params);
 
         // Test multiple Face3D additions and removals
-        let face1 = codec::entities::Face3D::new(
-            codec::types::Vector3::new(0.0, 0.0, 0.0),
-            codec::types::Vector3::new(10.0, 0.0, 0.0),
-            codec::types::Vector3::new(10.0, 10.0, 0.0),
-            codec::types::Vector3::new(0.0, 10.0, 0.0),
+        let face1 = document::entities::Face3D::new(
+            document::types::Vector3::new(0.0, 0.0, 0.0),
+            document::types::Vector3::new(10.0, 0.0, 0.0),
+            document::types::Vector3::new(10.0, 10.0, 0.0),
+            document::types::Vector3::new(0.0, 10.0, 0.0),
         );
-        let face2 = codec::entities::Face3D::new(
-            codec::types::Vector3::new(10.0, 0.0, 0.0),
-            codec::types::Vector3::new(20.0, 0.0, 0.0),
-            codec::types::Vector3::new(20.0, 10.0, 0.0),
-            codec::types::Vector3::new(10.0, 10.0, 0.0),
+        let face2 = document::entities::Face3D::new(
+            document::types::Vector3::new(10.0, 0.0, 0.0),
+            document::types::Vector3::new(20.0, 0.0, 0.0),
+            document::types::Vector3::new(20.0, 10.0, 0.0),
+            document::types::Vector3::new(10.0, 10.0, 0.0),
         );
         let fh1 = scene.add_entity(EntityType::Face3D(face1));
         assert!(scene.has_face3d());
@@ -5178,40 +6164,49 @@ mod layer0_inherit_tests {
         // Removing 1 of 2 faces must leave has_face3d() true!
         scene.document.remove_entity(fh1);
         scene.bump_entities(&[(fh1, crate::scene::ChangeKind::Removed)]);
-        assert!(scene.has_face3d(), "has_face3d must remain true while fh2 still exists");
+        assert!(
+            scene.has_face3d(),
+            "has_face3d must remain true while fh2 still exists"
+        );
 
         // Removing the 2nd face must update has_face3d() to false.
         scene.document.remove_entity(fh2);
         scene.bump_entities(&[(fh2, crate::scene::ChangeKind::Removed)]);
-        assert!(!scene.has_face3d(), "has_face3d must become false when all Face3Ds are removed");
+        assert!(
+            !scene.has_face3d(),
+            "has_face3d must become false when all Face3Ds are removed"
+        );
 
         // bump_geometry_no_blocks must also invalidate has_face3d
-        let fh3 = scene.add_entity(EntityType::Face3D(codec::entities::Face3D::new(
-            codec::types::Vector3::new(0.0, 0.0, 0.0),
-            codec::types::Vector3::new(1.0, 1.0, 1.0),
-            codec::types::Vector3::new(2.0, 2.0, 2.0),
-            codec::types::Vector3::new(3.0, 3.0, 3.0),
+        let fh3 = scene.add_entity(EntityType::Face3D(document::entities::Face3D::new(
+            document::types::Vector3::new(0.0, 0.0, 0.0),
+            document::types::Vector3::new(1.0, 1.0, 1.0),
+            document::types::Vector3::new(2.0, 2.0, 2.0),
+            document::types::Vector3::new(3.0, 3.0, 3.0),
         )));
         assert!(scene.has_face3d());
         scene.document.remove_entity(fh3);
         scene.bump_geometry_no_blocks();
-        assert!(!scene.has_face3d(), "bump_geometry_no_blocks must invalidate has_face3d");
+        assert!(
+            !scene.has_face3d(),
+            "bump_geometry_no_blocks must invalidate has_face3d"
+        );
     }
 
     #[test]
     fn split_face3d_wires_correctness_and_parity() {
-        let mut doc = codec::CadDocument::new();
-        let face = codec::entities::Face3D::new(
-            codec::types::Vector3::new(0.0, 0.0, 0.0),
-            codec::types::Vector3::new(10.0, 0.0, 0.0),
-            codec::types::Vector3::new(10.0, 10.0, 0.0),
-            codec::types::Vector3::new(0.0, 10.0, 0.0),
+        let mut doc = document::Document::new();
+        let face = document::entities::Face3D::new(
+            document::types::Vector3::new(0.0, 0.0, 0.0),
+            document::types::Vector3::new(10.0, 0.0, 0.0),
+            document::types::Vector3::new(10.0, 10.0, 0.0),
+            document::types::Vector3::new(0.0, 10.0, 0.0),
         );
         let face_h = doc.add_entity(EntityType::Face3D(face)).unwrap();
 
-        let line = codec::entities::Line::from_points(
-            codec::types::Vector3::new(0.0, 0.0, 0.0),
-            codec::types::Vector3::new(5.0, 5.0, 0.0),
+        let line = document::entities::Line::from_points(
+            document::types::Vector3::new(0.0, 0.0, 0.0),
+            document::types::Vector3::new(5.0, 5.0, 0.0),
         );
         let line_h = doc.add_entity(EntityType::Line(line)).unwrap();
 
@@ -5269,7 +6264,12 @@ mod layer0_inherit_tests {
         let missing = "non_existent_background_image_test_file.png";
         assert!(scene.background_image(missing).is_none());
         assert!(scene.background_image_cache.borrow().contains_key(missing));
-        assert!(scene.background_image_cache.borrow().get(missing).unwrap().is_none());
+        assert!(scene
+            .background_image_cache
+            .borrow()
+            .get(missing)
+            .unwrap()
+            .is_none());
 
         // Second call hits cache
         assert!(scene.background_image(missing).is_none());
@@ -5283,7 +6283,7 @@ mod layer0_inherit_tests {
     fn render_environment_objects_cache_and_apply() {
         let mut scene = Scene::new();
 
-        let mut renv = codec::objects::RenderEnvironment::default();
+        let mut renv = document::objects::RenderEnvironment::default();
         renv.fog_enabled = true;
         renv.fog_color = [100, 150, 200];
         renv.fog_background_enabled = true;
@@ -5295,8 +6295,8 @@ mod layer0_inherit_tests {
         let handle = Handle::new(42);
         scene.document.objects.insert(
             handle,
-            codec::objects::ObjectType::ClassObject(codec::objects::ClassObject::new(
-                codec::objects::ClassObjectData::RenderEnvironment(renv),
+            document::objects::ObjectType::ClassObject(document::objects::ClassObject::new(
+                document::objects::ClassObjectData::RenderEnvironment(renv),
             )),
         );
         scene.object_data_cache = crate::entities::object_data::build_cache(&scene.document);
@@ -5327,4 +6327,169 @@ mod layer0_inherit_tests {
         // Cache must be populated
         assert!(scene.document_render_env_cache.borrow().is_some());
     }
+}
+
+/// The display's device pixels per logical pixel, as the viewport last drew.
+static DEVICE_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f80_0000);
+
+/// Device pixels per logical pixel of the drawing viewport.
+pub fn device_scale() -> f32 {
+    f32::from_bits(DEVICE_SCALE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The edges of a solid in its own coordinates: the two ends of each pair,
+/// one after the other.
+fn local_edge_points(edges: &[[f32; 3]], edges_low: &[[f32; 3]]) -> Vec<[f64; 3]> {
+    let mut points = Vec::with_capacity(edges.len());
+    for pair_start in (0..edges.len().saturating_sub(1)).step_by(2) {
+        for index in [pair_start, pair_start + 1] {
+            let high = edges[index];
+            let low = edges_low.get(index).copied().unwrap_or([0.0; 3]);
+            points.push([
+                high[0] as f64 + low[0] as f64,
+                high[1] as f64 + low[1] as f64,
+                high[2] as f64 + low[2] as f64,
+            ]);
+        }
+    }
+    points
+}
+
+/// The edge outline of a highlighted solid: its edge pairs as one line broken
+/// between pairs, placed by `transform` when the solid is a block's.
+fn placed_edge_points(
+    pairs: &[[f64; 3]],
+    transform: Option<&document::types::Transform>,
+) -> Vec<[f64; 3]> {
+    let mut points = Vec::with_capacity(pairs.len() / 2 * 3);
+    for pair in pairs.chunks_exact(2) {
+        for local in pair {
+            let local = document::types::Vector3::new(local[0], local[1], local[2]);
+            let world = transform.map_or(local, |transform| transform.apply(local));
+            points.push([world.x, world.y, world.z]);
+        }
+        points.push([f64::NAN; 3]);
+    }
+    points
+}
+
+/// What the outlines of one build share: the step of the view's scale they
+/// are built for, and the edges of each solid geometry as thinned for a step
+/// (see [`crate::scene::outline_detail`]).
+struct OutlineDetail {
+    step: Option<i32>,
+    edges: rustc_hash::FxHashMap<(usize, Option<i32>), Arc<Vec<[f64; 3]>>>,
+}
+
+impl OutlineDetail {
+    fn new(step: Option<i32>) -> Self {
+        Self {
+            step,
+            edges: rustc_hash::FxHashMap::default(),
+        }
+    }
+
+    /// The step of the scale `set` shows at: the view's, and what its
+    /// reference stretches it by. `None` outlines it in full.
+    fn step_of(&self, set: &crate::scene::model::mesh_model::MeshLodSet) -> Option<i32> {
+        let step = self.step?;
+        // The longest a unit of the solid gets where the reference places it.
+        let stretch = set.instance_transform.as_ref().map_or(1.0, |transform| {
+            let m = &transform.matrix.m;
+            (0..3)
+                .map(|column| (0..3).map(|row| m[row][column].powi(2)).sum::<f64>())
+                .fold(0.0, f64::max)
+                .sqrt()
+        });
+        Some(step + crate::scene::outline_detail::step(stretch)?)
+    }
+
+    /// The edges of `set` for the scale of `step`, in its own coordinates.
+    /// References of one block share their edges, and so the answer.
+    fn edges(
+        &mut self,
+        set: &crate::scene::model::mesh_model::MeshLodSet,
+        step: Option<i32>,
+    ) -> Arc<Vec<[f64; 3]>> {
+        let (edges, edges_low) = set.geometry_edges();
+        let key = (edges.as_ptr() as usize, step);
+        if let Some(found) = self.edges.get(&key) {
+            return Arc::clone(found);
+        }
+        let whole = local_edge_points(edges, edges_low);
+        let shown = Arc::new(match step {
+            Some(step) => crate::scene::outline_detail::simplified(
+                &whole,
+                crate::scene::outline_detail::small_line(step),
+            ),
+            None => whole,
+        });
+        self.edges.insert(key, Arc::clone(&shown));
+        shown
+    }
+}
+
+fn edge_outline(name: String, points: Vec<[f64; 3]>, tint: [f32; 4], selected: bool) -> WireModel {
+    let mut wire = WireModel::solid_f64(name, points, tint, selected);
+    wire.line_weight_px = 2.0;
+    wire
+}
+
+/// The edge outline of a solid that a block reference only moves: the block's
+/// own outline, built once for every reference that shares its geometry, and
+/// a stub that moves it. The GPU draws such stubs as instances of the one
+/// outline, as it draws the references themselves, instead of each reference
+/// carrying a copy of every edge point (#1872). `None` when the solid is not
+/// a block's, or the reference turns, scales or mirrors it.
+fn moved_edge_outline(
+    set: &crate::scene::model::mesh_model::MeshLodSet,
+    prototypes: &mut rustc_hash::FxHashMap<(usize, bool, Option<i32>), Arc<Vec<WireModel>>>,
+    detail: &mut OutlineDetail,
+    level: Option<i32>,
+    name: &str,
+    tint: [f32; 4],
+    selected: bool,
+) -> Option<WireModel> {
+    let source = set.instance_source.as_ref()?;
+    let delta = translation_only(set.instance_transform.as_ref()?)?;
+    if source.edge_verts.len() < 2 {
+        return None;
+    }
+    let prototype = prototypes
+        // The tint follows `selected`, so a hovered and a selected
+        // reference of one block each get their own shape; so does each
+        // step of scale.
+        .entry((Arc::as_ptr(source) as usize, selected, level))
+        .or_insert_with(|| {
+            let points = placed_edge_points(&detail.edges(set, level), None);
+            let mut outline = edge_outline(name.to_string(), points, tint, selected);
+            outline.render_instance = Some(crate::scene::model::instance_model::RenderInstance {
+                source_id: crate::scene::model::instance_model::next_source_id(),
+                translation: [0.0; 3],
+            });
+            Arc::new(vec![outline])
+        });
+    let mut stub = WireModel::solid_f64(name.to_string(), Vec::new(), tint, selected);
+    stub.line_weight_px = 2.0;
+    stub.stub = Some(Arc::new(
+        crate::scene::model::instance_model::InstanceStub {
+            prototype: Arc::clone(prototype),
+            delta,
+            depth_delta: 0.0,
+        },
+    ));
+    Some(stub)
+}
+
+/// The move of a transform that only moves.
+fn translation_only(transform: &document::types::Transform) -> Option<[f64; 3]> {
+    let m = &transform.matrix.m;
+    let identity = (0..3).all(|row| {
+        (0..3).all(|column| {
+            let expected = if row == column { 1.0 } else { 0.0 };
+            (m[row][column] - expected).abs() <= 1e-12
+        })
+    }) && m[3] == [0.0, 0.0, 0.0, 1.0];
+    let delta = [m[0][3], m[1][3], m[2][3]];
+    (identity && delta.iter().all(|value| value.is_finite())).then_some(delta)
 }

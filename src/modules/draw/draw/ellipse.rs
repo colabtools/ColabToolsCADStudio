@@ -1,13 +1,14 @@
 // Ellipse tool — ribbon dropdown + all OpenCADStudio ellipse creation methods.
 //
 // Commands:
-//   ELLIPSE      — Center, Axes  (center → major endpoint → minor distance)
-//   ELLIPSE_AXIS — Axis, End     (axis endpoint 1 → endpoint 2 → minor distance)
+//   ELLIPSE_CENTER — Center, Axes  (center → major endpoint → minor distance)
+//   ELLIPSE        — Axis, End     (axis endpoint 1 → endpoint 2 → minor distance),
+//                    AutoCAD's default; ELLIPSE_AXIS is kept as an alias
 //   ELLIPSE_ARC  — Ellipse Arc   (shape as above, then start/end parametric angles)
 
-use codec::types::Vector3;
-use codec::{Ellipse, EntityType};
 use crate::t;
+use document::types::Vector3;
+use document::{Ellipse, EntityType};
 
 use crate::command::{CadCommand, CmdResult, WorkingPlane};
 use crate::modules::IconKind;
@@ -41,8 +42,8 @@ const ICON_ARC: IconKind = IconKind::Svg(include_bytes!(
 pub const DROPDOWN_ID: &str = "ELLIPSE";
 
 pub const DROPDOWN_ITEMS: &[(&str, &str, IconKind)] = &[
-    ("ELLIPSE", "Center, Axes", ICON_CTR),
-    ("ELLIPSE_AXIS", "Axis, End", ICON_AXIS),
+    ("ELLIPSE_CENTER", "Center, Axes", ICON_CTR),
+    ("ELLIPSE", "Axis, End", ICON_AXIS),
     ("ELLIPSE_ARC", "Ellipse Arc", ICON_ARC),
 ];
 
@@ -97,7 +98,8 @@ fn param_angle(center: DVec3, major_dir: DVec3, v: DVec3, pt: DVec3, ratio: f64)
     v_proj.atan2(u_proj * ratio).rem_euclid(TAU)
 }
 
-/// Build the final Ellipse entity.
+/// Build the final entity: a true ellipse, or under PELLIPSE 1 its
+/// polyline approximation.
 fn make_ellipse(
     center: DVec3,
     major: DVec3,
@@ -105,8 +107,13 @@ fn make_ellipse(
     t_start: f64,
     t_end: f64,
     plane: WorkingPlane,
-) -> Ellipse {
-    Ellipse {
+) -> EntityType {
+    if crate::modules::draw::defaults::get_pellipse() {
+        if let Some(polyline) = ellipse_polyline(center, major, ratio, t_start, t_end, plane) {
+            return polyline;
+        }
+    }
+    EntityType::Ellipse(Ellipse {
         center: Vector3::new(center.x, center.y, center.z),
         major_axis: Vector3::new(major.x, major.y, major.z),
         minor_axis_ratio: ratio,
@@ -114,7 +121,53 @@ fn make_ellipse(
         end_parameter: t_end,
         normal: Vector3::new(plane.z.x, plane.z.y, plane.z.z),
         ..Default::default()
+    })
+}
+
+/// PELLIPSE 1: two tangent arcs per eighth of the ellipse (16 for a full
+/// one), fitted through on-curve points with the exact tangents there. An
+/// elliptical arc becomes an open polyline over its sweep.
+fn ellipse_polyline(
+    center: DVec3,
+    major: DVec3,
+    ratio: f64,
+    t_start: f64,
+    t_end: f64,
+    plane: WorkingPlane,
+) -> Option<EntityType> {
+    use document::entities::{LwPolyline, LwVertex};
+    use document::types::Vector2;
+    let r_major = major.length();
+    if r_major < 1e-9 {
+        return None;
     }
+    let v = plane.z.cross(major / r_major).normalize_or(plane.y) * r_major * ratio;
+    let sweep = (t_end - t_start).rem_euclid(TAU);
+    let closed = sweep < 1e-9;
+    let sweep = if closed { TAU } else { sweep };
+    let spans = (sweep / (TAU / 8.0) - 1e-9).ceil().max(1.0) as usize;
+    let count = if closed { spans } else { spans + 1 };
+    let (mut points, mut tangents) = (Vec::with_capacity(count), Vec::with_capacity(count));
+    for i in 0..count {
+        let t = t_start + sweep * i as f64 / spans as f64;
+        let point = plane.to_local(center + t.cos() * major + t.sin() * v);
+        let tangent = plane.vector_to_local(-t.sin() * major + t.cos() * v);
+        points.push([point.x, point.y]);
+        tangents.push(Some([tangent.x, tangent.y]));
+    }
+    let fitted = ocs_geom::geom2d::fit_arc_chain(&points, closed, &tangents)?;
+    let mut polyline = LwPolyline::new();
+    polyline.is_closed = closed;
+    polyline.elevation = plane.to_local(center).z;
+    polyline.vertices = fitted
+        .into_iter()
+        .map(|fitted| {
+            let mut vertex = LwVertex::new(Vector2::new(fitted.point[0], fitted.point[1]));
+            vertex.bulge = fitted.bulge;
+            vertex
+        })
+        .collect();
+    Some(plane.place_entity(EntityType::LwPolyline(polyline)))
 }
 
 // ── 1. Center mode ────────────────────────────────────────────────────────
@@ -129,6 +182,12 @@ enum CtrStep {
 pub struct EllipseCommand {
     step: CtrStep,
     plane: WorkingPlane,
+}
+
+impl Default for EllipseCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EllipseCommand {
@@ -146,7 +205,7 @@ impl CadCommand for EllipseCommand {
     }
 
     fn name(&self) -> &'static str {
-        "ELLIPSE"
+        "ELLIPSE_CENTER"
     }
 
     fn prompt(&self) -> String {
@@ -164,10 +223,7 @@ impl CadCommand for EllipseCommand {
     fn options(&self) -> Vec<crate::command::CmdOption> {
         use crate::command::CmdOption;
         match self.step {
-            CtrStep::Center => vec![
-                CmdOption::new("Arc", "ARC"),
-                CmdOption::new("Axis", "AXIS"),
-            ],
+            CtrStep::Center => vec![CmdOption::new("Arc", "ARC"), CmdOption::new("aXis", "AXIS")],
             _ => vec![],
         }
     }
@@ -193,9 +249,7 @@ impl CadCommand for EllipseCommand {
             CtrStep::MinorRatio { center, major } => {
                 let (center, major) = (*center, *major);
                 let ratio = minor_ratio(center, major, pt);
-                CmdResult::CommitAndExit(EntityType::Ellipse(make_ellipse(
-                    center, major, ratio, 0.0, TAU, self.plane,
-                )))
+                CmdResult::CommitAndExit(make_ellipse(center, major, ratio, 0.0, TAU, self.plane))
             }
         }
     }
@@ -210,7 +264,7 @@ impl CadCommand for EllipseCommand {
         if matches!(self.step, CtrStep::Center) {
             return match text.trim().to_uppercase().as_str() {
                 "A" | "ARC" => Some(CmdResult::Dispatch("ELLIPSE_ARC".into())),
-                "AXIS" => Some(CmdResult::Dispatch("ELLIPSE_AXIS".into())),
+                "X" | "AXIS" => Some(CmdResult::Dispatch("ELLIPSE".into())),
                 _ => None,
             };
         }
@@ -218,9 +272,9 @@ impl CadCommand for EllipseCommand {
             let r_minor = parse_num(text)?;
             if r_minor > 0.0 {
                 let ratio = (r_minor / major.length()).clamp(1e-6, 1.0);
-                return Some(CmdResult::CommitAndExit(EntityType::Ellipse(make_ellipse(
+                return Some(CmdResult::CommitAndExit(make_ellipse(
                     *center, *major, ratio, 0.0, TAU, self.plane,
-                ))));
+                )));
             }
         }
         None
@@ -277,6 +331,12 @@ pub struct EllipseAxisCommand {
     plane: WorkingPlane,
 }
 
+impl Default for EllipseAxisCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EllipseAxisCommand {
     pub fn new() -> Self {
         Self {
@@ -292,7 +352,19 @@ impl CadCommand for EllipseAxisCommand {
     }
 
     fn name(&self) -> &'static str {
-        "ELLIPSE_AXIS"
+        "ELLIPSE"
+    }
+
+    fn options(&self) -> Vec<crate::command::CmdOption> {
+        use crate::command::CmdOption;
+        match self.step {
+            AxisStep::Pt1 => vec![CmdOption::new("Arc", "ARC"), CmdOption::new("Center", "C")],
+            _ => vec![],
+        }
+    }
+
+    fn point_step_accepts_keywords(&self) -> bool {
+        matches!(self.step, AxisStep::Pt1)
     }
 
     fn prompt(&self) -> String {
@@ -326,9 +398,7 @@ impl CadCommand for EllipseAxisCommand {
             AxisStep::MinorRatio { center, major } => {
                 let (center, major) = (*center, *major);
                 let ratio = minor_ratio(center, major, pt);
-                CmdResult::CommitAndExit(EntityType::Ellipse(make_ellipse(
-                    center, major, ratio, 0.0, TAU, self.plane,
-                )))
+                CmdResult::CommitAndExit(make_ellipse(center, major, ratio, 0.0, TAU, self.plane))
             }
         }
     }
@@ -338,13 +408,21 @@ impl CadCommand for EllipseAxisCommand {
     }
 
     fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
+        // AutoCAD's ELLIPSE: an axis endpoint, or [Arc/Center].
+        if matches!(self.step, AxisStep::Pt1) {
+            return match text.trim().to_uppercase().as_str() {
+                "A" | "ARC" => Some(CmdResult::Dispatch("ELLIPSE_ARC".into())),
+                "C" | "CENTER" => Some(CmdResult::Dispatch("ELLIPSE_CENTER".into())),
+                _ => None,
+            };
+        }
         if let AxisStep::MinorRatio { center, major } = &self.step {
             let r_minor = parse_num(text)?;
             if r_minor > 0.0 {
                 let ratio = (r_minor / major.length()).clamp(1e-6, 1.0);
-                return Some(CmdResult::CommitAndExit(EntityType::Ellipse(make_ellipse(
+                return Some(CmdResult::CommitAndExit(make_ellipse(
                     *center, *major, ratio, 0.0, TAU, self.plane,
-                ))));
+                )));
             }
         }
         None
@@ -418,6 +496,12 @@ pub struct EllipseArcCommand {
     plane: WorkingPlane,
 }
 
+impl Default for EllipseArcCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EllipseArcCommand {
     pub fn new() -> Self {
         Self {
@@ -441,7 +525,9 @@ impl CadCommand for EllipseArcCommand {
     fn prompt(&self) -> String {
         match &self.step {
             ArcStep::Center => t!("ELLIPSE ARC  Specify center:").into_owned(),
-            ArcStep::MajorAxis { .. } => t!("ELLIPSE ARC  Specify major axis endpoint:").into_owned(),
+            ArcStep::MajorAxis { .. } => {
+                t!("ELLIPSE ARC  Specify major axis endpoint:").into_owned()
+            }
             ArcStep::MinorRatio { major, .. } => {
                 let r = format!("{:.3}", major.length());
                 t!(
@@ -517,7 +603,7 @@ impl CadCommand for EllipseArcCommand {
                 } else {
                     make_ellipse(center, major, ratio, t_start, t_end, self.plane)
                 };
-                CmdResult::CommitAndExit(EntityType::Ellipse(entity))
+                CmdResult::CommitAndExit(entity)
             }
         }
     }
@@ -573,9 +659,9 @@ impl CadCommand for EllipseArcCommand {
             } => {
                 // Positive is CCW; negative is CW.
                 let t_end = val;
-                return Some(CmdResult::CommitAndExit(EntityType::Ellipse(make_ellipse(
+                return Some(CmdResult::CommitAndExit(make_ellipse(
                     *center, *major, *ratio, *t_start, t_end, self.plane,
-                ))));
+                )));
             }
             _ => {}
         }
@@ -707,8 +793,77 @@ fn line_wire(from: DVec3, to: DVec3) -> WireModel {
     )
 }
 
-
 // ── Autocomplete registry ─────────────────────────────────
-inventory::submit!(crate::command::CommandRegistration { names: &["ELLIPSE_ARC"] });  // EllipseArcCommand
-inventory::submit!(crate::command::CommandRegistration { names: &["ELLIPSE_AXIS"] });  // EllipseAxisCommand
-inventory::submit!(crate::command::CommandRegistration { names: &["ELLIPSE"] });  // EllipseCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ELLIPSE_ARC"]
+}); // EllipseArcCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ELLIPSE_AXIS"]
+}); // EllipseAxisCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ELLIPSE"]
+}); // EllipseCommand
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ELLIPSE takes the major axis by its two endpoints, as AutoCAD does;
+    /// C switches to the centre method and A to the arc.
+    #[test]
+    fn ellipse_starts_with_the_axis_endpoints() {
+        crate::modules::draw::defaults::set_pellipse(false);
+        let mut command = EllipseAxisCommand::new();
+        assert_eq!(command.name(), "ELLIPSE");
+        command.on_point(DVec3::new(0.0, 0.0, 0.0));
+        command.on_point(DVec3::new(10.0, 0.0, 0.0));
+        let Some(CmdResult::CommitAndExit(EntityType::Ellipse(e))) = command.on_text_input("3")
+        else {
+            panic!("ELLIPSE 0,0 10,0 3 must commit an ellipse");
+        };
+        assert!((e.center.x - 5.0).abs() < 1e-9 && e.center.y.abs() < 1e-9);
+        assert!((e.major_axis.x - 5.0).abs() < 1e-9);
+        assert!((e.minor_axis_ratio - 0.6).abs() < 1e-9);
+        for (keyword, target) in [("C", "ELLIPSE_CENTER"), ("a", "ELLIPSE_ARC")] {
+            let mut command = EllipseAxisCommand::new();
+            assert!(matches!(
+                command.on_text_input(keyword),
+                Some(CmdResult::Dispatch(name)) if name == target
+            ));
+        }
+        assert_eq!(EllipseCommand::new().name(), "ELLIPSE_CENTER");
+    }
+
+    /// PELLIPSE 1: a full ellipse is a closed 16-arc polyline, an elliptical
+    /// arc an open one; every vertex lies on the ellipse.
+    #[test]
+    fn pellipse_polyline_has_sixteen_arcs_on_the_ellipse() {
+        let plane = WorkingPlane::default();
+        let center = DVec3::new(5.0, 2.0, 1.5);
+        let major = DVec3::new(4.0, 0.0, 0.0);
+        let on_ellipse = |entity: &EntityType| {
+            let EntityType::LwPolyline(p) = entity else {
+                panic!("expected a polyline");
+            };
+            // Even vertices are the samples; odd ones the arc joints between.
+            for (i, vertex) in p.vertices.iter().enumerate() {
+                let x = (vertex.location.x - center.x) / 4.0;
+                let y = (vertex.location.y - center.y) / 2.0;
+                let error = (x * x + y * y - 1.0).abs();
+                assert!(error < if i % 2 == 0 { 1e-9 } else { 0.03 }, "{i}: {error}");
+            }
+            assert!((p.elevation - center.z).abs() < 1e-9);
+            p.clone()
+        };
+        let full = ellipse_polyline(center, major, 0.5, 0.0, TAU, plane).unwrap();
+        let full = on_ellipse(&full);
+        assert!(full.is_closed);
+        assert_eq!(full.vertices.len(), 16);
+        assert!(full.vertices.iter().all(|v| v.bulge > 0.0));
+
+        let arc = ellipse_polyline(center, major, 0.5, 0.0, TAU / 4.0, plane).unwrap();
+        let arc = on_ellipse(&arc);
+        assert!(!arc.is_closed);
+        assert_eq!(arc.vertices.len(), 5);
+    }
+}

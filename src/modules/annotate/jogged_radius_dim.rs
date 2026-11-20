@@ -1,7 +1,7 @@
-use codec::entities::{Dimension, DimensionLargeRadial};
-use codec::types::{Handle, Vector3};
-use codec::EntityType;
-use glam::{DVec3, Vec3};
+use document::entities::{Dimension, DimensionLargeRadial};
+use document::types::{Handle, Vector3};
+use document::EntityType;
+use glam::DVec3;
 
 use crate::command::{
     CadCommand, CmdOption, CmdResult, DimensionAssociationInput, DimensionAssociationSource,
@@ -108,7 +108,10 @@ impl JoggedRadiusDimensionCommand {
         dimension.override_center = v3(override_center);
         dimension.jog_point = v3(jog);
         dimension.jog_angle = self.defaults.jog_angle;
-        dimension.base.style_name.clone_from(&self.defaults.style_name);
+        dimension
+            .base
+            .style_name
+            .clone_from(&self.defaults.style_name);
         dimension.base.text_middle_point = v3(text_position);
         dimension.base.insertion_point = v3(text_position);
         dimension.base.text_user_positioned = true;
@@ -135,9 +138,9 @@ impl JoggedRadiusDimensionCommand {
         );
 
         CmdResult::CommitDimension {
-            entity: plane.place_entity(EntityType::Dimension(Dimension::LargeRadial(
+            entity: plane.place_entity(EntityType::Dimension(Box::new(Dimension::LargeRadial(
                 dimension,
-            ))),
+            )))),
             association,
             preserve_base_style: false,
             continue_command: false,
@@ -160,16 +163,13 @@ impl CadCommand for JoggedRadiusDimensionCommand {
             return t!("DIMJOGGED  Specify text angle (degrees):").into_owned();
         }
         match self.step {
-            Step::SelectObject => {
-                t!("DIMJOGGED  Select arc, circle, or polyline arc:").into_owned()
-            }
+            Step::SelectObject => t!("DIMJOGGED  Select arc or circle:").into_owned(),
             Step::OverrideCenter(_) => {
                 t!("DIMJOGGED  Specify center location override:").into_owned()
             }
-            Step::DimLine { .. } => t!(
-                "DIMJOGGED  Specify dimension line location  [Mtext/Text/Angle]:"
-            )
-            .into_owned(),
+            Step::DimLine { .. } => {
+                t!("DIMJOGGED  Specify dimension line location  [Mtext/Text/Angle]:").into_owned()
+            }
             Step::Jog { .. } => t!("DIMJOGGED  Specify jog location:").into_owned(),
         }
     }
@@ -201,13 +201,7 @@ impl CadCommand for JoggedRadiusDimensionCommand {
                 override_center,
                 chord,
                 text_position,
-            } => self.commit_dimension(
-                source,
-                override_center,
-                chord,
-                text_position,
-                point,
-            ),
+            } => self.commit_dimension(source, override_center, chord, text_position, point),
         }
     }
 
@@ -242,9 +236,7 @@ impl CadCommand for JoggedRadiusDimensionCommand {
     }
 
     fn options(&self) -> Vec<CmdOption> {
-        if matches!(self.step, Step::DimLine { .. })
-            && !self.awaiting_text
-            && !self.awaiting_angle
+        if matches!(self.step, Step::DimLine { .. }) && !self.awaiting_text && !self.awaiting_angle
         {
             vec![
                 CmdOption::new("MText", "MTEXT"),
@@ -348,21 +340,20 @@ impl CadCommand for JoggedRadiusDimensionCommand {
     fn on_mouse_move(&mut self, point: DVec3) -> Option<WireModel> {
         match self.step {
             Step::SelectObject => None,
-            Step::OverrideCenter(source) => Some(preview_wire(vec![
-                dvec(source.center_world()).as_vec3(),
-                point.as_vec3(),
-            ])),
+            Step::OverrideCenter(source) => {
+                Some(preview_wire(vec![dvec(source.center_world()), point]))
+            }
             Step::DimLine {
                 source,
                 override_center,
             } => {
                 let chord = dvec(source.chord_at(point.to_array()));
                 Some(preview_wire(vec![
-                    override_center.as_vec3(),
-                    chord.as_vec3(),
-                    Vec3::splat(f32::NAN),
-                    chord.as_vec3(),
-                    point.as_vec3(),
+                    override_center,
+                    chord,
+                    DVec3::splat(f64::NAN),
+                    chord,
+                    point,
                 ]))
             }
             Step::Jog {
@@ -384,7 +375,7 @@ impl CadCommand for JoggedRadiusDimensionCommand {
                 Some(preview_wire(
                     [chord_local, near, far, override_local]
                         .into_iter()
-                        .map(|position| plane.to_world(position).as_vec3())
+                        .map(|position| plane.to_world(position))
                         .collect(),
                 ))
             }
@@ -439,12 +430,7 @@ fn project_jog(override_center: DVec3, chord: DVec3, point: DVec3) -> DVec3 {
     override_center + line * factor
 }
 
-fn jog_break(
-    chord: DVec3,
-    jog: DVec3,
-    override_center: DVec3,
-    jog_angle: f64,
-) -> (DVec3, DVec3) {
+fn jog_break(chord: DVec3, jog: DVec3, override_center: DVec3, jog_angle: f64) -> (DVec3, DVec3) {
     let radial = (chord - override_center).normalize_or_zero();
     let (sin, cos) = jog_angle.sin_cos();
     let transverse = DVec3::new(
@@ -471,42 +457,15 @@ fn dvec(point: Vector3) -> DVec3 {
     DVec3::new(point.x, point.y, point.z)
 }
 
-fn preview_wire(points: Vec<Vec3>) -> WireModel {
-    WireModel {
-        bg_adapt: None,
-        point_marker: None,
-        taper_widths: Vec::new(),
-        pattern_stations: Vec::new(),
-        world_width: 0.0,
-        depth_override: None,
-        display_visible: true,
-        snap_only: false,
-        plot_visible: true,
-        fill_is_3d: false,
-        fill_is_2d_solid: false,
-        render_instance: None,
-        pick_tris: Vec::new(),
-        pick_tris_low: Vec::new(),
-        dash_from_start: false,
-        dash_align_end: None,
-        text_verts: Vec::new(),
-        name: "dimjogged_preview".to_string(),
-        points: points.into_iter().map(|point| point.to_array()).collect(),
-        points_low: Vec::new(),
-        color: WireModel::CYAN,
-        selected: false,
-        pattern_length: 0.0,
-        pattern: [0.0; 8],
-        line_weight_px: 1.0,
-        snap_pts: Vec::new(),
-        tangent_geoms: Vec::new(),
-        aci: 0,
-        key_vertices: Vec::new(),
-        aabb: WireModel::UNBOUNDED_AABB,
-        plinegen: true,
-        fill_tris: Vec::new(),
-        fill_tris_low: Vec::new(),
-    }
+fn preview_wire(points: Vec<DVec3>) -> WireModel {
+    // Preview geometry is f64; `solid_f64` keeps the residual so the rubber
+    // band stays on the snapped points at UTM-scale coordinates.
+    WireModel::solid_f64(
+        "dimjogged_preview".to_string(),
+        points.into_iter().map(|point| point.to_array()).collect(),
+        WireModel::CYAN,
+        false,
+    )
 }
 
 inventory::submit!(crate::command::CommandRegistration {

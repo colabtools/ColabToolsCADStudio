@@ -12,4 +12,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 ocs_plugin_api = { path = "../../crates/ocs_plugin_api", features = ["host"] }
-acadrust = { git = "https://github.com/HakanSeven12/opencadcodec.git", rev = "8a28c21" }
+# Codec types are re-exported by ocs_plugin_api as `acadrust` so the plugin
+# and the host share one type identity — never add an acadrust git dependency
+# here (it would create mismatching types instead of an ABI check).

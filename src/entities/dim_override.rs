@@ -7,9 +7,10 @@
 //! an override over the style default, so editing one of these rows writes here
 //! and the change round-trips to file.
 
-use codec::types::Color;
-use codec::xdata::{ExtendedData, XDataValue};
-use codec::{CadDocument, EntityType, Handle};
+use document::entities::EntityCommon;
+use document::types::Color;
+use document::xdata::{ExtendedData, XDataValue};
+use document::{Document, EntityType, Handle};
 
 // DXF group codes of the dimension variables surfaced on the leader panel.
 pub const DIMSCALE: i16 = 40; // overall scale       (real)
@@ -172,7 +173,7 @@ pub fn string(xd: &ExtendedData, code: i16) -> Option<String> {
         })
 }
 
-fn write_pairs(doc: &mut CadDocument, handle: Handle, pairs: Vec<(i16, XDataValue)>) {
+fn write_pairs(doc: &mut Document, handle: Handle, pairs: Vec<(i16, XDataValue)>) {
     let Some(entity) = doc.get_entity(handle) else {
         return;
     };
@@ -213,7 +214,7 @@ fn write_pairs(doc: &mut CadDocument, handle: Handle, pairs: Vec<(i16, XDataValu
 }
 
 /// Replace every dimension-variable override on entity `handle`.
-pub fn replace(doc: &mut CadDocument, handle: Handle, values: Vec<(i16, XDataValue)>) {
+pub fn replace(doc: &mut Document, handle: Handle, values: Vec<(i16, XDataValue)>) {
     write_pairs(doc, handle, values);
 }
 
@@ -221,18 +222,32 @@ pub fn replace(doc: &mut CadDocument, handle: Handle, values: Vec<(i16, XDataVal
 /// leaving the other overrides in the record untouched. Clearing the last one
 /// drops the whole `ACAD`/`DSTYLE` record. Legacy `ACAD_DSTYLE` records written
 /// by older OCS versions are migrated when the canonical `ACAD` slot is free.
-pub fn set(doc: &mut CadDocument, handle: Handle, code: i16, value: Option<XDataValue>) {
+pub fn set(doc: &mut Document, handle: Handle, code: i16, value: Option<XDataValue>) {
     let Some(entity) = doc.get_entity(handle) else {
         return;
     };
-    let mut kept: Vec<(i16, XDataValue)> = pairs(&entity.common().extended_data)
-        .into_iter()
-        .filter(|(c, _)| *c != code)
-        .collect();
-    if let Some(v) = value {
-        kept.push((code, v));
-    }
+    let kept = with_pair(pairs(&entity.common().extended_data), code, value);
     write_pairs(doc, handle, kept);
+}
+
+/// `pairs` with `code` set to `value` in its own place (appended when new),
+/// or removed with `None`. Rewriting an override keeps the record's order,
+/// so a dimension refreshed to the same values compares equal to what it was.
+fn with_pair(
+    mut pairs: Vec<(i16, XDataValue)>,
+    code: i16,
+    value: Option<XDataValue>,
+) -> Vec<(i16, XDataValue)> {
+    let at = pairs.iter().position(|(c, _)| *c == code);
+    match (at, value) {
+        (Some(i), Some(v)) => pairs[i].1 = v,
+        (Some(i), None) => {
+            pairs.remove(i);
+        }
+        (None, Some(v)) => pairs.push((code, v)),
+        (None, None) => {}
+    }
+    pairs
 }
 
 /// Set — or, with `value: None`, clear — a single override on an entity that
@@ -245,14 +260,13 @@ pub fn set(doc: &mut CadDocument, handle: Handle, code: i16, value: Option<XData
 /// document. Keeping the override on the entity means it is part of the single
 /// committed object and rides the ordinary undo/redo history.
 pub fn set_on_entity(entity: &mut EntityType, code: i16, value: Option<XDataValue>) {
-    let common = entity.common_mut();
-    let mut kept: Vec<(i16, XDataValue)> = pairs(&common.extended_data)
-        .into_iter()
-        .filter(|(c, _)| *c != code)
-        .collect();
-    if let Some(v) = value {
-        kept.push((code, v));
-    }
+    set_on_common(entity.common_mut(), code, value);
+}
+
+/// [`set_on_entity`] for an entity reached through its own type, such as a
+/// `Dimension` rather than its `EntityType`.
+pub fn set_on_common(common: &mut EntityCommon, code: i16, value: Option<XDataValue>) {
+    let kept = with_pair(pairs(&common.extended_data), code, value);
 
     let legacy = common.extended_data.get_record("ACAD_DSTYLE").is_some()
         && common.extended_data.get_record("ACAD").is_some_and(
@@ -276,22 +290,111 @@ pub fn set_on_entity(entity: &mut EntityType, code: i16, value: Option<XDataValu
         Some(vals)
     };
 
-    let mut rebuilt = ExtendedData::new();
-    for record in common.extended_data.records() {
-        if record.application_name != app && !(!legacy && record.application_name == "ACAD_DSTYLE")
-        {
-            rebuilt.add_record(record.clone());
-        }
-    }
-    if let Some(vals) = values {
-        let mut record = codec::xdata::ExtendedDataRecord::new(app);
+    // The new record takes the old one's place among the entity's records.
+    let mut record = values.map(|vals| {
+        let mut record = document::xdata::ExtendedDataRecord::new(app);
         for v in vals {
             record.add_value(v);
         }
+        record
+    });
+    let mut rebuilt = ExtendedData::new();
+    for existing in common.extended_data.records() {
+        let replaced = existing.application_name == app
+            || (!legacy && existing.application_name == "ACAD_DSTYLE");
+        if !replaced {
+            rebuilt.add_record(existing.clone());
+        } else if let Some(record) = record.take() {
+            rebuilt.add_record(record);
+        }
+    }
+    if let Some(record) = record {
         rebuilt.add_record(record);
     }
     rebuilt.raw_dwg_eed = common.extended_data.raw_dwg_eed.clone();
     common.extended_data = rebuilt;
+}
+
+/// The style fields a dimension-variable override can replace, by group code:
+/// reals, integers, switches, handles and strings.
+macro_rules! style_vars {
+    ($m:ident) => {
+        $m!(real: dimscale DIMSCALE, dimasz DIMASZ, dimexo DIMEXO, dimdli DIMDLI, dimexe DIMEXE,
+            dimrnd DIMRND, dimdle DIMDLE, dimtp DIMTP, dimtm DIMTM, dimfxl DIMFXL,
+            dimjogang DIMJOGANG, dimtxt DIMTXT, dimcen DIMCEN, dimtsz DIMTSZ, dimaltf DIMALTF,
+            dimlfac DIMLFAC, dimtvp DIMTVP, dimtfac DIMTFAC, dimgap DIMGAP, dimaltrnd DIMALTRND,
+            dimaltmzf DIMALTMZF, dimmzf DIMMZF;
+        flag: dimtol DIMTOL, dimlim DIMLIM, dimtih DIMTIH, dimtoh DIMTOH, dimse1 DIMSE1,
+            dimse2 DIMSE2, dimalt DIMALT, dimtofl DIMTOFL, dimsah DIMSAH, dimtix DIMTIX,
+            dimsoxd DIMSOXD, dimsd1 DIMSD1, dimsd2 DIMSD2, dimupt DIMUPT, dimfxlon DIMFXLON,
+            dimtxtdirection DIMTXTDIRECTION;
+        int: dimzin DIMZIN, dimtad DIMTAD, dimazin DIMAZIN, dimarcsym DIMARCSYM, dimclrd DIMCLRD,
+            dimclre DIMCLRE, dimclrt DIMCLRT, dimadec DIMADEC, dimaltd DIMALTD, dimdec DIMDEC,
+            dimtdec DIMTDEC, dimaltu DIMALTU, dimalttd DIMALTTD, dimaunit DIMAUNIT,
+            dimfrac DIMFRAC, dimlunit DIMLUNIT, dimdsep DIMDSEP, dimtmove DIMTMOVE,
+            dimjust DIMJUST, dimtolj DIMTOLJ, dimtzin DIMTZIN, dimaltz DIMALTZ,
+            dimalttz DIMALTTZ, dimatfit DIMATFIT, dimtfill DIMTFILL, dimtfillclr DIMTFILLCLR,
+            dimlwd DIMLWD, dimlwe DIMLWE;
+        handle: dimldrblk DIMLDRBLK, dimblk DIMBLK, dimblk1 DIMBLK1, dimblk2 DIMBLK2,
+            dimltex_handle DIMLTYPE, dimltex1_handle DIMLTEX1, dimltex2_handle DIMLTEX2,
+            dimtxsty_handle DIMTXSTY;
+        text: dimpost DIMPOST, dimapost DIMAPOST, dimaltmzs DIMALTMZS, dimmzs DIMMZS)
+    };
+}
+
+/// `style` with the override `pairs` laid over it. A text style override
+/// carries a handle; its name is the caller's to resolve.
+pub fn apply_pairs(style: &mut document::tables::DimStyle, pairs: &[(i16, XDataValue)]) {
+    macro_rules! apply {
+        (real: $($r:ident $rc:ident),*; flag: $($f:ident $fc:ident),*;
+         int: $($i:ident $ic:ident),*; handle: $($h:ident $hc:ident),*;
+         text: $($t:ident $tc:ident),*) => {
+            for (code, value) in pairs {
+                match (*code, value) {
+                    $(($rc, XDataValue::Real(v) | XDataValue::Distance(v)
+                        | XDataValue::ScaleFactor(v)) => style.$r = *v,)*
+                    $(($fc, XDataValue::Integer16(v)) => style.$f = *v != 0,)*
+                    $(($ic, XDataValue::Integer16(v)) => style.$i = *v,)*
+                    $(($hc, XDataValue::Handle(v)) => style.$h = *v,)*
+                    $(($tc, XDataValue::String(v)) => style.$t = v.clone(),)*
+                    _ => {}
+                }
+            }
+        };
+    }
+    style_vars!(apply);
+}
+
+/// The overrides that turn `base` into `edited`, in group-code order.
+pub fn diff_pairs(
+    base: &document::tables::DimStyle,
+    edited: &document::tables::DimStyle,
+) -> Vec<(i16, XDataValue)> {
+    let mut out = Vec::new();
+    macro_rules! diff {
+        (real: $($r:ident $rc:ident),*; flag: $($f:ident $fc:ident),*;
+         int: $($i:ident $ic:ident),*; handle: $($h:ident $hc:ident),*;
+         text: $($t:ident $tc:ident),*) => {
+            $(if (base.$r - edited.$r).abs() > 1e-12 {
+                out.push(($rc, XDataValue::Real(edited.$r)));
+            })*
+            $(if base.$f != edited.$f {
+                out.push(($fc, XDataValue::Integer16(i16::from(edited.$f))));
+            })*
+            $(if base.$i != edited.$i {
+                out.push(($ic, XDataValue::Integer16(edited.$i)));
+            })*
+            $(if base.$h != edited.$h {
+                out.push(($hc, XDataValue::Handle(edited.$h)));
+            })*
+            $(if base.$t != edited.$t {
+                out.push(($tc, XDataValue::String(edited.$t.clone())));
+            })*
+        };
+    }
+    style_vars!(diff);
+    out.sort_by_key(|(code, _)| *code);
+    out
 }
 
 pub fn property_real_code(field: &str) -> Option<i16> {
@@ -358,6 +461,167 @@ pub fn property_string_code(field: &str) -> Option<i16> {
     })
 }
 
+macro_rules! named_vars {
+    ($($kind:ident: $($code:ident),+;)+) => {
+        &[$($((stringify!($code), $code, VarKind::$kind),)+)+]
+    };
+}
+
+/// How a dimension variable's override value is stored in the record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VarKind {
+    Real,
+    Int,
+    Text,
+}
+
+/// The variables DIMOVERRIDE accepts by name. Block, linetype and text-style
+/// variables are stored as handles and are set from the Properties panel.
+const NAMED_VARS: &[(&str, i16, VarKind)] = named_vars! {
+    Real: DIMSCALE, DIMASZ, DIMEXO, DIMDLI, DIMEXE, DIMRND, DIMDLE, DIMTP, DIMTM, DIMFXL,
+        DIMJOGANG, DIMTXT, DIMCEN, DIMTSZ, DIMALTF, DIMLFAC, DIMTVP, DIMTFAC, DIMGAP,
+        DIMALTRND, DIMALTMZF, DIMMZF;
+    Int: DIMTOL, DIMLIM, DIMTIH, DIMTOH, DIMSE1, DIMSE2, DIMALT, DIMTOFL, DIMSAH, DIMTIX,
+        DIMSOXD, DIMSD1, DIMSD2, DIMUPT, DIMFXLON, DIMTXTDIRECTION, DIMZIN, DIMTAD, DIMAZIN,
+        DIMARCSYM, DIMCLRD, DIMCLRE, DIMCLRT, DIMADEC, DIMALTD, DIMDEC, DIMTDEC, DIMALTU,
+        DIMALTTD, DIMAUNIT, DIMFRAC, DIMLUNIT, DIMDSEP, DIMTMOVE, DIMJUST, DIMTOLJ, DIMTZIN,
+        DIMALTZ, DIMALTTZ, DIMATFIT, DIMTFILL, DIMTFILLCLR, DIMLWD, DIMLWE, DIMTALN;
+    Text: DIMPOST, DIMAPOST, DIMALTMZS, DIMMZS;
+};
+
+/// How DIMOVERRIDE shows a variable's current value (`<2.5000>`): reals to
+/// four places, colours by name for ByBlock and ByLayer.
+pub fn style_value_text(style: &document::tables::DimStyle, code: i16) -> Option<String> {
+    fn color_name(index: i16) -> String {
+        match index {
+            0 => "BYBLOCK".to_string(),
+            256 => "BYLAYER".to_string(),
+            other => other.to_string(),
+        }
+    }
+    Some(match code {
+        DIMSCALE => format!("{:.4}", style.dimscale),
+        DIMASZ => format!("{:.4}", style.dimasz),
+        DIMEXO => format!("{:.4}", style.dimexo),
+        DIMDLI => format!("{:.4}", style.dimdli),
+        DIMEXE => format!("{:.4}", style.dimexe),
+        DIMRND => format!("{:.4}", style.dimrnd),
+        DIMDLE => format!("{:.4}", style.dimdle),
+        DIMTP => format!("{:.4}", style.dimtp),
+        DIMTM => format!("{:.4}", style.dimtm),
+        DIMFXL => format!("{:.4}", style.dimfxl),
+        DIMJOGANG => format!("{:.4}", style.dimjogang),
+        DIMTXT => format!("{:.4}", style.dimtxt),
+        DIMCEN => format!("{:.4}", style.dimcen),
+        DIMTSZ => format!("{:.4}", style.dimtsz),
+        DIMALTF => format!("{:.4}", style.dimaltf),
+        DIMLFAC => format!("{:.4}", style.dimlfac),
+        DIMTVP => format!("{:.4}", style.dimtvp),
+        DIMTFAC => format!("{:.4}", style.dimtfac),
+        DIMGAP => format!("{:.4}", style.dimgap),
+        DIMALTRND => format!("{:.4}", style.dimaltrnd),
+        DIMALTMZF => format!("{:.4}", style.dimaltmzf),
+        DIMMZF => format!("{:.4}", style.dimmzf),
+        DIMTOL => i16::from(style.dimtol).to_string(),
+        DIMLIM => i16::from(style.dimlim).to_string(),
+        DIMTIH => i16::from(style.dimtih).to_string(),
+        DIMTOH => i16::from(style.dimtoh).to_string(),
+        DIMSE1 => i16::from(style.dimse1).to_string(),
+        DIMSE2 => i16::from(style.dimse2).to_string(),
+        DIMALT => i16::from(style.dimalt).to_string(),
+        DIMTOFL => i16::from(style.dimtofl).to_string(),
+        DIMSAH => i16::from(style.dimsah).to_string(),
+        DIMTIX => i16::from(style.dimtix).to_string(),
+        DIMSOXD => i16::from(style.dimsoxd).to_string(),
+        DIMSD1 => i16::from(style.dimsd1).to_string(),
+        DIMSD2 => i16::from(style.dimsd2).to_string(),
+        DIMUPT => i16::from(style.dimupt).to_string(),
+        DIMFXLON => i16::from(style.dimfxlon).to_string(),
+        DIMTXTDIRECTION => i16::from(style.dimtxtdirection).to_string(),
+        DIMZIN => style.dimzin.to_string(),
+        DIMTAD => style.dimtad.to_string(),
+        DIMAZIN => style.dimazin.to_string(),
+        DIMARCSYM => style.dimarcsym.to_string(),
+        DIMADEC => style.dimadec.to_string(),
+        DIMALTD => style.dimaltd.to_string(),
+        DIMDEC => style.dimdec.to_string(),
+        DIMTDEC => style.dimtdec.to_string(),
+        DIMALTU => style.dimaltu.to_string(),
+        DIMALTTD => style.dimalttd.to_string(),
+        DIMAUNIT => style.dimaunit.to_string(),
+        DIMFRAC => style.dimfrac.to_string(),
+        DIMLUNIT => style.dimlunit.to_string(),
+        DIMDSEP => style.dimdsep.to_string(),
+        DIMTMOVE => style.dimtmove.to_string(),
+        DIMJUST => style.dimjust.to_string(),
+        DIMTOLJ => style.dimtolj.to_string(),
+        DIMTZIN => style.dimtzin.to_string(),
+        DIMALTZ => style.dimaltz.to_string(),
+        DIMALTTZ => style.dimalttz.to_string(),
+        DIMATFIT => style.dimatfit.to_string(),
+        DIMTFILL => style.dimtfill.to_string(),
+        DIMLWD => style.dimlwd.to_string(),
+        DIMLWE => style.dimlwe.to_string(),
+        DIMCLRD => color_name(style.dimclrd),
+        DIMCLRE => color_name(style.dimclre),
+        DIMCLRT => color_name(style.dimclrt),
+        DIMTFILLCLR => color_name(style.dimtfillclr),
+        // "<>" is the measurement itself, shown as no suffix.
+        DIMPOST => style.dimpost.replace("<>", ""),
+        DIMAPOST => style.dimapost.clone(),
+        DIMALTMZS => style.dimaltmzs.clone(),
+        DIMMZS => style.dimmzs.clone(),
+        DIMTALN => "0".to_string(),
+        _ => return None,
+    })
+}
+
+/// The name of the variable stored under `code`, if it is one of the
+/// variables DIMOVERRIDE knows by name.
+pub fn variable_for_code(code: i16) -> Option<(&'static str, VarKind)> {
+    NAMED_VARS
+        .iter()
+        .find(|(_, known, _)| *known == code)
+        .map(|&(name, _, kind)| (name, kind))
+}
+
+/// The group code and storage kind of the dimension variable `name`.
+pub fn named_var(name: &str) -> Option<(i16, VarKind)> {
+    NAMED_VARS
+        .iter()
+        .find(|(var, _, _)| var.eq_ignore_ascii_case(name.trim()))
+        .map(|&(_, code, kind)| (code, kind))
+}
+
+/// Parse a typed value for a variable of `kind` into its record value. ON/OFF
+/// are read as 1/0 so switch variables can be typed either way.
+pub fn parse_var_value(kind: VarKind, text: &str) -> Option<XDataValue> {
+    let text = text.trim();
+    match kind {
+        VarKind::Real => text
+            .parse()
+            .ok()
+            .filter(|v: &f64| v.is_finite())
+            .map(XDataValue::Real),
+        VarKind::Int => text
+            .parse()
+            .ok()
+            .or_else(|| yes(text))
+            .or_else(|| color_keyword(text))
+            .map(XDataValue::Integer16),
+        VarKind::Text => Some(XDataValue::String(text.to_string())),
+    }
+}
+
+/// A colour typed by name, as DIMOVERRIDE shows ByBlock and ByLayer.
+fn color_keyword(value: &str) -> Option<i16> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "BYBLOCK" => Some(0),
+        "BYLAYER" => Some(256),
+        _ => None,
+    }
+}
+
 fn yes(value: &str) -> Option<i16> {
     match value.trim().to_ascii_lowercase().as_str() {
         "yes" | "on" | "true" | "1" => Some(1),
@@ -366,7 +630,7 @@ fn yes(value: &str) -> Option<i16> {
     }
 }
 
-fn inherited_int(doc: &CadDocument, handle: Handle, code: i16) -> i16 {
+fn inherited_int(doc: &Document, handle: Handle, code: i16) -> i16 {
     let Some(EntityType::Dimension(dimension)) = doc.get_entity(handle) else {
         return 0;
     };
@@ -374,13 +638,16 @@ fn inherited_int(doc: &CadDocument, handle: Handle, code: i16) -> i16 {
         return value;
     }
     let Some(style) = doc.dim_styles.iter().find(|style| {
-        style.name.eq_ignore_ascii_case(&dimension.base().style_name)
+        style
+            .name
+            .eq_ignore_ascii_case(&dimension.base().style_name)
             || (dimension.base().style_name.trim().is_empty()
                 && style.name.eq_ignore_ascii_case("Standard"))
     }) else {
         return 0;
     };
     match code {
+        DIMSAH => style.dimsah as i16,
         DIMSD1 => style.dimsd1 as i16,
         DIMSD2 => style.dimsd2 as i16,
         DIMSE1 => style.dimse1 as i16,
@@ -402,7 +669,29 @@ fn inherited_int(doc: &CadDocument, handle: Handle, code: i16) -> i16 {
     }
 }
 
-fn inherited_real(doc: &CadDocument, handle: Handle, code: i16) -> f64 {
+fn inherited_handle(doc: &Document, handle: Handle, code: i16) -> Handle {
+    let Some(EntityType::Dimension(dimension)) = doc.get_entity(handle) else {
+        return Handle::NULL;
+    };
+    let Some(style) = doc.dim_styles.iter().find(|style| {
+        style
+            .name
+            .eq_ignore_ascii_case(&dimension.base().style_name)
+            || (dimension.base().style_name.trim().is_empty()
+                && style.name.eq_ignore_ascii_case("Standard"))
+    }) else {
+        return Handle::NULL;
+    };
+    let style = crate::entities::dimension::resolved_dimension_style(style, dimension, doc);
+    match code {
+        DIMBLK => style.dimblk,
+        DIMBLK1 => style.dimblk1,
+        DIMBLK2 => style.dimblk2,
+        _ => Handle::NULL,
+    }
+}
+
+fn inherited_real(doc: &Document, handle: Handle, code: i16) -> f64 {
     let Some(EntityType::Dimension(dimension)) = doc.get_entity(handle) else {
         return 0.0;
     };
@@ -410,7 +699,9 @@ fn inherited_real(doc: &CadDocument, handle: Handle, code: i16) -> f64 {
         return value;
     }
     let Some(style) = doc.dim_styles.iter().find(|style| {
-        style.name.eq_ignore_ascii_case(&dimension.base().style_name)
+        style
+            .name
+            .eq_ignore_ascii_case(&dimension.base().style_name)
             || (dimension.base().style_name.trim().is_empty()
                 && style.name.eq_ignore_ascii_case("Standard"))
     }) else {
@@ -425,7 +716,7 @@ fn inherited_real(doc: &CadDocument, handle: Handle, code: i16) -> f64 {
     }
 }
 
-fn inherited_string(doc: &CadDocument, handle: Handle, code: i16) -> String {
+fn inherited_string(doc: &Document, handle: Handle, code: i16) -> String {
     let Some(EntityType::Dimension(dimension)) = doc.get_entity(handle) else {
         return String::new();
     };
@@ -433,7 +724,9 @@ fn inherited_string(doc: &CadDocument, handle: Handle, code: i16) -> String {
         return value;
     }
     let Some(style) = doc.dim_styles.iter().find(|style| {
-        style.name.eq_ignore_ascii_case(&dimension.base().style_name)
+        style
+            .name
+            .eq_ignore_ascii_case(&dimension.base().style_name)
             || (dimension.base().style_name.trim().is_empty()
                 && style.name.eq_ignore_ascii_case("Standard"))
     }) else {
@@ -452,12 +745,7 @@ fn split_template(value: &str) -> (&str, &str) {
 
 /// Apply a dimension override row. A changed override lays automatic text
 /// out afresh, so e.g. a new DIMTAD moves it off the stored position.
-pub fn set_property(
-    doc: &mut CadDocument,
-    handle: Handle,
-    field: &str,
-    value: &str,
-) -> bool {
+pub fn set_property(doc: &mut Document, handle: Handle, field: &str, value: &str) -> bool {
     let applied = apply_property(doc, handle, field, value);
     if applied {
         if let Some(EntityType::Dimension(dimension)) = doc.get_entity_mut(handle) {
@@ -467,12 +755,7 @@ pub fn set_property(
     applied
 }
 
-fn apply_property(
-    doc: &mut CadDocument,
-    handle: Handle,
-    field: &str,
-    value: &str,
-) -> bool {
+fn apply_property(doc: &mut Document, handle: Handle, field: &str, value: &str) -> bool {
     let trimmed = value.trim();
     if field == "dim_center_type" {
         let current = inherited_real(doc, handle, DIMCEN);
@@ -511,14 +794,7 @@ fn apply_property(
     if let Some(code) = handle_field {
         let resolved = match field {
             "dim_radial_arrow" | "dim_arrowhead_1" | "dim_arrowhead_2" => {
-                if trimmed == "Closed filled" {
-                    Some(Handle::NULL)
-                } else {
-                    doc.block_records
-                        .iter()
-                        .find(|record| record.name == trimmed)
-                        .map(|record| record.handle)
-                }
+                crate::entities::arrowheads::resolve(doc, trimmed)
             }
             "dim_text_style" => doc
                 .text_styles
@@ -534,6 +810,16 @@ fn apply_property(
         let Some(resolved) = resolved else {
             return false;
         };
+        // With separate arrows off both ends draw DIMBLK, so a one-end pick
+        // turns them on and keeps the other end's arrow. (#1916)
+        if matches!(field, "dim_arrowhead_1" | "dim_arrowhead_2")
+            && inherited_int(doc, handle, DIMSAH) == 0
+        {
+            let both = inherited_handle(doc, handle, DIMBLK);
+            let other = if code == DIMBLK1 { DIMBLK2 } else { DIMBLK1 };
+            set(doc, handle, other, Some(XDataValue::Handle(both)));
+            set(doc, handle, DIMSAH, Some(XDataValue::Integer16(1)));
+        }
         set(doc, handle, code, Some(XDataValue::Handle(resolved)));
         return true;
     }
@@ -548,7 +834,12 @@ fn apply_property(
         let Some(visible) = yes(trimmed) else {
             return false;
         };
-        set(doc, handle, code, Some(XDataValue::Integer16((visible == 0) as i16)));
+        set(
+            doc,
+            handle,
+            code,
+            Some(XDataValue::Integer16((visible == 0) as i16)),
+        );
         return true;
     }
     let bit_field = match field {
@@ -660,12 +951,7 @@ fn apply_property(
             "deviation" => {
                 if (upper - lower).abs() <= 1e-12 {
                     let distinct_lower = if upper.abs() > 1e-12 { 0.0 } else { 0.0001 };
-                    set(
-                        doc,
-                        handle,
-                        DIMTM,
-                        Some(XDataValue::Real(distinct_lower)),
-                    );
+                    set(doc, handle, DIMTM, Some(XDataValue::Real(distinct_lower)));
                 }
                 (1, 0, false)
             }
@@ -688,8 +974,7 @@ fn apply_property(
         if trimmed.is_empty() {
             set(doc, handle, code, None);
         } else if let Ok(number) = trimmed.parse::<f64>() {
-            let number = if field == "dim_text_offset"
-                && inherited_real(doc, handle, DIMGAP) < 0.0
+            let number = if field == "dim_text_offset" && inherited_real(doc, handle, DIMGAP) < 0.0
             {
                 -number.abs()
             } else {
@@ -712,9 +997,7 @@ fn apply_property(
     }
     if let Some(code) = property_int_code(field) {
         let parsed = match field {
-            "dim_line_lineweight" | "dim_ext_line_lineweight" => {
-                parse_lineweight_label(trimmed)
-            }
+            "dim_line_lineweight" | "dim_ext_line_lineweight" => parse_lineweight_label(trimmed),
             "dim_precision"
             | "dim_alt_precision"
             | "dim_tolerance_precision"
@@ -724,14 +1007,10 @@ fn apply_property(
             "dim_text_outside_align" | "dim_text_inside_align" | "dim_line_inside" => {
                 yes(trimmed).map(|value| i16::from(value == 0))
             }
-            "dim_ext_line_fixed"
-            | "dim_text_inside"
-            | "dim_line_forced"
-            | "dim_alt_enabled" => yes(trimmed),
-            "dim_decimal_separator" => trimmed
-                .chars()
-                .next()
-                .map(|character| character as i16),
+            "dim_ext_line_fixed" | "dim_text_inside" | "dim_line_forced" | "dim_alt_enabled" => {
+                yes(trimmed)
+            }
+            "dim_decimal_separator" => trimmed.chars().next().map(|character| character as i16),
             "dim_units" => match trimmed.to_ascii_lowercase().as_str() {
                 "scientific" => Some(1),
                 "decimal" => Some(2),

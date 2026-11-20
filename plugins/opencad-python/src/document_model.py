@@ -154,8 +154,9 @@ class _Solids:
     def union(self, first, second, layer=None, keep_operands=False):
         """Join two solids into a new one. The operands are consumed unless
         `keep_operands`. The kernel may refuse (the error says why) and a
-        refusal changes nothing. Curved operands can take a second or two,
-        and a whole script has a 30 second budget."""
+        refusal changes nothing.         Curved operands can take a second or two,
+        and a whole script has a 60 second budget (the host's ExecuteCode
+        floor; OCS_PLUGIN_EXECUTE_TIMEOUT_SECS can only raise it)."""
         return self._boolean("union", first, second, layer, keep_operands)
 
     def subtract(self, first, second, layer=None, keep_operands=False):
@@ -734,7 +735,6 @@ class _Modify:
             lambda c: c.text(radius),
             lambda c: c.entity(first, self._at(first, at1)),
             lambda c: c.entity(second, self._at(second, at2)),
-            lambda c: c.enter(),
         ])
 
     def move(self, entities, base, target):
@@ -834,6 +834,7 @@ class _Modify:
         original. Returns the copies."""
         return self._run("ARRAYPATH", [
             lambda c: c.entity(path, self._at(path, at)),
+            lambda c: c.token("DIVIDE"),
             lambda c: c.text(count),
         ], entities)
 
@@ -892,7 +893,7 @@ class _Modify:
             c.token("J")
             self._select(others)
             c.selection()
-            if c.waiting and "Join" in c.outcome["prompt"]:
+            if c.waiting:
                 c.enter()
         return self._pedit(entity, [join], at)
 

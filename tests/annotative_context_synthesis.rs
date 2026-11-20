@@ -3,10 +3,10 @@
 // survives a DWG save/reload — i.e. an OCS-authored annotative object carries a
 // genuine per-scale representation, interoperably, not just the native flag.
 
-use codec::entities::{EntityType, MText};
-use codec::objects::{Dictionary, ObjectContextKind, ObjectType, Scale};
-use codec::types::Vector3;
-use codec::{CadDocument, DxfVersion, Handle};
+use document::entities::{EntityType, MText};
+use document::objects::{Dictionary, ObjectContextKind, ObjectType, Scale};
+use document::types::Vector3;
+use document::{Document, DxfVersion, Handle};
 use OpenCADStudio::io;
 use OpenCADStudio::scene::annotative;
 
@@ -17,13 +17,13 @@ fn empty_annotation_scales_is_not_annotative() {
     // files where objects were flagged annotative but never given a scale) must
     // NOT be treated as annotative. Otherwise it gets (mis)scaled by the
     // annotation factor inside annotation-scaled viewports, ballooning the text.
-    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    let mut doc = Document::with_version(DxfVersion::AC1032);
     let mut m = MText::new();
     m.is_annotative = false; // no native flag, no annotative style
-    let ent = doc.add_entity(EntityType::MText(m)).unwrap();
+    let ent = doc.add_entity(EntityType::MText(Box::new(m))).unwrap();
 
     // Build xdict -> "AcDbContextDataManager" -> "ACDB_ANNOTATIONSCALES" (empty).
-    let mk = |doc: &mut CadDocument, owner: Handle| -> Handle {
+    let mk = |doc: &mut Document, owner: Handle| -> Handle {
         let h = doc.allocate_handle();
         let mut d = Dictionary::new();
         d.handle = h;
@@ -63,11 +63,15 @@ fn empty_annotation_scales_is_not_annotative() {
 
 /// Walk an entity's xdict → "AcDbContextDataManager" → "ACDB_ANNOTATIONSCALES"
 /// and return its leaf handles.
-fn context_leaves(doc: &CadDocument, entity: Handle) -> Vec<Handle> {
-    let Some(xd) = doc.get_entity(entity).and_then(|e| e.common().xdictionary_handle) else {
+fn context_leaves(doc: &Document, entity: Handle) -> Vec<Handle> {
+    let Some(xd) = doc
+        .get_entity(entity)
+        .and_then(|e| e.common().xdictionary_handle)
+    else {
         return vec![];
     };
-    let Some(mgr) = annotative::as_dict(doc, xd).and_then(|d| d.get("AcDbContextDataManager")) else {
+    let Some(mgr) = annotative::as_dict(doc, xd).and_then(|d| d.get("AcDbContextDataManager"))
+    else {
         return vec![];
     };
     let Some(coll) = annotative::as_dict(doc, mgr).and_then(|d| d.get("ACDB_ANNOTATIONSCALES"))
@@ -81,14 +85,16 @@ fn context_leaves(doc: &CadDocument, entity: Handle) -> Vec<Handle> {
 
 #[test]
 fn ocs_synthesized_mtext_context_survives_dwg_roundtrip() {
-    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    let mut doc = Document::with_version(DxfVersion::AC1032);
 
     // An MTEXT plus a named scale to attach it to.
     let mut m = MText::new();
     m.insertion_point = Vector3::new(100.0, 200.0, 0.0);
     m.rectangle_width = 50.0;
     m.is_annotative = true;
-    let ent = doc.add_entity(EntityType::MText(m)).expect("add mtext");
+    let ent = doc
+        .add_entity(EntityType::MText(Box::new(m)))
+        .expect("add mtext");
 
     let sh = doc.allocate_handle();
     let mut scale = Scale::new("1:50", 1.0, 50.0);
@@ -134,9 +140,9 @@ fn ocs_synthesized_mtext_context_survives_dwg_roundtrip() {
 
 #[test]
 fn ocs_synthesized_block_context_survives_dwg_roundtrip() {
-    use codec::entities::Insert;
+    use document::entities::Insert;
 
-    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    let mut doc = Document::with_version(DxfVersion::AC1032);
 
     let mut ins = Insert::new("BLK", Vector3::new(10.0, 20.0, 0.0));
     ins.rotation = 0.5;
@@ -156,7 +162,10 @@ fn ocs_synthesized_block_context_survives_dwg_roundtrip() {
     assert_eq!(leaves.len(), 1, "block context leaf lost");
     match doc2.objects.get(&leaves[0]) {
         Some(ObjectType::ObjectContextData(c)) => {
-            assert!(matches!(c.kind, ObjectContextKind::BlkRef { .. }), "not a BLKREF context");
+            assert!(
+                matches!(c.kind, ObjectContextKind::BlkRef { .. }),
+                "not a BLKREF context"
+            );
         }
         other => panic!("leaf is not an ObjectContextData: {other:?}"),
     }
@@ -164,12 +173,12 @@ fn ocs_synthesized_block_context_survives_dwg_roundtrip() {
 
 #[test]
 fn object_scale_membership_add_remove_roundtrips() {
-    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    let mut doc = Document::with_version(DxfVersion::AC1032);
     let mut m = MText::new();
     m.insertion_point = Vector3::new(1.0, 2.0, 0.0);
-    let ent = doc.add_entity(EntityType::MText(m)).unwrap();
+    let ent = doc.add_entity(EntityType::MText(Box::new(m))).unwrap();
 
-    let mk_scale = |doc: &mut CadDocument, name: &str, d: f64| {
+    let mk_scale = |doc: &mut Document, name: &str, d: f64| {
         let h = doc.allocate_handle();
         let mut s = Scale::new(name, 1.0, d);
         s.handle = h;
@@ -190,14 +199,20 @@ fn object_scale_membership_add_remove_roundtrips() {
     assert_eq!(names, vec!["1:100", "1:50"], "both memberships expected");
 
     // Remove one, keep the other; survives a round-trip.
-    assert!(annotative::remove_annotation_context_for_scale(&mut doc, ent, s50));
+    assert!(annotative::remove_annotation_context_for_scale(
+        &mut doc, ent, s50
+    ));
     let bytes = io::save_to_bytes(&doc, "dwg", DxfVersion::AC1032).unwrap();
     let doc2 = io::load_bytes("rt.dwg", bytes).unwrap();
     let remaining: Vec<String> = annotative::object_scale_memberships(&doc2, ent)
         .into_iter()
         .map(|(n, _)| n)
         .collect();
-    assert_eq!(remaining, vec!["1:100"], "exactly the un-removed scale remains");
+    assert_eq!(
+        remaining,
+        vec!["1:100"],
+        "exactly the un-removed scale remains"
+    );
 
     // Removing the last representation tears the chain down → non-annotative.
     let mut doc3 = doc2.clone();
@@ -207,7 +222,9 @@ fn object_scale_membership_add_remove_roundtrips() {
         .iter()
         .find_map(|(h, o)| matches!(o, ObjectType::Scale(s) if s.name == "1:100").then_some(*h))
         .unwrap();
-    assert!(annotative::remove_annotation_context_for_scale(&mut doc3, ent, s100b));
+    assert!(annotative::remove_annotation_context_for_scale(
+        &mut doc3, ent, s100b
+    ));
     assert!(
         annotative::object_scale_memberships(&doc3, ent).is_empty(),
         "no memberships after removing the last"
@@ -216,4 +233,61 @@ fn object_scale_membership_add_remove_roundtrips() {
         !annotative::is_annotative(&doc3, doc3.get_entity(ent).unwrap()),
         "object should be non-annotative once its last representation is gone"
     );
+}
+
+/// A context's fit overrides reach the dimension drawn at its scale. AutoCAD
+/// 2025 keeps, for a 1:50 context, DIMTMOVE 1 (leader) with override code 16
+/// under a style whose DIMTMOVE is 0, and draws that scale with the leader.
+#[test]
+fn dimension_context_fit_overrides_reach_the_drawn_dimension() {
+    use document::entities::{Dimension, DimensionLinear};
+    use document::xdata::XDataValue;
+    use OpenCADStudio::entities::dim_override as ov;
+
+    let mut doc = Document::with_version(DxfVersion::AC1032);
+    let dim = DimensionLinear::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(150.0, 0.0, 0.0));
+    let ent = doc
+        .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(dim))))
+        .unwrap();
+    let sh = doc.allocate_handle();
+    let mut s = Scale::new("1:50", 1.0, 50.0);
+    s.handle = sh;
+    doc.objects.insert(sh, ObjectType::Scale(s));
+    assert!(annotative::create_annotation_context(&mut doc, ent, sh));
+    let leaf = context_leaves(&doc, ent)[0];
+
+    let drawn_dimtmove = |doc: &Document| {
+        let drawn =
+            annotative::entity_for_annotation_context(doc, doc.get_entity(ent).unwrap(), Some(sh));
+        ov::int(&drawn.common().extended_data, ov::DIMTMOVE)
+    };
+    let set_context = |doc: &mut Document, dimtmove: bool, override_code: u8| {
+        let Some(ObjectType::ObjectContextData(c)) = doc.objects.get_mut(&leaf) else {
+            panic!("dimension context leaf");
+        };
+        let ObjectContextKind::Dim(d) = &mut c.kind else {
+            panic!("dimension context kind");
+        };
+        d.dimtmove = dimtmove;
+        d.override_code = override_code;
+    };
+
+    // Not flagged as overridden: the style decides.
+    set_context(&mut doc, true, 0);
+    assert_eq!(drawn_dimtmove(&doc), None);
+
+    set_context(&mut doc, true, 16);
+    assert_eq!(drawn_dimtmove(&doc), Some(1));
+    // Only the drawn copy carries it; the stored dimension is unchanged.
+    assert_eq!(
+        ov::int(
+            &doc.get_entity(ent).unwrap().common().extended_data,
+            ov::DIMTMOVE
+        ),
+        None
+    );
+
+    // The dimension's own override still wins.
+    ov::set(&mut doc, ent, ov::DIMTMOVE, Some(XDataValue::Integer16(2)));
+    assert_eq!(drawn_dimtmove(&doc), Some(2));
 }

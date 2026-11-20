@@ -1,9 +1,9 @@
 // MLINE command — create a styled group of parallel lines.
 
-use codec::entities::{MLine, MLineFlags, MLineJustification, MLineSegment, MLineVertex};
-use codec::objects::MLineStyle;
-use codec::types::Vector3;
-use codec::{EntityType, Handle};
+use document::entities::{MLine, MLineFlags, MLineJustification, MLineSegment, MLineVertex};
+use document::objects::MLineStyle;
+use document::types::Vector3;
+use document::{EntityType, Handle};
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, WorkingPlane};
@@ -46,12 +46,7 @@ impl MlineCommand {
             .find(|(_, style)| style.name.eq_ignore_ascii_case(&requested))
             .or_else(|| styles.first());
         let (style_handle, style_name) = selected
-            .map(|(handle, style)| {
-                (
-                    (!handle.is_null()).then_some(*handle),
-                    style.name.clone(),
-                )
-            })
+            .map(|(handle, style)| ((!handle.is_null()).then_some(*handle), style.name.clone()))
             .unwrap_or((None, requested));
         Self {
             points: Vec::new(),
@@ -147,10 +142,9 @@ impl MlineCommand {
             return None;
         };
         let mut points = Vec::new();
-        for (line_index, line) in
-            crate::entities::mline::mline_lines_with_style(&mline, style)
-                .into_iter()
-                .enumerate()
+        for (line_index, line) in crate::entities::mline::mline_lines_with_style(&mline, style)
+            .into_iter()
+            .enumerate()
         {
             if line_index > 0 {
                 points.push([f64::NAN; 3]);
@@ -166,8 +160,7 @@ impl MlineCommand {
                 }
             }));
         }
-        let (points, points_low) =
-            crate::scene::convert::tessellate::points_to_ds(points);
+        let (points, points_low) = crate::scene::convert::tessellate::points_to_ds(points);
         let fill_tris = crate::entities::mline::mline_fill_triangles_with_style(&mline, style)
             .into_iter()
             .map(|point| {
@@ -177,13 +170,10 @@ impl MlineCommand {
                 world.to_array()
             })
             .collect::<Vec<_>>();
-        let (fill_tris, fill_tris_low) =
-            crate::scene::convert::tessellate::points_to_ds(fill_tris);
+        let (fill_tris, fill_tris_low) = crate::scene::convert::tessellate::points_to_ds(fill_tris);
         Some(WireModel {
             bg_adapt: None,
             point_marker: None,
-            taper_widths: Vec::new(),
-            pattern_stations: Vec::new(),
             world_width: 0.0,
             depth_override: None,
             display_visible: true,
@@ -191,28 +181,34 @@ impl MlineCommand {
             plot_visible: true,
             fill_is_3d: false,
             fill_is_2d_solid: true,
+            solid_normal: None,
             render_instance: None,
-            pick_tris: Vec::new(),
-            pick_tris_low: Vec::new(),
             dash_from_start: false,
-            dash_align_end: None,
-            text_verts: Vec::new(),
             name: "mline_preview".into(),
-            points,
-            points_low,
             color: WireModel::CYAN,
             selected: false,
             pattern_length: 0.0,
             pattern: [0.0; 8],
             line_weight_px: 1.0,
-            snap_pts: Vec::new(),
-            tangent_geoms: Vec::new(),
             aci: 0,
-            key_vertices: Vec::new(),
             aabb: WireModel::UNBOUNDED_AABB,
             plinegen: true,
-            fill_tris,
-            fill_tris_low,
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                taper_widths: Vec::new(),
+                pattern_stations: Vec::new(),
+                pick_tris: Vec::new(),
+                pick_tris_low: Vec::new(),
+                text_verts: Vec::new(),
+                points,
+                points_low,
+                snap_pts: Vec::new(),
+                tangent_geoms: Vec::new(),
+                key_vertices: Vec::new(),
+                fill_tris,
+                fill_tris_low,
+                ..crate::scene::WireGeom::default()
+            }),
+            ..Default::default()
         })
     }
 }
@@ -342,24 +338,23 @@ impl CadCommand for MlineCommand {
             }
             Step::Style => {
                 if token == "?" {
-                    self.notice = Some(crate::tf!(
-                        "Loaded multiline styles: {}",
-                        self.styles
-                            .iter()
-                            .map(|(_, style)| style.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                    .into_owned());
+                    self.notice = Some(
+                        crate::tf!(
+                            "Loaded multiline styles: {}",
+                            self.styles
+                                .iter()
+                                .map(|(_, style)| style.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                        .into_owned(),
+                    );
                 } else if self.select_style(token) {
                     self.step = Step::Start;
                 } else {
                     self.notice = Some(
-                        crate::t!(
-                            "Multiline style \"%{style}\" was not found.",
-                            style = token
-                        )
-                        .into_owned(),
+                        crate::t!("Multiline style \"%{style}\" was not found.", style = token)
+                            .into_owned(),
                     );
                 }
             }
@@ -410,7 +405,9 @@ impl CadCommand for MlineCommand {
     }
 
     fn on_mouse_move(&mut self, point: DVec3) -> Option<WireModel> {
-        (!self.points.is_empty()).then(|| self.preview(point)).flatten()
+        (!self.points.is_empty())
+            .then(|| self.preview(point))
+            .flatten()
     }
 }
 
@@ -418,26 +415,22 @@ pub(crate) fn sync_mline_element_parameters(mline: &mut MLine, style: &MLineStyl
     let offsets: Vec<f64> = if style.elements.is_empty() {
         vec![0.5, -0.5]
     } else {
-        style.elements.iter().map(|element| element.offset).collect()
+        style
+            .elements
+            .iter()
+            .map(|element| element.offset)
+            .collect()
     };
     let minimum = offsets.iter().copied().fold(f64::INFINITY, f64::min);
-    let maximum = offsets
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
+    let maximum = offsets.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let shift = match mline.justification {
         MLineJustification::Top => -maximum,
         MLineJustification::Zero => 0.0,
         MLineJustification::Bottom => -minimum,
     };
-    let normal = glam::DVec3::new(mline.normal.x, mline.normal.y, mline.normal.z)
-        .normalize_or(glam::DVec3::Z);
+    let normal = mline.normal;
     for vertex in &mut mline.vertices {
-        let direction = glam::DVec3::new(vertex.direction.x, vertex.direction.y, vertex.direction.z)
-            .normalize_or(glam::DVec3::X);
-        let miter = glam::DVec3::new(vertex.miter.x, vertex.miter.y, vertex.miter.z)
-            .normalize_or(glam::DVec3::Y);
-        let factor = miter.dot(normal.cross(direction)).abs().max(1.0e-9);
+        let factor = crate::entities::mline::mline_miter_factor(vertex, normal);
         vertex
             .segments
             .resize_with(offsets.len(), MLineSegment::new);
@@ -454,7 +447,7 @@ pub(crate) fn sync_mline_element_parameters(mline: &mut MLine, style: &MLineStyl
     mline.style_element_count = offsets.len();
 }
 
-fn build_mline(
+pub(crate) fn build_mline(
     points: &[DVec3],
     scale: f64,
     justification: MLineJustification,

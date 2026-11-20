@@ -8,13 +8,17 @@
 // Single-object commands (e.g. LAYMCUR) use `instant()` instead: the first
 // completed selection action fires straight away, no Enter required.
 
-use codec::Handle;
-use glam::DVec3;
 use crate::t;
+use document::Handle;
+use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult};
 use crate::modules::draw::fence::FencePick;
 use crate::scene::model::wire_model::WireModel;
+
+/// The step a path picked from a box clicked at the empty command prompt
+/// relaunches into: it only records the set as the Previous selection.
+pub const IMPLIED_PATH_DONE: &str = "_SELECT_PATH_DONE";
 
 pub struct SelectObjectsCommand {
     prompt_cmd: String,
@@ -41,6 +45,14 @@ pub struct SelectObjectsCommand {
     /// The command works on associative dimensions only; the host drops
     /// everything else from each completed selection.
     associative_dimensions_only: bool,
+    /// The kinds of object the command takes; the host drops the rest of
+    /// each completed selection silently, and Enter on nothing ends quietly.
+    keep: Option<fn(&document::EntityType) -> bool>,
+    /// A SEttings keyword at the prompt, and what it does.
+    settings: Option<fn() -> CmdResult>,
+    /// A command's own keyword at the prompt (its label, the keyword and
+    /// what it does).
+    keyword: Option<(&'static str, &'static str, fn() -> CmdResult)>,
 }
 
 impl SelectObjectsCommand {
@@ -57,6 +69,9 @@ impl SelectObjectsCommand {
             auto_constrain_settings: false,
             prompt_text: None,
             associative_dimensions_only: false,
+            keep: None,
+            settings: None,
+            keyword: None,
         }
     }
 
@@ -74,6 +89,9 @@ impl SelectObjectsCommand {
             auto_constrain_settings: false,
             prompt_text: None,
             associative_dimensions_only: false,
+            keep: None,
+            settings: None,
+            keyword: None,
         }
     }
 
@@ -91,6 +109,9 @@ impl SelectObjectsCommand {
             auto_constrain_settings: false,
             prompt_text: None,
             associative_dimensions_only: false,
+            keep: None,
+            settings: None,
+            keyword: None,
         }
     }
 
@@ -108,6 +129,9 @@ impl SelectObjectsCommand {
             auto_constrain_settings: false,
             prompt_text: None,
             associative_dimensions_only: false,
+            keep: None,
+            settings: None,
+            keyword: None,
         }
     }
 
@@ -124,6 +148,53 @@ impl SelectObjectsCommand {
         command
     }
 
+    /// The standard gather with the command's own wording.
+    pub fn with_prompt(prompt_cmd: &str, pending_cmd: &str, prompt_text: &'static str) -> Self {
+        let mut command = Self::plain(prompt_cmd, pending_cmd);
+        command.prompt_text = Some(prompt_text);
+        command
+    }
+
+    /// The command's own wording, keeping only what `keep` accepts.
+    pub fn filtered(
+        prompt_cmd: &str,
+        pending_cmd: &str,
+        prompt_text: &'static str,
+        keep: fn(&document::EntityType) -> bool,
+    ) -> Self {
+        let mut command = Self::with_prompt(prompt_cmd, pending_cmd, prompt_text);
+        command.keep = Some(keep);
+        command
+    }
+
+    /// The command's own wording with one keyword of its own (`label`, typed
+    /// as `keyword` or its capitals).
+    pub fn with_keyword(
+        prompt_cmd: &str,
+        pending_cmd: &str,
+        prompt_text: &'static str,
+        label: &'static str,
+        keyword: &'static str,
+        action: fn() -> CmdResult,
+    ) -> Self {
+        let mut command = Self::with_prompt(prompt_cmd, pending_cmd, prompt_text);
+        command.keyword = Some((label, keyword, action));
+        command
+    }
+
+    /// The command's own wording with a SEttings keyword; Enter on nothing
+    /// ends quietly.
+    pub fn with_settings(
+        prompt_cmd: &str,
+        pending_cmd: &str,
+        prompt_text: &'static str,
+        settings: fn() -> CmdResult,
+    ) -> Self {
+        let mut command = Self::filtered(prompt_cmd, pending_cmd, prompt_text, |_| true);
+        command.settings = Some(settings);
+        command
+    }
+
     pub fn auto_constrain(pending_cmd: &str) -> Self {
         let mut command = Self::new(pending_cmd);
         command.auto_constrain_settings = true;
@@ -131,7 +202,21 @@ impl SelectObjectsCommand {
     }
 }
 
+thread_local! {
+    /// Remove mode of the selection being gathered (R / A at the prompt):
+    /// the prompt then reads "Remove objects:".
+    static REMOVE_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn set_remove_mode(on: bool) {
+    REMOVE_MODE.with(|mode| mode.set(on));
+}
+
 impl CadCommand for SelectObjectsCommand {
+    fn reveals_hidden_block_objects(&self) -> bool {
+        self.pending_cmd == "_BVSHOW"
+    }
+
     fn name(&self) -> &'static str {
         "SELECT"
     }
@@ -157,31 +242,19 @@ impl CadCommand for SelectObjectsCommand {
             )
             .into_owned();
         }
-        if self.commit_on_enter && !self.handles.is_empty() {
-            if self.auto_constrain_settings {
-                return t!(
-                    "%{cmd}  Select objects or [Settings] (%{count} selected, Enter to apply):",
-                    cmd = self.prompt_cmd,
-                    count = self.handles.len()
-                )
-                .into_owned();
-            }
-            t!(
-                "%{cmd}  Select objects (%{count} selected, Enter to apply):",
-                cmd = self.prompt_cmd,
-                count = self.handles.len()
-            )
-            .into_owned()
-        } else {
-            if self.auto_constrain_settings {
-                return t!(
-                    "%{cmd}  Select objects or [Settings]:",
-                    cmd = self.prompt_cmd
-                )
-                .into_owned();
-            }
-            t!("%{cmd}  Select objects:", cmd = self.prompt_cmd).into_owned()
+        if REMOVE_MODE.with(|mode| mode.get()) {
+            return t!("%{cmd}  Remove objects:", cmd = self.prompt_cmd).into_owned();
         }
+        // The reference asks the same "Select objects:" however many are
+        // picked; each pick's count is its own "N found" line.
+        if self.auto_constrain_settings {
+            return t!(
+                "%{cmd}  Select objects or [Settings]:",
+                cmd = self.prompt_cmd
+            )
+            .into_owned();
+        }
+        t!("%{cmd}  Select objects:", cmd = self.prompt_cmd).into_owned()
     }
 
     // Opt into the selection-gathering path; host routes clicks through
@@ -192,8 +265,40 @@ impl CadCommand for SelectObjectsCommand {
         self.pick.is_none()
     }
 
+    /// Fence and polygon points are the bare cursor: object snap would pull
+    /// them onto the objects being selected.
+    fn wants_raw_point(&self) -> bool {
+        self.pick.is_some()
+    }
+
+    fn selection_path(&self) -> Option<crate::command::SelectionPath> {
+        self.pick
+            .as_ref()
+            .map(|pick| crate::command::SelectionPath {
+                points: pick.points.clone(),
+                closed: pick.closed,
+                crossing: self.pick_crossing,
+                implied: self.pending_cmd == IMPLIED_PATH_DONE,
+            })
+    }
+
+    fn entity_pick_highlights_hover(&self) -> bool {
+        self.pick.is_none()
+    }
+
     fn selection_keeps_associative_dimensions(&self) -> bool {
         self.associative_dimensions_only
+    }
+
+    fn selection_entity_filter(&self) -> Option<fn(&document::EntityType) -> bool> {
+        self.keep
+    }
+
+    fn selection_drops_locked_point_clouds(&self) -> bool {
+        matches!(
+            self.pending_cmd.as_str(),
+            "MOVE" | "3DMOVE" | "ROTATE" | "3DROTATE" | "SCALE" | "MIRROR" | "MIRROR3D" | "STRETCH"
+        )
     }
 
     // Clickable selection keywords (#426, #596). Window and Crossing fix the
@@ -205,6 +310,12 @@ impl CadCommand for SelectObjectsCommand {
     // they work typed as well — these buttons only surface them, which is what
     // the on-screen keyboard-less case needs.
     fn options(&self) -> Vec<CmdOption> {
+        if self.settings.is_some() && self.pick.is_none() {
+            return vec![CmdOption::new(t!("Settings").as_ref(), "SE")];
+        }
+        if let (Some((label, keyword, _)), None) = (self.keyword, self.pick.as_ref()) {
+            return vec![CmdOption::new(label, keyword)];
+        }
         if self.commit_on_enter && self.show_options {
             if self.auto_constrain_settings {
                 return vec![CmdOption::new(t!("Settings").as_ref(), "S")];
@@ -228,6 +339,15 @@ impl CadCommand for SelectObjectsCommand {
     }
 
     fn on_selection_complete(&mut self, handles: Vec<Handle>) -> CmdResult {
+        // A path started from a box clicked with no command running is the
+        // whole selection: it ends with the path, leaving the objects
+        // selected, as a box picked there would.
+        if self.pending_cmd == IMPLIED_PATH_DONE {
+            if handles.is_empty() {
+                return CmdResult::Cancel;
+            }
+            return CmdResult::Relaunch(std::mem::take(&mut self.pending_cmd), handles);
+        }
         if self.commit_on_enter {
             // Keep gathering: remember the running set and update the prompt.
             // The command is applied when the user presses Enter / right-clicks.
@@ -239,6 +359,20 @@ impl CadCommand for SelectObjectsCommand {
             return CmdResult::NeedPoint;
         }
         CmdResult::Relaunch(std::mem::take(&mut self.pending_cmd), handles)
+    }
+
+    fn on_entity_pick(&mut self, handle: Handle, _pt: DVec3) -> CmdResult {
+        if handle.is_null() {
+            return CmdResult::NeedPoint;
+        }
+        if self.commit_on_enter {
+            if !self.handles.contains(&handle) {
+                self.handles.push(handle);
+            }
+            CmdResult::NeedPoint
+        } else {
+            CmdResult::Relaunch(std::mem::take(&mut self.pending_cmd), vec![handle])
+        }
     }
 
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
@@ -260,7 +394,24 @@ impl CadCommand for SelectObjectsCommand {
         if !self.commit_on_enter {
             return None;
         }
+        let word = text.trim().trim_start_matches('_').to_uppercase();
+        if let Some(settings) = self.settings {
+            if word.len() >= 2 && "SETTINGS".starts_with(word.as_str()) {
+                return Some(settings());
+            }
+        }
+        if let Some((label, keyword, action)) = self.keyword {
+            let capitals: String = label.chars().filter(char::is_ascii_uppercase).collect();
+            if word == keyword || word == capitals || word == label.to_ascii_uppercase() {
+                return Some(action());
+            }
+        }
         match text.trim().to_uppercase().as_str() {
+            // SIngle: the next selection ends the prompt.
+            "SI" | "SINGLE" => {
+                self.commit_on_enter = false;
+                Some(CmdResult::NeedPoint)
+            }
             "S" | "SETTINGS" if self.auto_constrain_settings => {
                 Some(CmdResult::OpenAutoConstrainSettings)
             }
@@ -285,7 +436,8 @@ impl CadCommand for SelectObjectsCommand {
     fn on_preview_wires(&mut self, pt: DVec3) -> Vec<WireModel> {
         match &self.pick {
             Some(pick) if !pick.is_empty() => {
-                vec![pick.preview([pt.x, pt.y], "select_fence")]
+                let window_polygon = pick.closed && !self.pick_crossing;
+                vec![pick.preview_styled([pt.x, pt.y], "select_fence", !window_polygon)]
             }
             _ => vec![],
         }
@@ -306,6 +458,9 @@ impl CadCommand for SelectObjectsCommand {
             }
             return CmdResult::NeedPoint;
         }
+        if self.keep.is_some() && self.handles.is_empty() {
+            return CmdResult::Relaunch(std::mem::take(&mut self.pending_cmd), Vec::new());
+        }
         if !self.commit_on_enter || self.handles.is_empty() {
             return CmdResult::Cancel;
         }
@@ -323,6 +478,90 @@ impl CadCommand for SelectObjectsCommand {
     }
 }
 
-
 // ── Autocomplete registry ─────────────────────────────────
-inventory::submit!(crate::command::CommandRegistration { names: &["ARRAY", "ARRAYPATH", "ARRAYPOLAR", "ARRAYRECT", "BLOCK", "COPY", "COPYCLIP", "CUTCLIP", "ERASE", "EXPLODE", "GROUP", "LAYFRZ", "LAYLCK", "LAYMCUR", "LAYOFF", "LAYULK", "MIRROR", "MOVE", "ROTATE", "SCALE", "STRETCH"] });  // SelectObjectsCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &[
+        "ARRAY",
+        "ARRAYPATH",
+        "ARRAYPOLAR",
+        "ARRAYRECT",
+        "BLOCK",
+        "COPY",
+        "COPYCLIP",
+        "CUTCLIP",
+        "DCDISPLAY",
+        "DIMDISASSOCIATE",
+        "DIMREASSOCIATE",
+        "ERASE",
+        "EXPLODE",
+        "GROUP",
+        "LAYFRZ",
+        "LAYLCK",
+        "LAYCUR",
+        "LAYMCUR",
+        "LAYOFF",
+        "LAYULK",
+        "MIRROR",
+        "MOVE",
+        "ROTATE",
+        "SCALE",
+        "STRETCH",
+        "TXTEXP"
+    ]
+}); // SelectObjectsCommand
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_select_objects_command_entity_pick_and_relaunch() {
+        let mut cmd = SelectObjectsCommand::new("MOVE");
+        assert!(cmd.is_selection_gathering());
+        assert_eq!(cmd.prompt(), "MOVE  Select objects:");
+
+        let h1 = Handle::new(42);
+        let h2 = Handle::new(43);
+
+        // Pick first entity
+        let res1 = cmd.on_entity_pick(h1, DVec3::ZERO);
+        assert!(matches!(res1, CmdResult::NeedPoint));
+        assert_eq!(cmd.handles, vec![h1]);
+
+        // Duplicate pick is ignored
+        let res_dup = cmd.on_entity_pick(h1, DVec3::ZERO);
+        assert!(matches!(res_dup, CmdResult::NeedPoint));
+        assert_eq!(cmd.handles, vec![h1]);
+
+        // Pick second entity
+        let res2 = cmd.on_entity_pick(h2, DVec3::ZERO);
+        assert!(matches!(res2, CmdResult::NeedPoint));
+        assert_eq!(cmd.handles, vec![h1, h2]);
+
+        // Enter finishes selection and relaunches pending command with accumulated handles
+        let enter_res = cmd.on_enter();
+        match enter_res {
+            CmdResult::Relaunch(relaunch_cmd, handles) => {
+                assert_eq!(relaunch_cmd, "MOVE");
+                assert_eq!(handles, vec![h1, h2]);
+            }
+            _ => panic!("expected CmdResult::Relaunch"),
+        }
+    }
+
+    #[test]
+    fn test_select_objects_command_single_pick_variant() {
+        let mut cmd = SelectObjectsCommand::instant("CHAMFER");
+        let h = Handle::new(99);
+
+        // Single-object variant relaunches immediately on pick
+        let res = cmd.on_entity_pick(h, DVec3::ZERO);
+        match res {
+            CmdResult::Relaunch(relaunch_cmd, handles) => {
+                assert_eq!(relaunch_cmd, "CHAMFER");
+                assert_eq!(handles, vec![h]);
+            }
+            _ => panic!("expected immediate CmdResult::Relaunch"),
+        }
+    }
+}

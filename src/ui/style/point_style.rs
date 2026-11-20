@@ -6,11 +6,11 @@
 //! does the same without the dialog.
 
 use crate::app::Message;
+use crate::t;
 use crate::ui::style::common::muted_style;
-use crate::ui::style::form::{dialog_button, form_radio};
+use crate::ui::style::form::{dialog_button, field_style_with_radius, form_radio};
 use iced::widget::{button, canvas, column, container, row, text, text_input, Space};
 use iced::{mouse, Background, Border, Element, Length, Point, Rectangle, Size, Theme};
-use crate::t;
 use std::borrow::Cow;
 
 const CELL_PX: f32 = 44.0;
@@ -52,28 +52,35 @@ impl canvas::Program<Message> for GlyphCanvas {
             0 => frame.fill(&canvas::Path::circle(Point::new(cx, cy), 2.4), glyph),
             1 => {}
             2 => {
-                frame.stroke(&line(Point::new(cx - r, cy), Point::new(cx + r, cy)), stroke.clone());
-                frame.stroke(&line(Point::new(cx, cy - r), Point::new(cx, cy + r)), stroke.clone());
+                frame.stroke(
+                    &line(Point::new(cx - r, cy), Point::new(cx + r, cy)),
+                    stroke,
+                );
+                frame.stroke(
+                    &line(Point::new(cx, cy - r), Point::new(cx, cy + r)),
+                    stroke,
+                );
             }
             3 => {
                 frame.stroke(
                     &line(Point::new(cx - r, cy - r), Point::new(cx + r, cy + r)),
-                    stroke.clone(),
+                    stroke,
                 );
                 frame.stroke(
                     &line(Point::new(cx - r, cy + r), Point::new(cx + r, cy - r)),
-                    stroke.clone(),
+                    stroke,
                 );
             }
-            4 => frame.stroke(&line(Point::new(cx, cy), Point::new(cx, cy - r)), stroke.clone()),
+            4 => frame.stroke(&line(Point::new(cx, cy), Point::new(cx, cy - r)), stroke),
             _ => {}
         }
         if self.mode & 32 != 0 {
-            frame.stroke(&canvas::Path::circle(Point::new(cx, cy), r), stroke.clone());
+            frame.stroke(&canvas::Path::circle(Point::new(cx, cy), r), stroke);
         }
         if self.mode & 64 != 0 {
-            let sq = canvas::Path::rectangle(Point::new(cx - r, cy - r), Size::new(2.0 * r, 2.0 * r));
-            frame.stroke(&sq, stroke.clone());
+            let sq =
+                canvas::Path::rectangle(Point::new(cx - r, cy - r), Size::new(2.0 * r, 2.0 * r));
+            frame.stroke(&sq, stroke);
         }
         vec![frame.into_geometry()]
     }
@@ -109,26 +116,6 @@ fn cell<'a>(value: i16, selected: bool) -> Element<'a, Message> {
         .into()
 }
 
-fn field_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
-    let palette = theme.palette();
-    let border = match status {
-        text_input::Status::Focused { .. } => palette.primary.base.color,
-        _ => palette.background.neutral.color,
-    };
-    text_input::Style {
-        background: Background::Color(palette.background.base.color),
-        border: Border {
-            color: border,
-            width: 1.0,
-            radius: 4.0.into(),
-        },
-        icon: palette.background.base.text,
-        placeholder: palette.background.base.text.scale_alpha(0.48),
-        value: palette.background.base.text,
-        selection: palette.primary.base.color.scale_alpha(0.5),
-    }
-}
-
 pub fn view_window<'a>(
     pdmode: i16,
     relative: bool,
@@ -154,11 +141,17 @@ pub fn view_window<'a>(
         text_input("0", size_buf)
             .on_input(Message::PointStyleSizeInput)
             .on_submit(Message::PointStyleApplySize)
-            .style(field_style)
+            .style(|theme, status| field_style_with_radius(theme, status, 4.0))
             .size(13)
             .width(110),
         Space::new().width(6),
-        text(if relative { Cow::Borrowed("%") } else { t!("units") }).size(12).style(muted_style),
+        text(if relative {
+            Cow::Borrowed("%")
+        } else {
+            t!("units")
+        })
+        .size(12)
+        .style(muted_style),
     ]
     .align_y(iced::Center);
 
@@ -178,7 +171,13 @@ pub fn view_window<'a>(
     ]
     .spacing(6);
 
-    let ok = dialog_button(t!("OK"), Message::PointStyleOk, true);
+    let actions = row![
+        Space::new().width(width),
+        dialog_button(t!("OK"), Message::PointStyleOk, true),
+        dialog_button(t!("Cancel"), Message::CloseModal, false),
+    ]
+    .spacing(8)
+    .align_y(iced::Center);
 
     container(
         column![
@@ -190,7 +189,7 @@ pub fn view_window<'a>(
             Space::new().height(8),
             radios,
             Space::new().height(12),
-            row![Space::new().width(width), ok].width(width),
+            actions.width(width),
         ]
         .spacing(4)
         .padding(20)
@@ -198,9 +197,7 @@ pub fn view_window<'a>(
         .height(height),
     )
     .style(|theme: &Theme| container::Style {
-        background: Some(Background::Color(
-            theme.palette().background.base.color
-        )),
+        background: Some(Background::Color(theme.palette().background.base.color)),
         ..Default::default()
     })
     .width(width)

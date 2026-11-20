@@ -1,7 +1,7 @@
-use codec::entities::{Dimension, DimensionOrdinate};
-use codec::types::Vector3;
-use codec::EntityType;
-use glam::{DVec3, Vec3};
+use document::entities::{Dimension, DimensionOrdinate};
+use document::types::Vector3;
+use document::EntityType;
+use glam::DVec3;
 
 use crate::command::{
     CadCommand, CmdOption, CmdResult, DimensionAssociationInput, DimensionPreview, InputKind,
@@ -42,6 +42,12 @@ pub struct OrdinateDimCommand {
     awaiting_angle: bool,
 }
 
+impl Default for OrdinateDimCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OrdinateDimCommand {
     pub fn new() -> Self {
         Self {
@@ -79,7 +85,8 @@ impl OrdinateDimCommand {
             dim.base.text_rotation = angle;
         }
         dim.refresh_measurement();
-        self.plane.place_entity(EntityType::Dimension(Dimension::Ordinate(dim)))
+        self.plane
+            .place_entity(EntityType::Dimension(Box::new(Dimension::Ordinate(dim))))
     }
 }
 
@@ -94,18 +101,17 @@ impl CadCommand for OrdinateDimCommand {
 
     fn prompt(&self) -> String {
         if self.awaiting_text {
-            return t!("DIMORDINATE  Enter dimension text (blank = measured value):")
-                .into_owned();
+            return t!("DIMORDINATE  Enter dimension text (blank = measured value):").into_owned();
         }
         if self.awaiting_angle {
             return t!("DIMORDINATE  Specify text angle (degrees):").into_owned();
         }
         match self.step {
             Step::FeaturePoint => t!("DIMORDINATE  Specify feature location:").into_owned(),
-            Step::LeaderEndpoint { .. } => t!(
-                "DIMORDINATE  Specify leader endpoint [Xdatum/Ydatum/Mtext/Text/Angle]:"
-            )
-            .into_owned(),
+            Step::LeaderEndpoint { .. } => {
+                t!("DIMORDINATE  Specify leader endpoint [Xdatum/Ydatum/Mtext/Text/Angle]:")
+                    .into_owned()
+            }
         }
     }
 
@@ -115,14 +121,12 @@ impl CadCommand for OrdinateDimCommand {
                 self.step = Step::LeaderEndpoint { feature: pt };
                 CmdResult::NeedPoint
             }
-            Step::LeaderEndpoint { feature } => {
-                CmdResult::CommitDimension {
-                    entity: self.build_dimension(feature, pt),
-                    association: DimensionAssociationInput::Infer(None),
-                    preserve_base_style: false,
-                    continue_command: false,
-                }
-            }
+            Step::LeaderEndpoint { feature } => CmdResult::CommitDimension {
+                entity: self.build_dimension(feature, pt),
+                association: DimensionAssociationInput::Infer(None),
+                preserve_base_style: false,
+                continue_command: false,
+            },
         }
     }
 
@@ -253,11 +257,7 @@ impl CadCommand for OrdinateDimCommand {
         Some(preview_wire(
             points
                 .into_iter()
-                .map(|point| {
-                    self.plane
-                        .to_world(DVec3::new(point.x, point.y, point.z))
-                        .as_vec3()
-                })
+                .map(|point| self.plane.to_world(DVec3::new(point.x, point.y, point.z)))
                 .collect(),
         ))
     }
@@ -266,7 +266,9 @@ impl CadCommand for OrdinateDimCommand {
         let Step::LeaderEndpoint { feature } = self.step else {
             return None;
         };
-        Some(vec![DimensionPreview::current_style(self.build_dimension(feature, cursor))])
+        Some(vec![DimensionPreview::current_style(
+            self.build_dimension(feature, cursor),
+        )])
     }
 }
 
@@ -280,44 +282,16 @@ fn is_x_type(feature: DVec3, leader: DVec3) -> bool {
     dy > dx
 }
 
-fn preview_wire(points: Vec<Vec3>) -> WireModel {
-    WireModel {
-        bg_adapt: None,
-        point_marker: None,
-        taper_widths: Vec::new(),
-        pattern_stations: Vec::new(),
-        world_width: 0.0,
-        depth_override: None,
-        display_visible: true,
-        snap_only: false,
-        plot_visible: true,
-        fill_is_3d: false,
-        fill_is_2d_solid: false,
-        render_instance: None,
-        pick_tris: Vec::new(),
-        pick_tris_low: Vec::new(),
-        dash_from_start: false,
-        dash_align_end: None,
-        text_verts: Vec::new(),
-        name: "dimordinate_preview".into(),
-        points: points.into_iter().map(|p| [p.x, p.y, p.z]).collect(),
-        points_low: Vec::new(),
-        color: WireModel::CYAN,
-        selected: false,
-        pattern_length: 0.0,
-        pattern: [0.0; 8],
-        line_weight_px: 1.0,
-        snap_pts: vec![],
-        tangent_geoms: vec![],
-        aci: 0,
-        key_vertices: vec![],
-        aabb: WireModel::UNBOUNDED_AABB,
-        plinegen: true,
-        fill_tris: vec![],
-        fill_tris_low: Vec::new(),
-    }
+fn preview_wire(points: Vec<DVec3>) -> WireModel {
+    WireModel::solid_f64(
+        "dimordinate_preview".into(),
+        points.into_iter().map(|point| point.to_array()).collect(),
+        WireModel::CYAN,
+        false,
+    )
 }
 
-
 // ── Autocomplete registry ─────────────────────────────────
-inventory::submit!(crate::command::CommandRegistration { names: &["DIMORDINATE"] });  // OrdinateDimCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["DIMORDINATE"]
+}); // OrdinateDimCommand

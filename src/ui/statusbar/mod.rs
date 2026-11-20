@@ -1,12 +1,12 @@
 //! Bottom status bar — Model/Layout tabs + OSNAP toggle + status info
 
-pub mod status_menu;
 pub(crate) mod spacemouse;
+pub mod status_menu;
 pub mod statusbar_config;
 pub mod statusbar_menu;
 
 use iced::widget::tooltip::Position as TipPos;
-use iced::widget::{button, column, container, mouse_area, row, text, text_input, tooltip};
+use iced::widget::{button, container, mouse_area, row, text, text_input, tooltip};
 use iced::{Background, Border, Color, Element, Length, Theme};
 use iced_aw::ContextMenu;
 use std::sync::Arc;
@@ -24,6 +24,7 @@ use crate::app::Message;
 use crate::snap::Snapper;
 use crate::t;
 use crate::ui::statusbar::status_menu::Entry as StatusMenuEntry;
+use crate::ui::window::drafting_settings::DraftingSettingsTab;
 use crate::ui::statusbar::statusbar_config::{StatusBarConfig, StatusPill};
 use crate::ui::wrap_bar::WrapBar;
 
@@ -52,77 +53,99 @@ pub struct StatusMenuData<'a> {
     pub tooltip_hidden: bool,
 }
 
+/// Drawing/layout inputs used to build the status bar's layout and scale controls.
+pub struct StatusBarLayoutState<'a> {
+    pub layouts: Arc<Vec<String>>,
+    pub block_tabs: Vec<String>,
+    pub current_layout: &'a str,
+    pub active_block: Option<String>,
+    pub is_start: bool,
+    pub rename_state: Option<&'a (String, String)>,
+    pub viewport_scale: Option<f64>,
+    pub viewport_count: usize,
+    pub in_mspace: bool,
+    pub show_layout_tabs: bool,
+    pub annotation_scale: f32,
+    pub scale_pill_enabled: bool,
+    pub annotation_all_visible: bool,
+    pub annotation_auto_add: bool,
+    pub viewport_scale_synced: Option<bool>,
+    /// Display lock of the entered or selected viewports, `None` without one.
+    pub viewport_locked: Option<bool>,
+    pub lineweight_display: bool,
+    pub constraint_status: Option<bool>,
+    /// A georeferenced drawing's coordinate system: its name and the
+    /// tooltip's details (#2686). `None` hides the pill.
+    pub geo_system: Option<(String, String)>,
+}
+
+/// Drafting modes and document settings represented by status bar controls.
+pub struct StatusBarModes {
+    pub grid: bool,
+    pub grid_snap: bool,
+    pub ortho_mode: bool,
+    pub polar_mode: bool,
+    pub polar_increment_deg: f32,
+    pub dyn_input: bool,
+    pub otrack: bool,
+    pub dynamic_ucs: bool,
+    pub isometric_drafting: bool,
+    pub iso_plane: crate::app::settings::IsoPlane,
+    pub clean_screen: bool,
+    pub linear_format: i16,
+    pub isolation_active: bool,
+    pub transparency_display: bool,
+    pub quick_properties: bool,
+    pub selection_filter_active: bool,
+    pub selection_cycling: bool,
+}
+
+/// Cursor coordinate readout inputs.
+pub struct StatusBarReadout {
+    pub cursor_world: glam::DVec3,
+    pub coords_mode: i16,
+    pub last_point: Option<glam::DVec3>,
+    pub picking: bool,
+}
+
 #[derive(Clone, Default)]
 pub struct StatusBar {
     #[allow(dead_code)]
     pub coord_display: String,
+    /// The quad cursor menu's display flags, mirrored from the app per
+    /// message (the bar has no other path to the app's settings).
+    pub quad: crate::ui::popup::quad_status::QuadStatusFlags,
+    /// Widest coordinate readout so far, in characters, and the mode it was
+    /// measured in. The pill keeps that width so the bar does not reflow,
+    /// and jump the layout tabs between one and two rows, as the cursor moves.
+    coords_width: std::cell::Cell<(i16, usize)>,
 }
 
 impl StatusBar {
     pub fn new() -> Self {
         Self {
             coord_display: "MODEL".into(),
+            quad: Default::default(),
+            coords_width: std::cell::Cell::new((0, 0)),
         }
+    }
+
+    /// The character width the coordinates pill reserves for `label`: the
+    /// widest readout shown in this mode, so it only grows.
+    fn coords_pill_chars(&self, mode: i16, label: &str) -> usize {
+        let (last_mode, widest) = self.coords_width.get();
+        let widest = if last_mode == mode { widest } else { 0 };
+        let chars = label.chars().count().max(widest);
+        self.coords_width.set((mode, chars));
+        chars
     }
 
     pub fn view<'a>(
         &'a self,
         snapper: &'a Snapper,
-        ortho_mode: bool,
-        polar_mode: bool,
-        polar_increment_deg: f32,
-        dyn_input: bool,
-        otrack: bool,
-        isometric_drafting: bool,
-        iso_plane: crate::app::settings::IsoPlane,
-        layouts: Arc<Vec<String>>,
-        block_tabs: Vec<String>,
-        current_layout: &'a str,
-        active_block: Option<String>,
-        // Start/welcome view has no drawing to own layouts.
-        is_start: bool,
-        // If `Some((original, edit_value))`, the named tab shows a text input.
-        rename_state: Option<&'a (String, String)>,
-        // Scale of the first user viewport in the active paper layout.
-        viewport_scale: Option<f64>,
-        // Number of user viewports in the current paper layout (0 = model space).
-        viewport_count: usize,
-        // True when the user is editing inside a paper-space viewport (MSPACE).
-        in_mspace: bool,
-        // Whether the layout tabs (Model/Paper) are visible (LAYOUTTAB).
-        show_layout_tabs: bool,
-        // Current annotation scale for model space (1.0 = 1:1, 50.0 = 1:50, etc.).
-        annotation_scale: f32,
-        // True when the scale pill is interactive (always model space; paper space only when a viewport is active/selected).
-        scale_pill_enabled: bool,
-        annotation_all_visible: bool,
-        annotation_auto_add: bool,
-        viewport_scale_synced: Option<bool>,
-        // LWDISPLAY header flag — controls lineweight visibility in the viewport.
-        lineweight_display: bool,
-        // Live cursor position in model coordinates, for the coordinate readout.
-        cursor_world: glam::DVec3,
-        // $COORDS readout mode: 0 = static (updates only on a pick), 1 = live
-        // absolute, 2 = polar (distance<angle from the last point while picking).
-        coords_mode: i16,
-        // The last committed point, for the static (0) and polar (2) readouts.
-        last_point: Option<glam::DVec3>,
-        // True while a command is prompting for a point (enables the polar readout).
-        picking: bool,
-        // True while clean-screen mode hides the ribbon and side panels.
-        clean_screen: bool,
-        // LUNITS — how lengths are written, for the units pill.
-        linear_format: i16,
-        // True when objects are hidden by Isolate / Hide.
-        isolation_active: bool,
-        // Whether entity transparency is shown (Transparency pill state).
-        transparency_display: bool,
-        // Whether the Quick Properties floating panel is enabled.
-        quick_properties: bool,
-        // True when the selection filter is excluding at least one type.
-        selection_filter_active: bool,
-        // Whether selection cycling is enabled.
-        selection_cycling: bool,
+        layout: StatusBarLayoutState<'a>,
+        modes: StatusBarModes,
+        readout: StatusBarReadout,
         // Which pills the user has chosen to show on the bar.
         config: &'a StatusBarConfig,
         menu_data: StatusMenuData<'a>,
@@ -140,6 +163,52 @@ impl StatusBar {
         gpu_status: &'a crate::scene::pipeline::GpuStatus,
         spacemouse: Option<Element<'a, Message>>,
     ) -> Element<'a, Message> {
+        let StatusBarLayoutState {
+            layouts,
+            block_tabs,
+            current_layout,
+            active_block,
+            is_start,
+            rename_state,
+            viewport_scale,
+            viewport_count,
+            in_mspace,
+            show_layout_tabs,
+            annotation_scale,
+            scale_pill_enabled,
+            annotation_all_visible,
+            annotation_auto_add,
+            viewport_scale_synced,
+            viewport_locked,
+            lineweight_display,
+            constraint_status,
+            geo_system,
+        } = layout;
+        let StatusBarModes {
+            grid,
+            grid_snap,
+            ortho_mode,
+            polar_mode,
+            polar_increment_deg,
+            dyn_input,
+            otrack,
+            dynamic_ucs,
+            isometric_drafting,
+            iso_plane,
+            clean_screen,
+            linear_format,
+            isolation_active,
+            transparency_display,
+            quick_properties,
+            selection_filter_active,
+            selection_cycling,
+        } = modes;
+        let StatusBarReadout {
+            cursor_world,
+            coords_mode,
+            last_point,
+            picking,
+        } = readout;
         let StatusMenuData {
             layout_names,
             polar_custom_input,
@@ -238,7 +307,7 @@ impl StatusBar {
                 if scale_is_model { 150.0 } else { 120.0 },
             )
         } else {
-            status_pill(scale_label).into()
+            status_pill(scale_label)
         };
         // Build the right-side pills, honouring the user's per-pill visibility.
         // They live in a flex-wrap flow (WrapFlow) so they spill onto extra rows
@@ -262,17 +331,18 @@ impl StatusBar {
                 }
                 _ => crate::tr!("gpu", "pill-tip"),
             };
-            pills.push(tip(warning_pill(label, Message::GpuWarningOpen), detail.into()).into());
+            pills.push(tip(
+                warning_pill(label, Message::GpuWarningOpen),
+                detail.into(),
+            ));
         }
         if vis(StatusPill::Coords) {
             let coords_label = format_coords(cursor_world, last_point, coords_mode, picking);
-            pills.push(
-                tip(
-                    action_pill(&coords_label, Message::CycleCoordsMode),
-                    t!("Cursor coordinates ($COORDS)\nClick to cycle: static / live / polar"),
-                )
-                .into(),
-            );
+            let chars = self.coords_pill_chars(coords_mode, &coords_label);
+            pills.push(tip(
+                fixed_width_pill(&coords_label, chars, Message::CycleCoordsMode),
+                t!("Cursor coordinates ($COORDS)\nClick to cycle: static / live / polar"),
+            ));
         }
         // Not a `StatusPill` (so not user-hideable yet): invisible until the
         // current scope actually has a ParametricConstraintSet, so a drawing
@@ -283,17 +353,24 @@ impl StatusBar {
             } else {
                 status_pill(crate::tf!("DOF: {dof}").into_owned())
             };
-            pills.push(
-                tip(
-                    pill,
-                    if dof == 0 {
-                        t!("Fully constrained — no remaining degrees of freedom")
-                    } else {
-                        t!("Remaining degrees of freedom in the current parametric constraint scope")
-                    },
-                )
-                .into(),
-            );
+            pills.push(tip(
+                pill,
+                if dof == 0 {
+                    t!("Fully constrained — no remaining degrees of freedom")
+                } else {
+                    t!("Remaining degrees of freedom in the current parametric constraint scope")
+                },
+            ));
+        }
+        if let Some(enabled) = constraint_status {
+            pills.push(tip(
+                toggle_pill(
+                    include_bytes!("../../../assets/icons/constrain/fixed.svg"),
+                    enabled,
+                    Message::ToggleBlockConstraintStatus,
+                ),
+                t!("Constraint status display (BCONSTATUSMODE)"),
+            ));
         }
         // Each click removes one flagged constraint.
         if parametric_conflicts > 0 {
@@ -304,181 +381,202 @@ impl StatusBar {
                         Message::ResolveOneParametricConflict,
                     ),
                     t!("One or more parametric constraints conflict or are redundant\nClick to remove one and re-solve"),
-                )
-                .into(),
+                ),
             );
+        }
+        if vis(StatusPill::Grid) {
+            pills.push(with_settings(
+                tip(
+                    toggle_pill(crate::ui::icons::GRID, grid, Message::ToggleGrid),
+                    t!("Toggle Grid"),
+                ),
+                t!("Grid Settings..."),
+                DraftingSettingsTab::SnapAndGrid,
+            ));
+        }
+        if vis(StatusPill::Snap) {
+            pills.push(with_settings(
+                tip(
+                    toggle_pill(crate::ui::icons::SNAP, grid_snap, Message::ToggleGridSnap),
+                    t!("Toggle Grid Snap"),
+                ),
+                t!("Snap Settings..."),
+                DraftingSettingsTab::SnapAndGrid,
+            ));
         }
         if vis(StatusPill::Ortho) {
-            pills.push(
-                tip(
-                    toggle_pill(crate::ui::icons::ST_ORTHO, ortho_mode, Message::ToggleOrtho),
-                    t!("Orthogonal Mode\nF8"),
-                )
-                .into(),
-            );
+            pills.push(tip(
+                toggle_pill(crate::ui::icons::ST_ORTHO, ortho_mode, Message::ToggleOrtho),
+                t!("Orthogonal Mode\nF8"),
+            ));
         }
         if vis(StatusPill::Lwt) {
-            pills.push(
-                tip(
-                    toggle_pill(
-                        crate::ui::icons::ST_LWT,
-                        lineweight_display,
-                        Message::ToggleLineweightDisplay,
-                    ),
-                    t!("Show Lineweight\nLWDISPLAY"),
-                )
-                .into(),
-            );
+            pills.push(tip(
+                toggle_pill(
+                    crate::ui::icons::ST_LWT,
+                    lineweight_display,
+                    Message::ToggleLineweightDisplay,
+                ),
+                t!("Show Lineweight\nLWDISPLAY"),
+            ));
         }
         if vis(StatusPill::Polar) {
-            pills.push(
-                polar_pill(
-                    polar_mode,
+            pills.push(polar_pill(
+                polar_mode,
+                polar_increment_deg,
+                tooltip_hidden,
+                crate::ui::popup::polar_popup::menu_entries(
                     polar_increment_deg,
-                    tooltip_hidden,
-                    crate::ui::popup::polar_popup::menu_entries(
-                        polar_increment_deg,
-                        polar_custom_input,
-                    ),
-                )
-                .into(),
-            );
+                    polar_custom_input,
+                ),
+            ));
         }
         if vis(StatusPill::Dyn) {
-            pills.push(
+            pills.push(with_settings(
                 tip(
                     toggle_pill(crate::ui::icons::ST_DYN, dyn_input, Message::ToggleDynInput),
                     t!("Dynamic Input\nF12"),
-                )
-                .into(),
-            );
+                ),
+                t!("Dynamic Input Settings..."),
+                DraftingSettingsTab::DynamicInput,
+            ));
         }
         if vis(StatusPill::Otrack) {
-            pills.push(
+            pills.push(with_settings(
                 tip(
                     toggle_pill(crate::ui::icons::ST_OTRACK, otrack, Message::ToggleOTrack),
                     t!("Object Snap Tracking\nF11"),
-                )
-                .into(),
-            );
+                ),
+                t!("Object Snap Tracking Settings..."),
+                DraftingSettingsTab::ObjectSnap,
+            ));
+        }
+        if vis(StatusPill::Ducs) {
+            pills.push(tip(
+                toggle_pill(
+                    crate::ui::icons::ST_DUCS,
+                    dynamic_ucs,
+                    Message::ToggleDynamicUcs,
+                ),
+                t!("Dynamic UCS\nF6"),
+            ));
         }
         if vis(StatusPill::Osnap) {
-            pills.push(
-                osnap_btn(
-                    osnap_active,
-                    snapper.snap_enabled,
-                    tooltip_hidden,
-                    crate::ui::popup::snap_popup::menu_entries(
-                        snapper,
-                        isometric_drafting,
-                        iso_plane,
-                    ),
-                )
-                .into(),
-            );
+            pills.push(osnap_btn(
+                osnap_active,
+                snapper.snap_enabled,
+                tooltip_hidden,
+                crate::ui::popup::snap_popup::menu_entries(snapper, isometric_drafting, iso_plane),
+            ));
+        }
+        // ── QUAD field (docs/quad-menu.md §3.6) ──────────────────────────
+        // One mastertoggle left of the pill's caret opens the display-option
+        // popup, both wired through `Message::Quad` / `Message::QuadOption`.
+        // The mirrored flags live on `StatusBar` (refreshed per message by
+        // the app). Hidden until turned on from the customization menu.
+        if vis(StatusPill::Quad) {
+            pills.push(quad_pill(
+                self.quad.on,
+                tooltip_hidden,
+                crate::ui::popup::quad_status::menu_entries(self.quad),
+            ));
         }
         if vis(StatusPill::Space) {
             pills.push(
                 tip(
                     space_mode_btn(current_layout, in_mspace),
                     t!("PAPER: double-click viewport to enter MSPACE\nMODEL: click to switch to Model Space"),
-                )
-                .into(),
+                ),
             );
         }
         if vis(StatusPill::Scale) {
             pills.push(scale_element);
         }
         if vis(StatusPill::AnnoVisibility) {
-            pills.push(
-                tip(
-                    toggle_pill(
-                        ST_ANNO_VISIBILITY,
-                        annotation_all_visible,
-                        Message::ToggleAnnotationVisibility,
-                    ),
-                    t!("Show Annotation Objects"),
-                )
-                .into(),
-            );
+            pills.push(tip(
+                toggle_pill(
+                    ST_ANNO_VISIBILITY,
+                    annotation_all_visible,
+                    Message::ToggleAnnotationVisibility,
+                ),
+                t!("Show Annotation Objects"),
+            ));
         }
         if vis(StatusPill::AnnoAutoAdd) {
-            pills.push(
-                tip(
-                    toggle_pill(
-                        ST_ANNO_AUTO_ADD,
-                        annotation_auto_add,
-                        Message::ToggleAnnotationAutoAdd,
-                    ),
-                    t!("Automatically Add Scales"),
-                )
-                .into(),
-            );
+            pills.push(tip(
+                toggle_pill(
+                    ST_ANNO_AUTO_ADD,
+                    annotation_auto_add,
+                    Message::ToggleAnnotationAutoAdd,
+                ),
+                t!("Automatically Add Scales"),
+            ));
         }
         if vis(StatusPill::VpScaleSync) {
             if let Some(synced) = viewport_scale_synced {
-                pills.push(
-                    tip(
-                        toggle_pill(
-                            ST_VP_SCALE_SYNC,
-                            synced,
-                            Message::SyncViewportAnnotationScale,
-                        ),
-                        t!("Viewport / Annotation Scale Sync"),
-                    )
-                    .into(),
-                );
+                pills.push(tip(
+                    toggle_pill(
+                        ST_VP_SCALE_SYNC,
+                        synced,
+                        Message::SyncViewportAnnotationScale,
+                    ),
+                    t!("Viewport / Annotation Scale Sync"),
+                ));
+            }
+        }
+        if vis(StatusPill::VpLock) {
+            if let Some(locked) = viewport_locked {
+                pills.push(tip(
+                    toggle_pill(crate::ui::icons::LOCK, locked, Message::ToggleViewportLock),
+                    t!("Lock/Unlock Viewport"),
+                ));
             }
         }
         if vis(StatusPill::Units) {
-            pills.push(
-                status_menu::menu_bar(
-                    menu_tip(
-                        popup_pill(t!(crate::modules::draw::units::linear_format_short(
-                            linear_format
-                        ))),
-                        t!("Units (LUNITS)\nHow lengths are written\nClick to change"),
-                        tooltip_hidden,
-                    ),
-                    crate::ui::popup::units_popup::menu_entries(linear_format),
-                    140.0,
-                )
-                .into(),
-            );
+            pills.push(status_menu::menu_bar(
+                menu_tip(
+                    popup_pill(t!(crate::modules::draw::units::linear_format_short(
+                        linear_format
+                    ))),
+                    t!("Units (LUNITS)\nHow lengths are written\nClick to change"),
+                    tooltip_hidden,
+                ),
+                crate::ui::popup::units_popup::menu_entries(linear_format),
+                140.0,
+            ));
+        }
+        if vis(StatusPill::Geo) {
+            if let Some((name, details)) = geo_system {
+                pills.push(tip(popup_pill(name), details.into()));
+            }
         }
         if vis(StatusPill::Transparency) {
-            pills.push(
-                tip(
-                    toggle_pill(
-                        crate::ui::icons::ST_TRANSPARENCY,
-                        transparency_display,
-                        Message::ToggleTransparencyDisplay,
-                    ),
-                    t!("Show Transparency\nForce opaque when off"),
-                )
-                .into(),
-            );
+            pills.push(tip(
+                toggle_pill(
+                    crate::ui::icons::ST_TRANSPARENCY,
+                    transparency_display,
+                    Message::ToggleTransparencyDisplay,
+                ),
+                t!("Show Transparency\nForce opaque when off"),
+            ));
         }
         if vis(StatusPill::Isolate) {
-            pills.push(
-                status_menu::menu_bar(
-                    menu_tip(
-                        toggle_pill(
-                            crate::ui::icons::ST_ISOLATE,
-                            isolation_active,
-                            Message::StatusMenuTooltipHidden(true),
-                        ),
-                        t!("Isolate Objects\nClick for Isolate / Hide / End"),
-                        tooltip_hidden,
+            pills.push(status_menu::menu_bar(
+                menu_tip(
+                    toggle_pill(
+                        crate::ui::icons::ST_ISOLATE,
+                        isolation_active,
+                        Message::StatusMenuTooltipHidden(true),
                     ),
-                    crate::ui::popup::isolate_popup::menu_entries(has_selection, isolation_active),
-                    160.0,
-                )
-                .into(),
-            );
+                    t!("Isolate Objects\nClick for Isolate / Hide / End"),
+                    tooltip_hidden,
+                ),
+                crate::ui::popup::isolate_popup::menu_entries(has_selection, isolation_active),
+                160.0,
+            ));
         }
         if vis(StatusPill::QuickProps) {
-            pills.push(
+            pills.push(with_settings(
                 tip(
                     toggle_pill(
                         crate::ui::icons::ST_QUICKPROPS,
@@ -486,33 +584,31 @@ impl StatusBar {
                         Message::ToggleQuickProperties,
                     ),
                     t!("Quick Properties\nFloating panel on selection"),
-                )
-                .into(),
-            );
+                ),
+                t!("Quick Properties Settings..."),
+                DraftingSettingsTab::QuickProperties,
+            ));
         }
         if vis(StatusPill::SelFilter) {
-            pills.push(
-                status_menu::menu_bar(
-                    menu_tip(
-                        toggle_pill(
-                            crate::ui::icons::ST_FILTER,
-                            selection_filter_active,
-                            Message::StatusMenuTooltipHidden(true),
-                        ),
-                        t!("Selection Filtering\nLimit which object types can be picked"),
-                        tooltip_hidden,
+            pills.push(status_menu::menu_bar(
+                menu_tip(
+                    toggle_pill(
+                        crate::ui::icons::ST_FILTER,
+                        selection_filter_active,
+                        Message::StatusMenuTooltipHidden(true),
                     ),
-                    crate::ui::popup::selection_filter_popup::menu_entries(
-                        &selection_types,
-                        selection_filter,
-                    ),
-                    180.0,
-                )
-                .into(),
-            );
+                    t!("Selection Filtering\nLimit which object types can be picked"),
+                    tooltip_hidden,
+                ),
+                crate::ui::popup::selection_filter_popup::menu_entries(
+                    &selection_types,
+                    selection_filter,
+                ),
+                180.0,
+            ));
         }
         if vis(StatusPill::SelCycle) {
-            pills.push(
+            pills.push(with_settings(
                 tip(
                     toggle_pill(
                         crate::ui::icons::ST_SELCYCLE,
@@ -520,45 +616,37 @@ impl StatusBar {
                         Message::ToggleSelectionCycling,
                     ),
                     t!("Selection Cycling\nRepeat-click to step through overlapping objects"),
-                )
-                .into(),
-            );
+                ),
+                t!("Selection Cycling Settings..."),
+                DraftingSettingsTab::SelectionCycling,
+            ));
         }
         if vis(StatusPill::Vp) && !vp_label.is_empty() {
-            pills.push(
-                tip(
-                    status_pill(vp_label).into(),
-                    t!("Viewport count in active layout"),
-                )
-                .into(),
-            );
+            pills.push(tip(
+                status_pill(vp_label),
+                t!("Viewport count in active layout"),
+            ));
         }
         if vis(StatusPill::CleanScreen) {
-            pills.push(
-                tip(
-                    toggle_pill(
-                        crate::ui::icons::ST_CLEANSCREEN,
-                        clean_screen,
-                        Message::ToggleCleanScreen,
-                    ),
-                    t!("Clean Screen\nHide ribbon and panels"),
-                )
-                .into(),
-            );
+            pills.push(tip(
+                toggle_pill(
+                    crate::ui::icons::ST_CLEANSCREEN,
+                    clean_screen,
+                    Message::ToggleCleanScreen,
+                ),
+                t!("Clean Screen\nHide ribbon and panels"),
+            ));
         }
         // Customization handle: opens the pill show/hide menu.
-        pills.push(
-            status_menu::menu_bar(
-                menu_tip(
-                    customize_btn(),
-                    t!("Customization\nShow or hide status-bar items"),
-                    tooltip_hidden,
-                ),
-                statusbar_menu::customization_entries(config),
-                200.0,
-            )
-            .into(),
-        );
+        pills.push(status_menu::menu_bar(
+            menu_tip(
+                customize_btn(),
+                t!("Customization\nShow or hide status-bar items"),
+                tooltip_hidden,
+            ),
+            statusbar_menu::customization_entries(config),
+            200.0,
+        ));
         let right_status = iced::widget::Row::with_children(pills)
             .spacing(2.0)
             .align_y(iced::Center)
@@ -575,8 +663,7 @@ impl StatusBar {
         if show_layout_tabs {
             // Paper layouts only: `layouts[0]` is always "Model". Derived once
             // from the shared `Arc` and cloned (cheap refcount bump) per tab.
-            let reorderable_layouts: Arc<[String]> =
-                Arc::from(layouts.get(1..).unwrap_or(&[]));
+            let reorderable_layouts: Arc<[String]> = Arc::from(layouts.get(1..).unwrap_or(&[]));
             // Shared once per frame: block tabs carry no reorder set, so reuse
             // one empty Arc (refcount bump) instead of allocating per tab.
             let empty_reorderable: Arc<[String]> = Arc::from([] as [String; 0]);
@@ -586,36 +673,30 @@ impl StatusBar {
                     .filter(|(orig, _)| orig.as_str() == name.as_str())
                     .map(|(_, edit)| edit.as_str());
                 let switch_msg = Message::LayoutSwitch(name.to_owned());
-                left.push(
-                    space_tab(
-                        name.to_owned(),
-                        is_active,
-                        renaming,
-                        !is_start,
-                        reorderable_layouts.clone(),
-                        switch_msg,
-                        "SB_LAYOUT_TAB",
-                    )
-                    .into(),
-                );
+                left.push(space_tab(
+                    name.to_owned(),
+                    is_active,
+                    renaming,
+                    !is_start,
+                    reorderable_layouts.clone(),
+                    switch_msg,
+                    "SB_LAYOUT_TAB",
+                ));
             }
             for name in block_tabs.iter() {
                 let is_active = active_block.as_deref() == Some(name.as_str());
                 let switch_msg = Message::BlockEditSwitch(name.to_owned());
-                left.push(
-                    space_tab(
-                        name.to_owned(),
-                        is_active,
-                        None,
-                        !is_start,
-                        empty_reorderable.clone(),
-                        switch_msg,
-                        "SB_BLOCK_TAB",
-                    )
-                    .into(),
-                );
+                left.push(space_tab(
+                    name.to_owned(),
+                    is_active,
+                    None,
+                    !is_start,
+                    empty_reorderable.clone(),
+                    switch_msg,
+                    "SB_BLOCK_TAB",
+                ));
             }
-            left.push(add_btn.into());
+            left.push(add_btn);
         }
         let left_area = iced::widget::Row::with_children(left)
             .spacing(2.0)
@@ -747,6 +828,22 @@ fn tip_node<'a>(content: Element<'a, Message>, body: Element<'a, Message>) -> El
 /// A status-bar toggle, drawn as a tinted icon (issue #216: the old size-10
 /// text labels were too small to read). The name lives in the tooltip each
 /// call site already wraps it with.
+/// `pill` with a right-click menu of one row, `label`, that opens Drafting
+/// Settings on `tab`.
+fn with_settings<'a>(
+    pill: Element<'a, Message>,
+    label: std::borrow::Cow<'static, str>,
+    tab: DraftingSettingsTab,
+) -> Element<'a, Message> {
+    ContextMenu::new(pill, move || {
+        crate::ui::kit::menu::view(vec![crate::ui::kit::menu::Item::new(
+            label.clone(),
+            Message::OpenDraftingSettings(tab),
+        )])
+    })
+    .into()
+}
+
 fn toggle_pill(icon: &'static [u8], active: bool, msg: Message) -> Element<'static, Message> {
     let icon = if active {
         crate::ui::icons::themed_primary_weak_text(icon, 17.0)
@@ -850,7 +947,7 @@ fn polar_pill<'a>(
                     color: Some(if active {
                         palette.primary.weak.text
                     } else {
-                        palette.background.base.text.scale_alpha(0.72)
+                        crate::ui::style::readable::muted_text(theme)
                     }),
                 }
             }),
@@ -893,6 +990,61 @@ fn polar_pill<'a>(
 // ── OSNAP pill ─────────────────────────────────────────────────────────────
 //
 // Main: toggles the global snap on/off. Caret: opens the snap-type dropdown.
+
+// ── Quad toggle pill ───────────────────────────────────────────────────
+//
+// Main: toggles the quad cursor menu on/off (`Message::Quad(Toggle)`,
+// docs/quad-menu.md §3.6). Caret: the display-option popup
+// (`quad_status::menu_entries` → `Message::QuadOption`). No SVG: the pills
+// with text labels (PAPER, scale) set the precedent, and the quad has no
+// dedicated icon file.
+
+fn quad_pill<'a>(
+    on: bool,
+    tooltip_hidden: bool,
+    entries: Vec<StatusMenuEntry<'a>>,
+) -> Element<'a, Message> {
+    let label = text(t!("QUAD")).size(11).style(move |theme: &Theme| {
+        let palette = theme.palette();
+        text::Style {
+            color: Some(if on {
+                palette.primary.weak.text
+            } else {
+                crate::ui::style::readable::muted_text(theme)
+            }),
+        }
+    });
+    let main = mouse_area(container(label).padding([2, 0]))
+        .on_press(Message::Quad(crate::ui::popup::quad_menu::QuadMsg::Toggle));
+    let main = tooltip(
+        main,
+        container(text(t!("Quad cursor menu\nClick to toggle on/off")).size(11))
+            .style(container::bordered_box)
+            .padding([4, 8]),
+        TipPos::Top,
+    );
+
+    let caret = status_menu::menu_bar(
+        menu_tip(
+            mouse_area(
+                container(if on {
+                    crate::ui::icons::themed_primary_weak_arrow_down(9.0)
+                } else {
+                    crate::ui::icons::themed_secondary_arrow_down(9.0)
+                })
+                .padding([4, 7]),
+            )
+            .on_press(Message::StatusMenuTooltipHidden(true))
+            .into(),
+            t!("Quad display options\nClick to choose"),
+            tooltip_hidden,
+        ),
+        entries,
+        crate::ui::popup::quad_status::menu_width(),
+    );
+
+    split_pill(main.into(), caret, on)
+}
 
 fn osnap_btn<'a>(
     active: bool,
@@ -938,26 +1090,15 @@ fn osnap_btn<'a>(
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 fn layout_tab_context_menu(name: String) -> Element<'static, Message> {
-    let rename = mouse_area(
-        container(text(t!("Rename")).size(12))
-            .padding([4, 12])
-            .width(Length::Fill),
-    )
-    .on_press(Message::LayoutRenameStart(name.clone()))
-    .interaction(iced::mouse::Interaction::Pointer);
-
-    let delete = mouse_area(
-        container(text(t!("Delete")).size(12))
-            .padding([4, 12])
-            .width(Length::Fill),
-    )
-    .on_press(Message::LayoutDelete(name))
-    .interaction(iced::mouse::Interaction::Pointer);
-
-    container(column![rename, delete].spacing(0).width(160))
-        .style(container::bordered_box)
-        .padding([4, 0])
-        .into()
+    use crate::ui::kit::menu::{view as menu, Item};
+    menu(vec![
+        Item::new(t!("New Layout"), Message::LayoutCreate),
+        Item::new(t!("Copy"), Message::LayoutCopy(name.clone())),
+        Item::new(t!("Rename"), Message::LayoutRenameStart(name.clone())),
+        Item::new(t!("Delete"), Message::LayoutDelete(name.clone())),
+        Item::new(t!("Page Setup"), Message::LayoutPageSetup(name.clone())),
+        Item::new(t!("Plot"), Message::LayoutPlot(name)),
+    ])
 }
 
 /// A layout tab button.
@@ -981,7 +1122,7 @@ fn space_tab<'a>(
         } else if is_active {
             palette.primary.weak.text
         } else {
-            palette.background.base.text.scale_alpha(0.72)
+            crate::ui::style::readable::muted_text(theme)
         };
         container::Style {
             background: is_active.then_some(Background::Color(palette.primary.weak.color)),
@@ -1157,6 +1298,20 @@ fn popup_pill(label: impl Into<String>) -> Element<'static, Message> {
     action_pill(label, Message::StatusMenuTooltipHidden(true))
 }
 
+/// An action pill whose label area holds `chars` characters, so its width
+/// does not follow a changing label (7 px per character of the 12 px text).
+fn fixed_width_pill(label: &str, chars: usize, msg: Message) -> Element<'static, Message> {
+    button(
+        container(text(label.to_string()).size(12))
+            .width(Length::Fixed(chars as f32 * 7.0))
+            .align_x(iced::alignment::Horizontal::Center),
+    )
+    .on_press(msg)
+    .style(button::subtle)
+    .padding([4, 7])
+    .into()
+}
+
 fn action_pill(label: impl Into<String>, msg: Message) -> Element<'static, Message> {
     let label = label.into();
     button(text(label).size(12))
@@ -1223,4 +1378,24 @@ fn active_scale_label(
             }
         })
         .map(|(label, _, _)| label.clone())
+}
+
+#[cfg(test)]
+mod coords_width_tests {
+    use super::*;
+
+    #[test]
+    fn coords_pill_width_only_grows_within_a_mode() {
+        // The readout's length follows the cursor; the pill keeps the widest
+        // so far, so the bar does not flip between one and two rows.
+        let bar = StatusBar::new();
+        assert_eq!(bar.coords_pill_chars(1, "1 5/16\", -9'-6 55/64\", 0\""), 25);
+        assert_eq!(
+            bar.coords_pill_chars(1, "302'-5 9/32\", -175'-9 27/64\", 0\""),
+            32
+        );
+        assert_eq!(bar.coords_pill_chars(1, "1\", 2\", 0\""), 32);
+        // Another mode measures afresh.
+        assert_eq!(bar.coords_pill_chars(2, "10' < 45d"), 9);
+    }
 }

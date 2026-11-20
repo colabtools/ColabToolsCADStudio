@@ -1,6 +1,6 @@
 use super::*;
 use crate::scene::model::{mesh_model::MeshLodSet, mesh_model::MeshModel, wire_model::WireModel};
-use codec::{types::Transform, Handle};
+use document::{types::Transform, Handle};
 use iced::futures::executor::block_on;
 
 #[test]
@@ -58,38 +58,67 @@ fn block_edits_preserve_cache_coordinates_and_arena_partition() {
     let mut block_geometry = wire_gpu::BlockGeometryCache::default();
     let block = |handle: u64, x: f64| WireModel {
         name: handle.to_string(),
-        points: vec![[x as f32, 0.0, 0.0], [x as f32 + 1.0, 0.0, 0.0]],
         render_instance: Some(crate::scene::model::instance_model::RenderInstance {
             source_id: 1,
             translation: [x, 0.0, 0.0],
+        }),
+        geom: std::sync::Arc::new(crate::scene::WireGeom {
+            points: vec![[x as f32, 0.0, 0.0], [x as f32 + 1.0, 0.0, 0.0]],
+            ..crate::scene::WireGeom::default()
         }),
         ..Default::default()
     };
     let first = block(1, 10.0);
     let second = block(2, 20.0);
     let depth = rustc_hash::FxHashMap::from_iter([(1, [0.1, 0.01]), (2, [0.2, 0.01])]);
-    let original = pipeline.upload_block_wires(&device, &queue, &[&first, &second], &depth, &mut block_geometry);
-    let unchanged = pipeline.upload_block_wires(&device, &queue, &[&first, &second], &depth, &mut block_geometry);
+    let original = pipeline.upload_block_wires(
+        &device,
+        &queue,
+        &[(&first).into(), (&second).into()],
+        &depth,
+        &mut block_geometry,
+    );
+    let unchanged = pipeline.upload_block_wires(
+        &device,
+        &queue,
+        &[(&first).into(), (&second).into()],
+        &depth,
+        &mut block_geometry,
+    );
     assert_eq!(original[0].geometry_id(), unchanged[0].geometry_id());
     assert_eq!(original[0].instance_count, 2);
 
-    let removed = pipeline.upload_block_wires(&device, &queue, &[&second], &depth, &mut block_geometry);
+    let removed = pipeline.upload_block_wires(
+        &device,
+        &queue,
+        &[(&second).into()],
+        &depth,
+        &mut block_geometry,
+    );
     assert_ne!(
         original[0].geometry_id(),
         removed[0].geometry_id(),
         "removing the base instance must replace vertices baked at its old position"
     );
     let moved = block(2, 30.0);
-    let moved_gpu = pipeline.upload_block_wires(&device, &queue, &[&moved], &depth, &mut block_geometry);
+    let moved_gpu = pipeline.upload_block_wires(
+        &device,
+        &queue,
+        &[(&moved).into()],
+        &depth,
+        &mut block_geometry,
+    );
     assert_ne!(removed[0].geometry_id(), moved_gpu[0].geometry_id());
-    let restored = pipeline.upload_block_wires(&device, &queue, &[&first, &second], &depth, &mut block_geometry);
+    let restored = pipeline.upload_block_wires(
+        &device,
+        &queue,
+        &[(&first).into(), (&second).into()],
+        &depth,
+        &mut block_geometry,
+    );
     assert_ne!(moved_gpu[0].geometry_id(), restored[0].geometry_id());
     assert_eq!(restored[0].instance_count, 2);
-    assert_eq!(
-        block_geometry.len(),
-        1,
-        "discard obsolete geometry"
-    );
+    assert_eq!(block_geometry.len(), 1, "discard obsolete geometry");
 
     let line = WireModel {
         render_instance: None,
@@ -152,7 +181,10 @@ fn bounded_gpu_uploads_preserve_geometry_and_instancing() {
     let pipeline = Pipeline::new(&device, &queue, wgpu::TextureFormat::Bgra8UnormSrgb);
 
     let line = WireModel {
-        points: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        geom: std::sync::Arc::new(crate::scene::WireGeom {
+            points: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            ..crate::scene::WireGeom::default()
+        }),
         ..Default::default()
     };
     let count = gpu_budget::max_storage_elements::<wire_gpu::WireConst>(&device) + 2;
@@ -174,7 +206,10 @@ fn bounded_gpu_uploads_preserve_geometry_and_instancing() {
     }
     let segments = gpu_budget::max_elements::<wire_gpu::WireInstance>(&device) + 1;
     let dense = WireModel {
-        points: (0..=segments).map(|i| [i as f32, 0.0, 0.0]).collect(),
+        geom: std::sync::Arc::new(crate::scene::WireGeom {
+            points: (0..=segments).map(|i| [i as f32, 0.0, 0.0]).collect(),
+            ..crate::scene::WireGeom::default()
+        }),
         ..Default::default()
     };
     let chunks = wire_gpu::WireGpu::from_run(
@@ -278,11 +313,20 @@ fn bounded_gpu_uploads_preserve_geometry_and_instancing() {
     for (index, set) in repeated.iter_mut().enumerate() {
         set.instance_handle = Some(Handle::new(1000 + index as u64));
     }
-    let (mesh, total) = mesh_gpu::build_mesh_batch(&device, &queue, &repeated);
+    let (mut mesh, total) = mesh_gpu::build_mesh_batch(&device, &queue, &repeated);
     assert_eq!(mesh.len(), 2);
     assert_eq!(total, instance_count as u64);
     assert_eq!(mesh[0].vertex_buffer, mesh[1].vertex_buffer);
     assert_eq!(mesh[0].index_buffer, mesh[1].index_buffer);
+    // Same material and colour: one bind group, not one per chunk (#1727).
+    mesh_gpu::upload_chunk_material_bind_groups(
+        &device,
+        &queue,
+        &pipeline.mesh_material_bgl,
+        &mut mesh,
+    );
+    assert!(mesh[0].material_bind_group.is_some());
+    assert_eq!(mesh[0].material_bind_group, mesh[1].material_bind_group);
     assert_eq!(
         mesh.iter()
             .map(|chunk| chunk.instance_count as usize)
@@ -297,6 +341,126 @@ fn bounded_gpu_uploads_preserve_geometry_and_instancing() {
             .iter()
             .all(|range| range.instance_start < chunk.instance_count));
     }
+
+    queue.submit([]);
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    assert!(
+        block_on(validation.pop()).is_none(),
+        "GPU validation failed"
+    );
+}
+
+/// Placements of one solid are drawn as instances of its geometry. They take
+/// its display LODs too: all at the level the largest of them needs.
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn instances_of_a_solid_draw_its_coarser_levels_when_they_are_small() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        .expect("GPU adapter");
+    let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_limits: adapter.limits(),
+        ..Default::default()
+    }))
+    .expect("GPU device");
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let mut pipeline = Pipeline::new(&device, &queue, wgpu::TextureFormat::Bgra8UnormSrgb);
+
+    // A sphere of radius 10, placed 400 times on a 20 x 20 grid 30 apart.
+    let body = ocs_solid::model::make_sphere([0.0; 3], 10.0).unwrap();
+    let mesh = crate::scene::model::solid_model::tessellate(
+        &body,
+        crate::scene::model::solid_model::DisplayTolerance::new(0.05),
+    )
+    .unwrap();
+    let mut solid = MeshLodSet::from_single(MeshModel {
+        name: "7".to_owned(),
+        verts: mesh
+            .positions
+            .iter()
+            .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
+            .collect(),
+        verts_low: Vec::new(),
+        normals: mesh
+            .normals
+            .iter()
+            .map(|n| [n[0] as f32, n[1] as f32, n[2] as f32])
+            .collect(),
+        indices: mesh
+            .triangles
+            .iter()
+            .flat_map(|t| t.map(|i| i as u32))
+            .collect(),
+        triangle_material_handles: Vec::new(),
+        triangle_colors: Vec::new(),
+        color: [1.0; 4],
+        selected: false,
+    });
+    solid.build_display_lods();
+    let levels = [1, 2].map(|level| solid.display_lod(level).expect("a level").indices.len());
+    let full = solid.lods[0].indices.len();
+    assert!(
+        levels[1] < levels[0] && levels[0] < full,
+        "{levels:?} of {full}"
+    );
+    solid.prepare_instance_source(Handle::new(7));
+    let placements: Vec<MeshLodSet> = (0..400u32)
+        .map(|index| {
+            let (x, y) = (30.0 * (index % 20) as f32, 30.0 * (index / 20) as f32);
+            let mut placed = solid.clone();
+            placed.lods.clear();
+            placed.display_lods = Default::default();
+            placed.instance_transform = Some(Transform::from_translation(
+                document::types::Vector3::new(x as f64, y as f64, 0.0),
+            ));
+            placed.instance_handle = Some(Handle::new(1000 + index as u64));
+            placed.world_aabb = [x - 10.0, y - 10.0, x + 10.0, y + 10.0];
+            placed.z_aabb = [-10.0, 10.0];
+            placed
+        })
+        .collect();
+
+    let (chunks, total) = mesh_gpu::build_mesh_batch(&device, &queue, &placements);
+    assert_eq!(total, (full / 3 * 400) as u64);
+    assert_eq!(chunks.len(), 1, "one chunk of 400 instances");
+    let chunk = &chunks[0];
+    assert_eq!(chunk.instance_count, 400);
+    assert_eq!(chunk.index_count as usize, full);
+    assert_eq!(chunk.lod_index_buffers.len(), 2, "both coarser levels");
+    assert_eq!(
+        chunk.lod_entries.len(),
+        1,
+        "one entry for all the triangles"
+    );
+    assert_eq!(
+        chunk.lod_entries[0].ranges,
+        [
+            (0, full as u32),
+            (0, levels[0] as u32),
+            (0, levels[1] as u32)
+        ]
+    );
+
+    // An orthographic view straight down, at `scale` pixels to the unit: a
+    // sphere measures about 28 units across its box, whichever one it is.
+    pipeline.gpu_mesh_batch = std::sync::Arc::new(chunks);
+    let mut drawn_at = |scale: f32| {
+        let half = 500.0 / scale;
+        pipeline.mesh_lod_view = Some((
+            glam::Mat4::orthographic_rh(-half, half, -half, half, -10_000.0, 10_000.0),
+            glam::DVec3::new(285.0, 285.0, 0.0),
+            [1000.0, 1000.0],
+        ));
+        pipeline.select_mesh_lods();
+        pipeline.mesh_lod_draws.get(&0).cloned()
+    };
+    assert_eq!(drawn_at(0.5), Some(vec![(2, 0, levels[1] as u32)]), "14 px");
+    assert_eq!(
+        drawn_at(4.0),
+        Some(vec![(1, 0, levels[0] as u32)]),
+        "113 px"
+    );
+    assert_eq!(drawn_at(20.0), Some(vec![(0, 0, full as u32)]), "566 px");
 
     queue.submit([]);
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
@@ -462,14 +626,16 @@ fn test_selected_circle_arc_ellipse_highlight_overlay() {
 
     let mut circle_wire = WireModel::default();
     circle_wire.name = "circle_wire".into();
-    circle_wire.tangent_geoms.push(crate::scene::model::wire_model::TangentGeom::PlanarCircle {
-        center: [0.0, 0.0, 0.0],
-        axis_x: [1.0, 0.0, 0.0],
-        axis_y: [0.0, 1.0, 0.0],
-        radius: 10.0,
-    });
+    circle_wire
+        .tangent_geoms
+        .push(crate::scene::model::wire_model::TangentGeom::PlanarCircle {
+            center: [0.0, 0.0, 0.0],
+            axis_x: [1.0, 0.0, 0.0],
+            axis_y: [0.0, 1.0, 0.0],
+            radius: 10.0,
+        });
 
-    let handle = codec::Handle::new(100);
+    let handle = document::Handle::new(100);
     let mut selected_handles = rustc_hash::FxHashSet::default();
     selected_handles.insert(handle);
     let hover_handles = rustc_hash::FxHashSet::default();
@@ -548,8 +714,18 @@ fn test_selected_circle_arc_ellipse_highlight_overlay() {
         &mut encoder,
         &target,
         iced::Rectangle::with_size(iced::Size::new(512.0, 512.0)),
-        iced::Rectangle { x: 0, y: 0, width: 512, height: 512 },
-        iced::Rectangle { x: 0, y: 0, width: 512, height: 512 },
+        iced::Rectangle {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        },
+        iced::Rectangle {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        },
         [0.0, 0.0, 0.0, 1.0],
         false,
         false,
@@ -575,14 +751,16 @@ fn test_thick_and_tapered_arc_gpu_rendering() {
     // 1. Wide circular arc with pick triangles
     let mut wide_arc = WireModel::default();
     wide_arc.name = "wide_arc".into();
-    wide_arc.tangent_geoms.push(crate::scene::model::wire_model::TangentGeom::Arc {
-        center: [50.0, 50.0, 0.0],
-        axis_x: [1.0, 0.0, 0.0],
-        axis_y: [0.0, 1.0, 0.0],
-        radius: 30.0,
-        start_angle: 0.0,
-        end_angle: std::f64::consts::PI,
-    });
+    wide_arc
+        .tangent_geoms
+        .push(crate::scene::model::wire_model::TangentGeom::Arc {
+            center: [50.0, 50.0, 0.0],
+            axis_x: [1.0, 0.0, 0.0],
+            axis_y: [0.0, 1.0, 0.0],
+            radius: 30.0,
+            start_angle: 0.0,
+            end_angle: std::f64::consts::PI,
+        });
     wide_arc.world_width = 10.0;
     wide_arc.color = [1.0, 0.2, 0.2, 1.0];
     wide_arc.pick_tris = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
@@ -591,14 +769,16 @@ fn test_thick_and_tapered_arc_gpu_rendering() {
     // 2. Tapered circular arc
     let mut tapered_arc = WireModel::default();
     tapered_arc.name = "tapered_arc".into();
-    tapered_arc.tangent_geoms.push(crate::scene::model::wire_model::TangentGeom::Arc {
-        center: [150.0, 50.0, 0.0],
-        axis_x: [1.0, 0.0, 0.0],
-        axis_y: [0.0, 1.0, 0.0],
-        radius: 40.0,
-        start_angle: 0.2,
-        end_angle: 2.8,
-    });
+    tapered_arc
+        .tangent_geoms
+        .push(crate::scene::model::wire_model::TangentGeom::Arc {
+            center: [150.0, 50.0, 0.0],
+            axis_x: [1.0, 0.0, 0.0],
+            axis_y: [0.0, 1.0, 0.0],
+            radius: 40.0,
+            start_angle: 0.2,
+            end_angle: 2.8,
+        });
     tapered_arc.world_width = 16.0;
     tapered_arc.taper_widths = vec![2.0, 16.0];
     tapered_arc.color = [0.2, 0.8, 1.0, 1.0];
@@ -637,8 +817,18 @@ fn test_thick_and_tapered_arc_gpu_rendering() {
         &mut encoder,
         &target,
         iced::Rectangle::with_size(iced::Size::new(512.0, 512.0)),
-        iced::Rectangle { x: 0, y: 0, width: 512, height: 512 },
-        iced::Rectangle { x: 0, y: 0, width: 512, height: 512 },
+        iced::Rectangle {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        },
+        iced::Rectangle {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        },
         [0.0, 0.0, 0.0, 1.0],
         false,
         false,
@@ -674,22 +864,26 @@ fn test_tilted_3d_donut_and_thick_arc_gpu_rendering() {
     // Donut circular arc segments
     let mut donut = WireModel::default();
     donut.name = "donut".into();
-    donut.tangent_geoms.push(crate::scene::model::wire_model::TangentGeom::Arc {
-        center: [50.0, 50.0, 0.0],
-        axis_x: [1.0, 0.0, 0.0],
-        axis_y: [0.0, 1.0, 0.0],
-        radius: 30.0,
-        start_angle: 0.0,
-        end_angle: std::f64::consts::PI,
-    });
-    donut.tangent_geoms.push(crate::scene::model::wire_model::TangentGeom::Arc {
-        center: [50.0, 50.0, 0.0],
-        axis_x: [1.0, 0.0, 0.0],
-        axis_y: [0.0, 1.0, 0.0],
-        radius: 30.0,
-        start_angle: std::f64::consts::PI,
-        end_angle: std::f64::consts::TAU,
-    });
+    donut
+        .tangent_geoms
+        .push(crate::scene::model::wire_model::TangentGeom::Arc {
+            center: [50.0, 50.0, 0.0],
+            axis_x: [1.0, 0.0, 0.0],
+            axis_y: [0.0, 1.0, 0.0],
+            radius: 30.0,
+            start_angle: 0.0,
+            end_angle: std::f64::consts::PI,
+        });
+    donut
+        .tangent_geoms
+        .push(crate::scene::model::wire_model::TangentGeom::Arc {
+            center: [50.0, 50.0, 0.0],
+            axis_x: [1.0, 0.0, 0.0],
+            axis_y: [0.0, 1.0, 0.0],
+            radius: 30.0,
+            start_angle: std::f64::consts::PI,
+            end_angle: std::f64::consts::TAU,
+        });
     donut.world_width = 12.0;
     donut.color = [0.2, 0.9, 0.3, 1.0];
 
@@ -743,8 +937,18 @@ fn test_tilted_3d_donut_and_thick_arc_gpu_rendering() {
         &mut encoder,
         &target,
         iced::Rectangle::with_size(iced::Size::new(512.0, 512.0)),
-        iced::Rectangle { x: 0, y: 0, width: 512, height: 512 },
-        iced::Rectangle { x: 0, y: 0, width: 512, height: 512 },
+        iced::Rectangle {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        },
+        iced::Rectangle {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        },
         [0.0, 0.0, 0.0, 1.0],
         false,
         false,
@@ -770,16 +974,18 @@ fn test_selected_ellipse_overlay() {
 
     let mut ellipse_wire = WireModel::default();
     ellipse_wire.name = "ellipse_wire".into();
-    ellipse_wire.tangent_geoms.push(crate::scene::model::wire_model::TangentGeom::PlanarEllipse {
-        center: [0.0, 0.0, 0.0],
-        major_axis: [10.0, 0.0, 0.0],
-        normal: [0.0, 0.0, 1.0],
-        minor_axis_ratio: 0.5,
-        start_param: 0.0,
-        end_param: std::f64::consts::TAU,
-    });
+    ellipse_wire.tangent_geoms.push(
+        crate::scene::model::wire_model::TangentGeom::PlanarEllipse {
+            center: [0.0, 0.0, 0.0],
+            major_axis: [10.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            minor_axis_ratio: 0.5,
+            start_param: 0.0,
+            end_param: std::f64::consts::TAU,
+        },
+    );
 
-    let handle = codec::Handle::new(200);
+    let handle = document::Handle::new(200);
     let mut selected_handles = rustc_hash::FxHashSet::default();
     selected_handles.insert(handle);
     let hover_handles = rustc_hash::FxHashSet::default();
@@ -859,8 +1065,18 @@ fn test_selected_ellipse_overlay() {
         &mut encoder,
         &target,
         iced::Rectangle::with_size(iced::Size::new(512.0, 512.0)),
-        iced::Rectangle { x: 0, y: 0, width: 512, height: 512 },
-        iced::Rectangle { x: 0, y: 0, width: 512, height: 512 },
+        iced::Rectangle {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        },
+        iced::Rectangle {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        },
         [0.0, 0.0, 0.0, 1.0],
         false,
         false,
@@ -888,7 +1104,7 @@ fn test_pline_arc_switch_preview_and_render() {
     let mut cmd = crate::modules::draw::draw::polyline::PlineCommand::new();
     cmd.on_point(glam::DVec3::new(0.0, 0.0, 0.0));
     let _res = cmd.on_point(glam::DVec3::new(10.0, 0.0, 0.0));
-    cmd.set_live_handle(codec::Handle::new(1));
+    cmd.set_live_handle(document::Handle::new(1));
     cmd.on_text_input("A");
 
     let test_points = [
@@ -931,8 +1147,18 @@ fn test_pline_arc_switch_preview_and_render() {
                 &mut encoder,
                 &target,
                 iced::Rectangle::with_size(iced::Size::new(512.0, 512.0)),
-                iced::Rectangle { x: 0, y: 0, width: 512, height: 512 },
-                iced::Rectangle { x: 0, y: 0, width: 512, height: 512 },
+                iced::Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 512,
+                    height: 512,
+                },
+                iced::Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 512,
+                    height: 512,
+                },
                 [0.0, 0.0, 0.0, 1.0],
                 false,
                 false,
@@ -942,4 +1168,170 @@ fn test_pline_arc_switch_preview_and_render() {
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         }
     }
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn highlight_chunks_reuse_unchanged_buckets_and_invalidate_on_geometry_change() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        .expect("GPU adapter");
+    let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_limits: adapter.limits(),
+        ..Default::default()
+    })).expect("GPU device");
+    let mut pipeline = Pipeline::new(&device, &queue, wgpu::TextureFormat::Bgra8UnormSrgb);
+    pipeline.prepare_highlight_wire_cache(7, 1);
+    let wires: Vec<_> = (1..=1024).map(|n| {
+        WireModel::solid(
+            n.to_string(),
+            vec![[n as f32, 0.0, 0.0], [n as f32, 1.0, 0.0]],
+            [1.0, 1.0, 1.0, 1.0],
+            false,
+        )
+    }).collect();
+    let color = [0.1, 0.4, 1.0, 1.0];
+    let key = color.map(f32::to_bits);
+    let depth = rustc_hash::FxHashMap::default();
+    let transient = rustc_hash::FxHashSet::default();
+    let refs: Vec<_> = wires.iter().collect();
+    let _ = pipeline.highlight_small_wire_chunks(&device, &queue, &refs, color, &depth, &transient);
+    let unchanged = pipeline.highlight_wire_chunks[&(1, key)].gpu[0].instance_buffer.clone();
+    let changed = pipeline.highlight_wire_chunks[&(0, key)].gpu[0].instance_buffer.clone();
+    let refs: Vec<_> = wires.iter().skip(1).collect();
+    let _ = pipeline.highlight_small_wire_chunks(&device, &queue, &refs, color, &depth, &transient);
+    assert_eq!(pipeline.highlight_wire_chunks[&(1, key)].gpu[0].instance_buffer, unchanged);
+    assert_ne!(pipeline.highlight_wire_chunks[&(0, key)].gpu[0].instance_buffer, changed);
+    pipeline.prepare_highlight_wire_cache(8, 1);
+    assert!(pipeline.highlight_wire_chunks.is_empty());
+    assert_eq!(pipeline.highlight_wire_chunk_bytes, 0);
+}
+
+// Regression coverage for retaining committed highlights while a new box moves.
+fn split_highlight_test_setup() -> (wgpu::Device, wgpu::Queue, Pipeline, Vec<WireModel>) {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        .expect("GPU adapter");
+    let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_limits: adapter.limits(),
+        ..Default::default()
+    }))
+    .expect("GPU device");
+    let mut pipeline = Pipeline::new(&device, &queue, wgpu::TextureFormat::Bgra8UnormSrgb);
+    let wires: Vec<_> = (1..=3)
+        .map(|n| {
+            WireModel::solid(
+                n.to_string(),
+                vec![[n as f32, 0.0, 0.0], [n as f32, 1.0, 0.0]],
+                [1.0; 4],
+                false,
+            )
+        })
+        .collect();
+    pipeline.wire_handle_index = std::sync::Arc::new(
+        [(1, vec![0]), (2, vec![1]), (3, vec![2])]
+            .into_iter()
+            .collect(),
+    );
+    pipeline.prepare_highlight_wire_cache(1, 1);
+    (device, queue, pipeline, wires)
+}
+
+fn handles(values: &[u64]) -> rustc_hash::FxHashSet<Handle> {
+    values.iter().copied().map(Handle::new).collect()
+}
+
+const SPLIT_TINT: Option<[f32; 4]> = Some([0.1, 0.4, 1.0, 1.0]);
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn split_highlight_reuses_selection_when_hover_changes() {
+    let (device, queue, mut p, wires) = split_highlight_test_setup();
+    let selected = handles(&[1]);
+    let annotation = std::sync::Arc::new(Vec::new());
+    let depth = rustc_hash::FxHashMap::default();
+    let upload = |p: &mut Pipeline, hovered: u64| {
+        p.upload_split_highlights(
+            &device,
+            &queue,
+            &wires,
+            &selected,
+            &handles(&[hovered]),
+            &annotation,
+            &[],
+            &depth,
+            SPLIT_TINT,
+            1,
+            1,
+            false,
+            true,
+            (hovered, 0),
+        )
+    };
+    upload(&mut p, 2);
+    let cache = p.selected_highlight_gpu_cache.as_ref().unwrap();
+    let old = cache.wires[0].instance_buffer.clone();
+    upload(&mut p, 3);
+    let cache = p.selected_highlight_gpu_cache.as_ref().unwrap();
+    assert_eq!(old, cache.wires[0].instance_buffer);
+    assert_eq!(p.gpu_selected_wires.len(), 2);
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn split_highlight_rebuilds_when_selection_changes() {
+    let (device, queue, mut p, wires) = split_highlight_test_setup();
+    let annotation = std::sync::Arc::new(Vec::new());
+    let depth = rustc_hash::FxHashMap::default();
+    let empty = rustc_hash::FxHashSet::default();
+    for selected in [1, 2] {
+        p.upload_split_highlights(
+            &device,
+            &queue,
+            &wires,
+            &handles(&[selected]),
+            &empty,
+            &annotation,
+            &[],
+            &depth,
+            SPLIT_TINT,
+            1,
+            1,
+            true,
+            true,
+            (0, 0),
+        );
+    }
+    let cache = p.selected_highlight_gpu_cache.as_ref().unwrap();
+    assert_eq!(cache.selected, handles(&[2]));
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn split_highlight_rebuilds_when_depth_changes() {
+    let (device, queue, mut p, wires) = split_highlight_test_setup();
+    let annotation = std::sync::Arc::new(Vec::new());
+    let depth = rustc_hash::FxHashMap::default();
+    let selected = handles(&[1]);
+    let empty = rustc_hash::FxHashSet::default();
+    for generation in [1, 2] {
+        p.upload_split_highlights(
+            &device,
+            &queue,
+            &wires,
+            &selected,
+            &empty,
+            &annotation,
+            &[],
+            &depth,
+            SPLIT_TINT,
+            1,
+            generation,
+            true,
+            false,
+            (0, 0),
+        );
+    }
+    let cache = p.selected_highlight_gpu_cache.as_ref().unwrap();
+    assert_eq!(cache.depth_generation, 2);
 }

@@ -6,15 +6,18 @@
 //! Properties panel's own rows for that entity (built and written back in
 //! `app::node_graph`); operation rows come from the node's spec.
 
-use codec::{EntityType, Handle};
+use crate::ui::style::kit_metrics as km;
+use document::{EntityType, Handle};
 use graph::{Kind, NodeId, Port, Spec};
-use iced::widget::{
-    button, canvas, checkbox, column, container, mouse_area, opaque, pin, row, scrollable, slider,
-    stack, text, text_input, Space,
-};
 use iced::advanced::layout::{self, Layout};
-use iced::advanced::widget::{self, Widget};
-use iced::advanced::{renderer, Renderer as _, Shell};
+use iced::advanced::widget::operation::{Focusable, Operation, TextInput};
+use iced::advanced::widget::{self, tree, Widget};
+use iced::advanced::{overlay, renderer, Renderer as _, Shell};
+use iced::keyboard;
+use iced::widget::{
+    button, canvas, checkbox, column, container, hover, mouse_area, opaque, pin, row, scrollable,
+    slider, stack, text, text_input, tooltip, Space,
+};
 use iced::{
     mouse, Background, Border, Element, Length, Point, Rectangle, Size, Theme, Transformation,
     Vector,
@@ -34,10 +37,14 @@ const PORT_W: f32 = 14.0;
 const PORT_HIT: f32 = 10.0;
 const ZOOM_STEP: f32 = 1.1;
 const ZOOM_STEPS: std::ops::RangeInclusive<i32> = -15..=12;
+/// The ribbon's tooltip delay.
+const TIP_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// Drawing objects a node can create.
+/// Drawing objects a node can create, and `Object`, which creates nothing
+/// and stands for whatever object is linked into it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectKind {
+    Object,
     Line,
     Circle,
     Arc,
@@ -48,9 +55,27 @@ pub enum ObjectKind {
     XLine,
     Text,
     MText,
+    Spline,
+    Polyline3D,
+    Solid,
+    Face3D,
+    Leader,
+    Tolerance,
+    Wipeout,
+    Hatch,
+    MLine,
+    MultiLeader,
+    Helix,
+    AttributeDefinition,
+    Table,
+    Polyline2D,
+    Mesh,
+    PolygonMesh,
+    PolyfaceMesh,
 }
 
-const OBJECTS: &[ObjectKind] = &[
+pub(crate) const OBJECTS: &[ObjectKind] = &[
+    ObjectKind::Object,
     ObjectKind::Line,
     ObjectKind::Circle,
     ObjectKind::Arc,
@@ -61,12 +86,35 @@ const OBJECTS: &[ObjectKind] = &[
     ObjectKind::XLine,
     ObjectKind::Text,
     ObjectKind::MText,
+    ObjectKind::Spline,
+    ObjectKind::Polyline3D,
+    ObjectKind::Solid,
+    ObjectKind::Face3D,
+    ObjectKind::Leader,
+    ObjectKind::Tolerance,
+    ObjectKind::Wipeout,
+    ObjectKind::Hatch,
+    ObjectKind::MLine,
+    ObjectKind::MultiLeader,
+    ObjectKind::Helix,
+    ObjectKind::AttributeDefinition,
+    ObjectKind::Table,
+    ObjectKind::Polyline2D,
+    ObjectKind::Mesh,
+    ObjectKind::PolygonMesh,
+    ObjectKind::PolyfaceMesh,
 ];
+
+/// Every object node type, in palette order.
+pub fn object_kinds() -> &'static [ObjectKind] {
+    OBJECTS
+}
 
 impl ObjectKind {
     /// Display name, also the graph's object type name.
     pub fn name(self) -> &'static str {
         match self {
+            ObjectKind::Object => "Object",
             ObjectKind::Line => "Line",
             ObjectKind::Circle => "Circle",
             ObjectKind::Arc => "Arc",
@@ -77,6 +125,23 @@ impl ObjectKind {
             ObjectKind::XLine => "Construction Line",
             ObjectKind::Text => "Text",
             ObjectKind::MText => "Multiline Text",
+            ObjectKind::Spline => "Spline",
+            ObjectKind::Polyline3D => "3D Polyline",
+            ObjectKind::Solid => "2D Solid",
+            ObjectKind::Face3D => "3D Face",
+            ObjectKind::Leader => "Leader",
+            ObjectKind::Tolerance => "Tolerance",
+            ObjectKind::Wipeout => "Wipeout",
+            ObjectKind::Hatch => "Hatch",
+            ObjectKind::MLine => "Multiline",
+            ObjectKind::MultiLeader => "Multileader",
+            ObjectKind::Helix => "Helix",
+            ObjectKind::AttributeDefinition => "Attribute Definition",
+            ObjectKind::Table => "Table",
+            ObjectKind::Polyline2D => "2D Polyline",
+            ObjectKind::Mesh => "Mesh",
+            ObjectKind::PolygonMesh => "Polygon Mesh",
+            ObjectKind::PolyfaceMesh => "Polyface Mesh",
         }
     }
 
@@ -88,7 +153,8 @@ impl ObjectKind {
     pub fn matches(self, entity: &EntityType) -> bool {
         matches!(
             (self, entity),
-            (ObjectKind::Line, EntityType::Line(_))
+            (ObjectKind::Object, _)
+                | (ObjectKind::Line, EntityType::Line(_))
                 | (ObjectKind::Circle, EntityType::Circle(_))
                 | (ObjectKind::Arc, EntityType::Arc(_))
                 | (ObjectKind::Ellipse, EntityType::Ellipse(_))
@@ -98,11 +164,32 @@ impl ObjectKind {
                 | (ObjectKind::XLine, EntityType::XLine(_))
                 | (ObjectKind::Text, EntityType::Text(_))
                 | (ObjectKind::MText, EntityType::MText(_))
+                | (ObjectKind::Spline, EntityType::Spline(_))
+                | (ObjectKind::Polyline3D, EntityType::Polyline3D(_))
+                | (ObjectKind::Solid, EntityType::Solid(_))
+                | (ObjectKind::Face3D, EntityType::Face3D(_))
+                | (ObjectKind::Leader, EntityType::Leader(_))
+                | (ObjectKind::Tolerance, EntityType::Tolerance(_))
+                | (ObjectKind::Wipeout, EntityType::Wipeout(_))
+                | (ObjectKind::Hatch, EntityType::Hatch(_))
+                | (ObjectKind::MLine, EntityType::MLine(_))
+                | (ObjectKind::MultiLeader, EntityType::MultiLeader(_))
+                | (ObjectKind::Helix, EntityType::Helix(_))
+                | (
+                    ObjectKind::AttributeDefinition,
+                    EntityType::AttributeDefinition(_)
+                )
+                | (ObjectKind::Table, EntityType::Table(_))
+                | (ObjectKind::Polyline2D, EntityType::Polyline2D(_))
+                | (ObjectKind::Mesh, EntityType::Mesh(_))
+                | (ObjectKind::PolygonMesh, EntityType::PolygonMesh(_))
+                | (ObjectKind::PolyfaceMesh, EntityType::PolyfaceMesh(_))
         )
     }
 
     fn command(self) -> &'static str {
         match self {
+            ObjectKind::Object => "SELECT",
             ObjectKind::Line => "LINE",
             ObjectKind::Circle => "CIRCLE",
             ObjectKind::Arc => "ARC",
@@ -113,17 +200,44 @@ impl ObjectKind {
             ObjectKind::XLine => "XLINE",
             ObjectKind::Text => "TEXT",
             ObjectKind::MText => "MTEXT",
+            ObjectKind::Spline => "SPLINE",
+            ObjectKind::Polyline3D => "3DPOLY",
+            ObjectKind::Solid => "SOLID",
+            ObjectKind::Face3D => "3DFACE",
+            ObjectKind::Leader => "LEADER",
+            ObjectKind::Tolerance => "TOLERANCE",
+            ObjectKind::Wipeout => "WIPEOUT",
+            ObjectKind::Hatch => "HATCH",
+            ObjectKind::MLine => "MLINE",
+            ObjectKind::MultiLeader => "MLEADER",
+            ObjectKind::Helix => "HELIX",
+            ObjectKind::AttributeDefinition => "ATTDEF",
+            ObjectKind::Table => "TABLE",
+            ObjectKind::Polyline2D => "PLINE",
+            ObjectKind::Mesh => "MESH",
+            ObjectKind::PolygonMesh => "3DMESH",
+            ObjectKind::PolyfaceMesh => "PFACE",
         }
     }
 
-    /// The entity a new node starts from.
-    pub fn entity(self) -> EntityType {
-        use codec::entities as e;
-        use codec::types::{Vector2, Vector3};
+    /// Whether the node owns its entities: everything but `Object`.
+    pub fn owns(self) -> bool {
+        self != ObjectKind::Object
+    }
+
+    /// The entity a new node starts from; `None` for `Object`. Styles and
+    /// patterns come from `document`, as the commands take them.
+    pub fn entity(self, document: &document::Document) -> Option<EntityType> {
+        use document::entities as e;
+        use document::types::{Vector2, Vector3};
         let origin = Vector3::new(0.0, 0.0, 0.0);
         let x_axis = Vector3::new(1.0, 0.0, 0.0);
-        match self {
-            ObjectKind::Line => EntityType::Line(e::Line::from_coords(0.0, 0.0, 0.0, 10.0, 0.0, 0.0)),
+        let point = |x: f64, y: f64| Vector3::new(x, y, 0.0);
+        Some(match self {
+            ObjectKind::Object => return None,
+            ObjectKind::Line => {
+                EntityType::Line(e::Line::from_coords(0.0, 0.0, 0.0, 10.0, 0.0, 0.0))
+            }
             ObjectKind::Circle => EntityType::Circle(e::Circle::from_coords(0.0, 0.0, 0.0, 5.0)),
             ObjectKind::Arc => EntityType::Arc(e::Arc::from_coords(
                 0.0,
@@ -149,12 +263,182 @@ impl ObjectKind {
             ObjectKind::Text => {
                 EntityType::Text(e::Text::with_value("Text", origin).with_height(2.5))
             }
-            ObjectKind::MText => {
-                EntityType::MText(e::MText::with_value("MText", origin).with_height(2.5))
+            ObjectKind::MText => EntityType::MText(Box::new(
+                e::MText::with_value("MText", origin).with_height(2.5),
+            )),
+            ObjectKind::Spline => EntityType::Spline(e::Spline::from_fit_points(vec![
+                origin,
+                point(5.0, 5.0),
+                point(10.0, 0.0),
+            ])),
+            ObjectKind::Polyline3D => EntityType::Polyline3D(e::Polyline3D::from_points(vec![
+                origin,
+                point(10.0, 0.0),
+                Vector3::new(10.0, 10.0, 5.0),
+            ])),
+            ObjectKind::Solid => EntityType::Solid(e::Solid::new(
+                origin,
+                point(10.0, 0.0),
+                point(0.0, 10.0),
+                point(10.0, 10.0),
+            )),
+            ObjectKind::Face3D => EntityType::Face3D(e::Face3D::new(
+                origin,
+                point(10.0, 0.0),
+                point(10.0, 10.0),
+                point(0.0, 10.0),
+            )),
+            ObjectKind::Leader => {
+                EntityType::Leader(e::Leader::two_point(origin, point(10.0, 5.0)))
             }
-        }
+            ObjectKind::Tolerance => {
+                EntityType::Tolerance(e::Tolerance::with_text(origin, "{\\Fgdt;j}%%v0.1"))
+            }
+            ObjectKind::Wipeout => EntityType::Wipeout(e::Wipeout::rectangular(origin, 10.0, 5.0)),
+            // A solid fill over a rectangle; pattern, scale and angle are rows.
+            ObjectKind::Hatch => crate::entity_creation::build_entity(
+                &serde_json::json!({
+                    "type": "HATCH",
+                    "boundary": [[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [0.0, 5.0]],
+                    "solid": true,
+                }),
+                Some(document),
+            )
+            .ok()?,
+            // Two vertices in the current multiline style, scale and justification.
+            ObjectKind::MLine => {
+                let header = &document.header;
+                let (handle, style) = document
+                    .objects
+                    .iter()
+                    .find_map(|(handle, object)| match object {
+                        document::objects::ObjectType::MLineStyle(style)
+                            if style.name.eq_ignore_ascii_case(&header.multiline_style) =>
+                        {
+                            Some((Some(*handle), style.clone()))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| (None, document::objects::MLineStyle::standard()));
+                crate::modules::draw::draw::mline::build_mline(
+                    &[glam::DVec3::ZERO, glam::DVec3::new(10.0, 0.0, 0.0)],
+                    header.multiline_scale,
+                    document::entities::MLineJustification::from(header.multiline_justification),
+                    false,
+                    &style,
+                    handle,
+                )
+            }
+            // One leader with MText content, in the current multileader style.
+            ObjectKind::MultiLeader => {
+                let name = &document.header.current_mleader_style_name;
+                let style = document
+                    .objects
+                    .iter()
+                    .find_map(|(handle, object)| match object {
+                        document::objects::ObjectType::MultiLeaderStyle(style)
+                            if style.name.eq_ignore_ascii_case(name) =>
+                        {
+                            let mut style = style.clone();
+                            style.handle = *handle;
+                            Some(style)
+                        }
+                        _ => None,
+                    });
+                EntityType::MultiLeader(Box::new(
+                    crate::modules::annotate::mleader_cmd::build_mleader(
+                        "MText",
+                        &[glam::DVec3::ZERO, glam::DVec3::new(10.0, 5.0, 0.0)],
+                        None,
+                        glam::Mat4::IDENTITY,
+                        style.as_ref(),
+                        1.0,
+                    ),
+                ))
+            }
+            // The HELIX defaults (radius, turns, direction) about the Z axis.
+            ObjectKind::Helix => crate::modules::draw::draw::helix::HelixCommand::new()
+                .build(10.0, glam::DVec3::Z)?,
+            ObjectKind::AttributeDefinition => EntityType::AttributeDefinition(
+                e::AttributeDefinition::new("TAG".into(), "Value".into(), String::new()),
+            ),
+            // Four rows by three columns in the current table style.
+            ObjectKind::Table => {
+                let mut table = e::TableBuilder::new(4, 3).at(origin).build();
+                let name = &document.header.current_table_style_name;
+                table.table_style_handle = document.objects.iter().find_map(|(handle, object)| {
+                    matches!(object, document::objects::ObjectType::TableStyle(style)
+                        if style.name.eq_ignore_ascii_case(name))
+                    .then_some(*handle)
+                });
+                EntityType::Table(Box::new(table))
+            }
+            ObjectKind::Polyline2D => {
+                let mut polyline = e::Polyline2D::new();
+                for (x, y) in [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)] {
+                    polyline.add_vertex(e::Vertex2D::new(point(x, y)));
+                }
+                EntityType::Polyline2D(polyline)
+            }
+            // A 10-unit cube.
+            ObjectKind::Mesh => EntityType::Mesh(
+                e::MeshBuilder::new()
+                    .vertices(&CUBE.map(|[x, y, z]| Vector3::new(x * 10.0, y * 10.0, z * 10.0)))
+                    .face(vec![0, 3, 2, 1])
+                    .face(vec![4, 5, 6, 7])
+                    .face(vec![0, 1, 5, 4])
+                    .face(vec![1, 2, 6, 5])
+                    .face(vec![2, 3, 7, 6])
+                    .face(vec![3, 0, 4, 7])
+                    .compute_edges()
+                    .build(),
+            ),
+            // A 3 x 3 grid over 10 x 10.
+            ObjectKind::PolygonMesh => {
+                let mut mesh = e::PolygonMeshEntity::new();
+                mesh.m_vertex_count = 3;
+                mesh.n_vertex_count = 3;
+                mesh.vertices = (0..9)
+                    .map(|i| {
+                        e::PolygonMeshVertex::at(point(5.0 * (i / 3) as f64, 5.0 * (i % 3) as f64))
+                    })
+                    .collect();
+                EntityType::PolygonMesh(mesh)
+            }
+            // The faces of a 10-unit cube.
+            ObjectKind::PolyfaceMesh => {
+                let mut mesh = e::PolyfaceMesh::new();
+                let v: Vec<i16> = CUBE
+                    .iter()
+                    .map(|[x, y, z]| mesh.add_vertex_xyz(x * 10.0, y * 10.0, z * 10.0))
+                    .collect();
+                for [a, b, c, d] in [
+                    [0, 3, 2, 1],
+                    [4, 5, 6, 7],
+                    [0, 1, 5, 4],
+                    [1, 2, 6, 5],
+                    [2, 3, 7, 6],
+                    [3, 0, 4, 7],
+                ] {
+                    mesh.add_quad(v[a], v[b], v[c], v[d]);
+                }
+                EntityType::PolyfaceMesh(mesh)
+            }
+        })
     }
 }
+
+/// A unit cube's corners: bottom face, then top face.
+const CUBE: [[f64; 3]; 8] = [
+    [0.0, 0.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [1.0, 1.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [1.0, 0.0, 1.0],
+    [1.0, 1.0, 1.0],
+    [0.0, 1.0, 1.0],
+];
 
 /// What a palette entry adds.
 #[derive(Clone, Copy, Debug)]
@@ -170,12 +454,36 @@ impl PaletteItem {
             PaletteItem::Op(spec) => spec.name,
         }
     }
+
+    /// Whether both are the same entry. Labels will not do: Point names both
+    /// a drawing object and a coordinate.
+    fn same(self, other: Self) -> bool {
+        match (self, other) {
+            (PaletteItem::Object(a), PaletteItem::Object(b)) => a == b,
+            (PaletteItem::Op(a), PaletteItem::Op(b)) => std::ptr::eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+/// The tint over the palette entry about to be added.
+/// A node-library entry under the pointer or being dragged: lit like a
+/// palette row.
+fn palette_highlight(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(crate::ui::style::chrome::row_selected(
+            theme,
+        ))),
+        ..Default::default()
+    }
 }
 
 /// Canvas state of one node.
+#[derive(Clone)]
 pub struct NodeUi {
     pub pos: Point,
-    /// Expanded section titles; a new object node opens only Geometry.
+    /// Expanded section titles and coordinate groups; a new object node opens
+    /// only Geometry.
     pub open: HashSet<String>,
     /// Entities an object node owns, one per list element.
     pub handles: Vec<Handle>,
@@ -183,13 +491,35 @@ pub struct NodeUi {
 
 pub enum RowWidget {
     Field,
-    Slider { min: f64, max: f64, step: f64 },
+    /// A plain number: anything else is refused as it is typed.
+    Number,
+    /// A number written the way the Properties panel takes it, as an
+    /// expression or with units; checked when it is committed.
+    Measure,
+    /// A point, typed as `x,y,z` with or without parentheses.
+    Coordinate,
+    /// A coordinate group's summary row; its label folds the components.
+    Group,
+    Slider {
+        min: f64,
+        max: f64,
+        step: f64,
+    },
     Toggle,
+    /// One of a list, as `(value, label)`: the Properties panel's choice,
+    /// layer, linetype and lineweight rows.
+    Choice(Vec<(Value, String)>),
+    /// Typed text, or one of a list (a block reference's Name).
+    EditChoice(Vec<String>),
+    /// A colour, valued as the control protocol writes it.
+    Color,
 }
 
 /// A group of rows; an empty title has no header and is always open.
 pub struct NodeSection {
     pub title: String,
+    /// The header's own ports, carrying every row of the section at once.
+    pub header: Option<NodeRow>,
     pub rows: Vec<NodeRow>,
 }
 
@@ -200,6 +530,92 @@ pub struct NodeRow {
     pub input: bool,
     pub output: bool,
     pub widget: RowWidget,
+    /// The coordinate group (its summary row's field) this row folds into.
+    pub group: Option<String>,
+}
+
+/// How the canvas shows links. A view setting kept with the user's
+/// preferences, never in the `.ocg` file: one graph reads the same either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkDisplay {
+    /// Every link is a wire.
+    #[default]
+    Wires,
+    /// A linked input names its source; its wire shows while hovered.
+    Labels,
+    /// Labels, plus the wires of the selected node.
+    Selection,
+}
+
+impl LinkDisplay {
+    pub const ALL: [Self; 3] = [Self::Wires, Self::Labels, Self::Selection];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Wires => "Wires",
+            Self::Labels => "Labels",
+            Self::Selection => "Selection",
+        }
+    }
+
+    /// Whether linked inputs show a label in place of their wire.
+    pub fn labels(self) -> bool {
+        self != Self::Wires
+    }
+}
+
+/// An output a picker offers: its port, and how it reads (`Node.output`).
+pub struct Source {
+    pub port: Port,
+    pub name: String,
+    pub value: Value,
+}
+
+/// The source picker of one input, open where it was clicked.
+pub struct Picker {
+    pub to: Port,
+    pub at: Point,
+    pub search: String,
+}
+
+const PICKER_W: f32 = 260.0;
+const PICKER_LIST_H: f32 = 220.0;
+const PICKER_ROW_H: f32 = 20.0;
+
+/// The widget id of the picker's search box.
+pub fn picker_search_id() -> widget::Id {
+    widget::Id::from("node-graph-picker-search")
+}
+
+/// What labels mode shows of a graph's links; see [`Graph::link_labels`].
+#[derive(Default)]
+pub(crate) struct LinkLabels {
+    /// Linked inputs that show as rows, each naming its source.
+    pub rows: HashMap<Port, String>,
+    /// The sources of folded inputs, by the row that stands for them: a
+    /// closed section's header ([`section_key`]) or a closed group's row.
+    pub folded: HashMap<Port, Vec<String>>,
+    /// Each folded input, with the row that stands for it.
+    pub folded_by: HashMap<Port, Port>,
+}
+
+/// The key a closed section's header goes by in [`LinkLabels::folded`] and
+/// in hover; no field starts with `§`.
+fn section_key(node: NodeId, title: &str) -> Port {
+    Port {
+        node,
+        field: format!("§{title}"),
+    }
+}
+
+/// A folded row's sum-up of its links: the first source, and how many more.
+fn folded_text(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => format!("← {one}"),
+        [first, rest @ ..] => format!("← {first} +{}", rest.len()),
+    }
 }
 
 pub enum Drag {
@@ -207,6 +623,41 @@ pub enum Drag {
     Node(NodeId, Vector),
     Link(Port),
     Pan(Point, Vector),
+}
+
+/// What undo and redo put back of a graph: its nodes, links and inputs,
+/// where they sit, and what its last evaluation changed in the drawing, so
+/// the next evaluation unwinds the right edits (#2731).
+#[derive(Clone)]
+pub struct GraphUndo {
+    engine: graph::Graph,
+    ui: HashMap<NodeId, NodeUi>,
+    applied: Vec<(Handle, EntityType)>,
+    applied_records: Vec<(Handle, document::objects::ObjectType)>,
+    created: Vec<Handle>,
+}
+
+/// A graph read from a file on a worker ([`Graph::from_file`]), with the
+/// drawing fingerprint it was saved against, for a message: it is taken
+/// once.
+#[derive(Clone)]
+pub struct LoadedGraph(std::sync::Arc<std::sync::Mutex<Option<(Graph, String)>>>);
+
+impl LoadedGraph {
+    pub fn new(read: (Graph, String)) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(read))))
+    }
+
+    /// The graph and its fingerprint; `None` once taken.
+    pub fn take(&self) -> Option<(Graph, String)> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+impl std::fmt::Debug for LoadedGraph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LoadedGraph")
+    }
 }
 
 #[derive(Default)]
@@ -224,6 +675,52 @@ pub struct Graph {
     toggled_categories: HashSet<&'static str>,
     /// Filter typed into the panel's search box.
     search: String,
+    /// Objects the last evaluation edited in place, with their prior state,
+    /// in edit order. The next evaluation restores them first.
+    pub applied: Vec<(Handle, EntityType)>,
+    /// History records (solid construction history) the last evaluation's
+    /// operations changed, with their prior state; restored with `applied`.
+    pub applied_records: Vec<(Handle, document::objects::ObjectType)>,
+    /// Objects the last evaluation's operations created; the next one
+    /// erases them first.
+    pub created: Vec<Handle>,
+    /// The node pressed last; Selection mode draws its links.
+    pub selected: Option<NodeId>,
+    /// The input whose label is under the pointer; its wire shows.
+    pub hovered_label: Option<Port>,
+    pub picker: Option<Picker>,
+    /// The input whose dropdown or colour list is open.
+    pub menu: Option<Port>,
+}
+
+impl Graph {
+    pub fn undo_state(&self) -> GraphUndo {
+        GraphUndo {
+            engine: self.engine.clone(),
+            ui: self.ui.clone(),
+            applied: self.applied.clone(),
+            applied_records: self.applied_records.clone(),
+            created: self.created.clone(),
+        }
+    }
+
+    /// Puts `state` back; open edits in fields are dropped with it.
+    pub fn restore(&mut self, state: &GraphUndo) {
+        let state = state.clone();
+        self.engine = state.engine;
+        self.ui = state.ui;
+        self.applied = state.applied;
+        self.applied_records = state.applied_records;
+        self.created = state.created;
+        self.drafts.clear();
+        self.drag = None;
+        self.hovered_label = None;
+        self.picker = None;
+        self.menu = None;
+        if self.selected.is_some_and(|id| !self.ui.contains_key(&id)) {
+            self.selected = None;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +738,10 @@ pub enum GraphMsg {
     InPress(Port),
     Input(Port, String),
     Commit(Port),
+    /// Esc in a field: drop its draft, so the field shows its value again.
+    Discard(Port),
+    /// The pointer went elsewhere: commit every draft but the focused field's.
+    Leave(Option<Port>),
     /// A slider or toggle set an operation input.
     Set(Port, Value),
     Zoom(mouse::ScrollDelta),
@@ -251,13 +752,128 @@ pub enum GraphMsg {
     Saved(Option<Result<String, String>>),
     Open,
     Loaded(Option<Vec<u8>>),
+    /// The file of an Open parsed on a worker, for the drawing (tab id,
+    /// document generation) it was opened in, or why it is no graph.
+    Parsed(u64, u64, Result<LoadedGraph, String>),
     /// The button was released over the panel entry it was pressed on.
     PaletteRelease,
     Search(String),
+    /// The panel's switch chose how links show.
+    Links(LinkDisplay),
+    /// The pointer entered (`Some`) or left (`None`) an input's label.
+    LabelHover(Option<Port>),
+    /// Opens the source picker of an input, or closes it when it is open.
+    Pick(Port),
+    PickSearch(String),
+    /// The picker chose an output (first) for an input (second).
+    PickSource(Port, Port),
+    /// The picker's Disconnect: the input loses its link.
+    PickClear(Port),
+    PickClose,
+    /// Opens an input's dropdown or colour list, or closes it when it is
+    /// open; `None` closes any.
+    Menu(Option<Port>),
 }
 
 fn msg(m: GraphMsg) -> Message {
     Message::Graph(m)
+}
+
+/// `content` with a tooltip, styled like the node graph's own button on the
+/// command line. Cards are drawn through the canvas zoom, so what goes on them
+/// divides its sizes by `zoom` to come out the same size as any other tooltip.
+fn with_tip<'a>(
+    content: impl Into<Element<'a, Message>>,
+    tip: String,
+    zoom: f32,
+) -> Element<'a, Message> {
+    let bubble = container(text(tip).size(11.0 / zoom))
+        .padding([3.0 / zoom, 6.0 / zoom])
+        .style(container::bordered_box);
+    tooltip(content, bubble, tooltip::Position::Top)
+        .gap(4.0 / zoom)
+        .padding(5.0 / zoom)
+        .delay(TIP_DELAY)
+        .into()
+}
+
+/// A node's name, with its ports below it when it has a spec.
+fn node_tip(name: String, spec: Option<&Spec>) -> String {
+    match spec {
+        Some(spec) => {
+            let inputs: Vec<&str> = spec.inputs.iter().map(|input| input.name).collect();
+            format!(
+                "{name}\n{} -> {}",
+                inputs.join(", "),
+                spec.outputs.join(", ")
+            )
+        }
+        None => name,
+    }
+}
+
+/// What a row's tooltip says: its name and whole value, which the card may
+/// have no room to show.
+fn row_tip(row: &NodeRow) -> String {
+    let value = display(&row.value);
+    if value.is_empty() {
+        row.label.clone()
+    } else {
+        format!("{}: {value}", row.label)
+    }
+}
+
+/// Whether an operation input takes a point or vector. The specs do not say:
+/// points, curves and objects are all inputs without a default, so this goes
+/// by name, and by the operation where a name means different things.
+fn is_coordinate(spec: &Spec, input: &graph::ops::Input) -> bool {
+    if input.list || !matches!(input.default, graph::ops::Initial::None) {
+        return false;
+    }
+    match input.name {
+        // An object to pick, where the spec also asks for the point that
+        // picks it (`first` beside `first point`).
+        "first" | "second" => !spec
+            .inputs
+            .iter()
+            .any(|other| other.name.strip_suffix(" point") == Some(input.name)),
+        "a" | "b" => spec.category == "Geometry",
+        "third" | "point" | "center" | "location" | "vector" | "corner" | "vertex" | "base"
+        | "side" | "keep" | "jog" | "feature" | "leader" => true,
+        name => {
+            name.starts_with("axis ")
+                || [" point", " corner", " source", " target"]
+                    .iter()
+                    .any(|end| name.ends_with(end))
+        }
+    }
+}
+
+/// The widget id of the text field on `port`.
+fn field_id(port: &Port) -> widget::Id {
+    widget::Id::from(format!("node-graph-field:{}:{}", port.node, port.field))
+}
+
+/// Whether `text` is a number, or could still become one with more typing.
+/// A list (`[1, 2.5, 3]`) runs the node once per element.
+fn number_prefix(text: &str) -> bool {
+    if let Some(list) = text.strip_prefix('[') {
+        let list = list.strip_suffix(']').unwrap_or(list);
+        return list.split(',').all(|item| number_prefix(item.trim()));
+    }
+    let digits = |part: &str| part.chars().all(|c| c.is_ascii_digit());
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    digits(whole)
+        && digits(fraction)
+        && exponent.is_none_or(|exponent| {
+            mantissa.chars().any(|c| c.is_ascii_digit())
+                && digits(exponent.strip_prefix(['-', '+']).unwrap_or(exponent))
+        })
 }
 
 /// Compact display of a port value.
@@ -289,7 +905,10 @@ impl Graph {
     /// Screen point → graph coordinates.
     fn to_graph(&self, screen: Point) -> Point {
         let zoom = self.zoom();
-        Point::new((screen.x - self.pan.x) / zoom, (screen.y - self.pan.y) / zoom)
+        Point::new(
+            (screen.x - self.pan.x) / zoom,
+            (screen.y - self.pan.y) / zoom,
+        )
     }
 
     /// Graph coordinates → screen point.
@@ -308,54 +927,108 @@ impl Graph {
                 let mut open: Vec<&String> = ui.open.iter().collect();
                 open.sort();
                 let handles: Vec<u64> = ui.handles.iter().map(|handle| handle.value()).collect();
-                (id.to_string(), json!({ "pos": [ui.pos.x, ui.pos.y], "open": open, "handles": handles }))
+                (
+                    id.to_string(),
+                    json!({ "pos": [ui.pos.x, ui.pos.y], "open": open, "handles": handles }),
+                )
             })
             .collect();
+        let applied: Vec<Value> = self
+            .applied
+            .iter()
+            .filter_map(|(handle, entity)| {
+                Some(json!([handle.value(), serde_json::to_value(entity).ok()?]))
+            })
+            .collect();
+        let created: Vec<u64> = self.created.iter().map(|handle| handle.value()).collect();
         let file = json!({
             "format": "ocg",
             "version": 1,
             "drawing": drawing,
             "graph": self.engine.to_json(),
             "canvas": { "pan": [self.pan.x, self.pan.y], "zoom": self.zoom_steps, "nodes": nodes },
+            "applied": applied,
+            "created": created,
         });
         serde_json::to_vec_pretty(&file).unwrap_or_default()
     }
 
     /// Reads an `.ocg` file, returning the graph and the drawing fingerprint
-    /// it was saved against. Handles come back unchecked.
+    /// it was saved against. Handles come back unchecked, and the edits of
+    /// the last evaluation come back whatever drawing is open.
     pub fn from_file(bytes: &[u8]) -> Result<(Self, String), String> {
         let file: Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
         if file["format"] != "ocg" {
             return Err(t!("Not a node graph file").into_owned());
         }
         let mut graph = Graph {
-            engine: graph::Graph::from_json(&file["graph"])?,
+            engine: graph::Graph::from_json(&file["graph"], &crate::app::node_graph::ops::resolve)?,
             ..Graph::default()
         };
+        graph.applied = file["applied"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|pair| {
+                let entity = serde_json::from_value(pair[1].clone()).ok()?;
+                Some((Handle::new(pair[0].as_u64()?), entity))
+            })
+            .collect();
+        graph.created = file["created"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Value::as_u64)
+            .map(Handle::new)
+            .collect();
         let canvas = &file["canvas"];
         let pair = |value: &Value| {
-            Some(Vector::new(value[0].as_f64()? as f32, value[1].as_f64()? as f32))
+            Some(Vector::new(
+                value[0].as_f64()? as f32,
+                value[1].as_f64()? as f32,
+            ))
         };
         graph.pan = pair(&canvas["pan"]).unwrap_or_default();
-        graph.zoom_steps = canvas["zoom"]
-            .as_i64()
-            .map_or(0, |steps| (steps as i32).clamp(*ZOOM_STEPS.start(), *ZOOM_STEPS.end()));
+        graph.zoom_steps = canvas["zoom"].as_i64().map_or(0, |steps| {
+            (steps as i32).clamp(*ZOOM_STEPS.start(), *ZOOM_STEPS.end())
+        });
         let ids: Vec<NodeId> = graph.engine.nodes.iter().map(|node| node.id).collect();
         for (index, id) in ids.into_iter().enumerate() {
             let saved = &canvas["nodes"][id.to_string()];
             let step = (index % 6) as f32 * 30.0;
             let pos = pair(&saved["pos"]).unwrap_or(Vector::new(40.0 + step, 40.0 + step));
             let open: HashSet<String> = match saved["open"].as_array() {
-                Some(titles) => titles.iter().filter_map(|title| title.as_str().map(str::to_owned)).collect(),
+                Some(titles) => titles
+                    .iter()
+                    .filter_map(|title| title.as_str().map(str::to_owned))
+                    .collect(),
                 None => std::iter::once(t!("Geometry").into_owned()).collect(),
             };
             let handles = saved["handles"]
                 .as_array()
-                .map(|values| values.iter().filter_map(Value::as_u64).map(Handle::new).collect())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_u64)
+                        .map(Handle::new)
+                        .collect()
+                })
                 .unwrap_or_default();
-            graph.ui.insert(id, NodeUi { pos: Point::ORIGIN + pos, open, handles });
+            graph.ui.insert(
+                id,
+                NodeUi {
+                    pos: Point::ORIGIN + pos,
+                    open,
+                    handles,
+                },
+            );
         }
-        Ok((graph, file["drawing"].as_str().unwrap_or_default().to_owned()))
+        Ok((
+            graph,
+            file["drawing"].as_str().unwrap_or_default().to_owned(),
+        ))
     }
 
     pub fn add_node(&mut self, item: PaletteItem, handles: Vec<Handle>, pos: Point) -> NodeId {
@@ -391,7 +1064,10 @@ impl Graph {
             .inputs
             .iter()
             .map(|input| {
-                let port = Port { node: id, field: input.name.to_owned() };
+                let port = Port {
+                    node: id,
+                    field: input.name.to_owned(),
+                };
                 let widget = match (spec.name, input.name) {
                     ("Number Slider" | "Integer Slider", "value") => RowWidget::Slider {
                         min: param("min").unwrap_or(0.0),
@@ -399,6 +1075,8 @@ impl Graph {
                         step: param("step").unwrap_or(0.0),
                     },
                     ("Boolean", "value") => RowWidget::Toggle,
+                    _ if matches!(input.default, graph::ops::Initial::Num(_)) => RowWidget::Number,
+                    _ if is_coordinate(spec, input) => RowWidget::Coordinate,
                     _ => RowWidget::Field,
                 };
                 let output = spec.outputs.contains(&input.name);
@@ -413,6 +1091,7 @@ impl Graph {
                     input: true,
                     output,
                     widget,
+                    group: None,
                 }
             })
             .collect();
@@ -427,14 +1106,22 @@ impl Graph {
                     input: false,
                     output: true,
                     widget: RowWidget::Field,
+                    group: None,
                 }),
         );
-        vec![NodeSection { title: String::new(), rows }]
+        vec![NodeSection {
+            title: String::new(),
+            header: None,
+            rows,
+        }]
     }
 
     /// Every node's rows, parallel to `engine.nodes`. `objects` holds the
     /// object nodes' rows, which only the app can build.
-    pub fn sections(&self, mut objects: HashMap<NodeId, Vec<NodeSection>>) -> Vec<Vec<NodeSection>> {
+    pub fn sections(
+        &self,
+        mut objects: HashMap<NodeId, Vec<NodeSection>>,
+    ) -> Vec<Vec<NodeSection>> {
         self.engine
             .nodes
             .iter()
@@ -447,16 +1134,41 @@ impl Graph {
 
     fn is_open(&self, id: NodeId, section: &NodeSection) -> bool {
         section.title.is_empty()
-            || self.ui.get(&id).is_some_and(|ui| ui.open.contains(&section.title))
+            || self
+                .ui
+                .get(&id)
+                .is_some_and(|ui| ui.open.contains(&section.title))
+    }
+
+    /// Whether `row` shows: not folded into a closed coordinate group.
+    fn is_shown(&self, id: NodeId, row: &NodeRow) -> bool {
+        row.group
+            .as_ref()
+            .is_none_or(|group| self.ui.get(&id).is_some_and(|ui| ui.open.contains(group)))
     }
 
     /// Row centre of `field`, relative to the node's top. Rows of a collapsed
-    /// section keep their ports on its header.
-    fn port_offset(&self, id: NodeId, sections: &[NodeSection], field: &str, input: bool) -> Option<f32> {
+    /// section keep their ports on its header, folded components on their
+    /// group's row.
+    fn port_offset(
+        &self,
+        id: NodeId,
+        sections: &[NodeSection],
+        field: &str,
+        input: bool,
+    ) -> Option<f32> {
         let mut y = HEADER_H;
+        let matches =
+            |row: &NodeRow| row.field == field && if input { row.input } else { row.output };
         for section in sections {
-            let matches = |row: &NodeRow| row.field == field && if input { row.input } else { row.output };
-            let header = if section.title.is_empty() { 0.0 } else { SECTION_H };
+            if section.header.as_ref().is_some_and(matches) {
+                return Some(y + SECTION_H * 0.5);
+            }
+            let header = if section.title.is_empty() {
+                0.0
+            } else {
+                SECTION_H
+            };
             if !self.is_open(id, section) {
                 if section.rows.iter().any(matches) {
                     return Some(y + SECTION_H * 0.5);
@@ -465,7 +1177,17 @@ impl Graph {
                 continue;
             }
             y += header;
+            let mut group_y = None;
             for row in &section.rows {
+                if !self.is_shown(id, row) {
+                    if matches(row) {
+                        return group_y.map(|group_y: f32| group_y + ROW_H * 0.5);
+                    }
+                    continue;
+                }
+                if matches!(row.widget, RowWidget::Group) {
+                    group_y = Some(y);
+                }
                 if matches(row) {
                     return Some(y + ROW_H * 0.5);
                 }
@@ -476,41 +1198,258 @@ impl Graph {
     }
 
     fn port_point(&self, sections: &[Vec<NodeSection>], port: &Port, input: bool) -> Option<Point> {
-        let index = self.engine.nodes.iter().position(|node| node.id == port.node)?;
+        let index = self
+            .engine
+            .nodes
+            .iter()
+            .position(|node| node.id == port.node)?;
         let ui = self.ui.get(&port.node)?;
         let y = self.port_offset(port.node, &sections[index], &port.field, input)?;
-        let x = if input { PORT_W * 0.5 } else { NODE_W - PORT_W * 0.5 };
+        let x = if input {
+            PORT_W * 0.5
+        } else {
+            NODE_W - PORT_W * 0.5
+        };
         Some(self.to_screen(ui.pos + Vector::new(x, y)))
     }
 
     /// The input port under the cursor.
     pub fn hit_input(&self, sections: &[Vec<NodeSection>]) -> Option<Port> {
-        self.engine.nodes.iter().zip(sections).find_map(|(node, node_sections)| {
-            node_sections
-                .iter()
-                .filter(|section| self.is_open(node.id, section))
-                .flat_map(|section| &section.rows)
-                .filter(|row| row.input)
-                .map(|row| Port { node: node.id, field: row.field.clone() })
-                .find(|port| {
-                    self.port_point(sections, port, true)
-                        .is_some_and(|p| p.distance(self.cursor) <= PORT_HIT * self.zoom().max(0.5))
-                })
-        })
+        self.engine
+            .nodes
+            .iter()
+            .zip(sections)
+            .find_map(|(node, node_sections)| {
+                node_sections
+                    .iter()
+                    .flat_map(|section| {
+                        let rows = if self.is_open(node.id, section) {
+                            section.rows.as_slice()
+                        } else {
+                            &[]
+                        };
+                        section.header.iter().chain(rows)
+                    })
+                    .filter(|row| row.input && self.is_shown(node.id, row))
+                    .map(|row| Port {
+                        node: node.id,
+                        field: row.field.clone(),
+                    })
+                    .find(|port| {
+                        self.port_point(sections, port, true).is_some_and(|p| {
+                            p.distance(self.cursor) <= PORT_HIT * self.zoom().max(0.5)
+                        })
+                    })
+            })
     }
 
-    pub fn view(&self, sections: Vec<Vec<NodeSection>>) -> Element<'_, Message> {
+    /// The rows of node `id` that a link supplies, and so cannot be typed in.
+    /// One value can have several ports: a coordinate is also its group's
+    /// row, and a section's header carries all of its rows. A row is driven
+    /// by a link to any port that includes it, and a group by a link to any
+    /// of its components.
+    pub(crate) fn driven_fields(&self, id: NodeId, sections: &[NodeSection]) -> HashSet<String> {
+        let linked = |field: &str| {
+            self.engine.is_linked(&Port {
+                node: id,
+                field: field.to_owned(),
+            })
+        };
+        let mut driven = HashSet::default();
+        for section in sections {
+            let whole = section.header.as_ref().is_some_and(|h| linked(&h.field));
+            for row in &section.rows {
+                if whole
+                    || row.group.as_ref().is_some_and(|group| linked(group))
+                    || linked(&row.field)
+                    || row.field.split('|').any(linked)
+                {
+                    driven.insert(row.field.clone());
+                }
+            }
+        }
+        driven
+    }
+
+    /// Every text field a user can type in, each card's in Tab order: its
+    /// rows from the top.
+    pub(crate) fn tab_order(&self, sections: &[Vec<NodeSection>]) -> Vec<Port> {
+        let mut fields = Vec::new();
+        for (node, node_sections) in self.engine.nodes.iter().zip(sections) {
+            let id = node.id;
+            let driven = self.driven_fields(id, node_sections);
+            for section in node_sections.iter().filter(|s| self.is_open(id, s)) {
+                for row in &section.rows {
+                    let typed = !matches!(
+                        row.widget,
+                        RowWidget::Slider { .. }
+                            | RowWidget::Toggle
+                            | RowWidget::Choice(_)
+                            | RowWidget::Color
+                    );
+                    if typed && row.input && self.is_shown(id, row) && !driven.contains(&row.field)
+                    {
+                        fields.push(Port {
+                            node: id,
+                            field: row.field.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        fields
+    }
+
+    /// A node's card title: its operation, or its object kind and count.
+    fn title(&self, node: &graph::Node) -> String {
+        match &node.kind {
+            Kind::Op(spec) => t!(spec.name).into_owned(),
+            Kind::Object(name) => {
+                let count = self.ui.get(&node.id).map_or(0, |ui| ui.handles.len());
+                let name = t!(name.as_str()).into_owned();
+                if count > 1 {
+                    format!("{name} ×{count}")
+                } else {
+                    name
+                }
+            }
+        }
+    }
+
+    /// Every output of the graph as a picker offers it, `Node.output`, in
+    /// card order. A section's header output is listed by its title.
+    pub(crate) fn sources(&self, sections: &[Vec<NodeSection>]) -> Vec<Source> {
+        let mut sources = Vec::new();
+        for (node, node_sections) in self.engine.nodes.iter().zip(sections) {
+            let title = self.title(node);
+            for section in node_sections {
+                let rows = section.header.iter().chain(&section.rows);
+                for row in rows.filter(|row| row.output) {
+                    let label = if section
+                        .header
+                        .as_ref()
+                        .is_some_and(|h| h.field == row.field)
+                    {
+                        &section.title
+                    } else {
+                        &row.label
+                    };
+                    sources.push(Source {
+                        port: Port {
+                            node: node.id,
+                            field: row.field.clone(),
+                        },
+                        name: format!("{title}.{label}"),
+                        value: node.outputs.get(&row.field).cloned().unwrap_or(Value::Null),
+                    });
+                }
+            }
+        }
+        sources
+    }
+
+    /// The outputs `to` can take a link from: any whose node `to`'s node
+    /// does not reach, so the link closes no loop.
+    pub(crate) fn sources_for<'s>(&self, sources: &'s [Source], to: &Port) -> Vec<&'s Source> {
+        sources
+            .iter()
+            .filter(|source| !self.engine.reaches(to.node, source.port.node))
+            .collect()
+    }
+
+    /// What the labels show of the graph's links. A linked input that
+    /// shows as a row names its source; one folded away, in a closed section
+    /// or coordinate group, is summed up on the row that stands for it.
+    /// Links into a section's header port keep their wires.
+    pub(crate) fn link_labels(
+        &self,
+        sections: &[Vec<NodeSection>],
+        sources: &[Source],
+    ) -> LinkLabels {
+        let mut labels = LinkLabels::default();
+        for (node, node_sections) in self.engine.nodes.iter().zip(sections) {
+            for section in node_sections {
+                let open = self.is_open(node.id, section);
+                for row in section.rows.iter().filter(|row| row.input) {
+                    let port = Port {
+                        node: node.id,
+                        field: row.field.clone(),
+                    };
+                    let Some(link) = self.engine.links.iter().find(|link| link.to == port) else {
+                        continue;
+                    };
+                    let name = sources
+                        .iter()
+                        .find(|source| source.port == link.from)
+                        .map_or_else(|| link.from.field.clone(), |source| source.name.clone());
+                    let stand_in = if !open {
+                        section_key(node.id, &section.title)
+                    } else if let Some(group) =
+                        row.group.as_ref().filter(|_| !self.is_shown(node.id, row))
+                    {
+                        Port {
+                            node: node.id,
+                            field: group.clone(),
+                        }
+                    } else {
+                        labels.rows.insert(port, name);
+                        continue;
+                    };
+                    labels
+                        .folded
+                        .entry(stand_in.clone())
+                        .or_default()
+                        .push(name);
+                    labels.folded_by.insert(port, stand_in);
+                }
+            }
+        }
+        labels
+    }
+
+    pub fn view(
+        &self,
+        sections: Vec<Vec<NodeSection>>,
+        links: LinkDisplay,
+    ) -> Element<'_, Message> {
+        let fields = self.tab_order(&sections);
+        let drafts = self.drafts.keys().cloned().collect();
+        let sources = self.sources(&sections);
+        let labels = if links.labels() {
+            self.link_labels(&sections, &sources)
+        } else {
+            LinkLabels::default()
+        };
+        let selected = self.selected.filter(|_| links == LinkDisplay::Selection);
         let wires = self
             .engine
             .links
             .iter()
             .filter_map(|link| {
+                // A labelled link shows its wire, faintly, while its label (or
+                // the row that sums it up) is hovered, or one of its nodes is
+                // selected.
+                let stand_in = labels.folded_by.get(&link.to);
+                let faint = stand_in.is_some() || labels.rows.contains_key(&link.to);
+                let hovered = self.hovered_label.as_ref();
+                let shown = !faint
+                    || hovered == Some(&link.to)
+                    || (hovered.is_some() && hovered == stand_in)
+                    || selected.is_some_and(|id| link.from.node == id || link.to.node == id);
+                if !shown {
+                    return None;
+                }
                 Some((
                     self.port_point(&sections, &link.from, false)?,
                     self.port_point(&sections, &link.to, true)?,
+                    faint,
                 ))
             })
             .collect();
+        let picker = self.picker.as_ref().map(|picker| {
+            let offered = self.sources_for(&sources, &picker.to);
+            self.picker_view(picker, &offered)
+        });
         let pending = match &self.drag {
             Some(Drag::Link(from)) => self
                 .port_point(&sections, from, false)
@@ -518,21 +1457,35 @@ impl Graph {
             _ => None,
         };
         let zoom = self.zoom();
+        // Lay the nodes out relative to the visible area's top-left rather
+        // than the graph origin: a `pin` clips to its own bounds, so nodes
+        // left of / above the origin vanished once panned or zoomed out (#1592).
+        let shift = Vector::new(self.pan.x / zoom, self.pan.y / zoom);
         let mut nodes = stack![];
         for (node, node_sections) in self.engine.nodes.iter().zip(sections) {
             let Some(ui) = self.ui.get(&node.id) else {
                 continue;
             };
-            nodes = nodes.push(pin(self.node_view(node, node_sections)).x(ui.pos.x).y(ui.pos.y));
+            let lit = selected == Some(node.id);
+            nodes = nodes.push(
+                pin(self.node_view(node, node_sections, &labels, lit))
+                    .x(ui.pos.x + shift.x)
+                    .y(ui.pos.y + shift.y),
+            );
         }
         let mut layers = stack![
-            canvas(Wires { wires, pending, width: 2.0 * zoom.max(0.5) })
-                .width(Length::Fill)
-                .height(Length::Fill),
+            canvas(Wires {
+                wires,
+                pending,
+                width: 2.0 * zoom.max(0.5)
+            })
+            .width(Length::Fill)
+            .height(Length::Fill),
             Zoomed {
                 content: nodes.width(Length::Fill).height(Length::Fill).into(),
-                pan: self.pan,
                 zoom,
+                fields,
+                drafts,
             },
         ];
         if let Some(Drag::Palette(item)) = self.drag {
@@ -540,6 +1493,9 @@ impl Graph {
                 .padding([3, 8])
                 .style(container::bordered_box);
             layers = layers.push(pin(ghost).x(self.cursor.x + 10.0).y(self.cursor.y + 10.0));
+        }
+        if let (Some(picker), Some(view)) = (&self.picker, picker) {
+            layers = layers.push(pin(view).x(picker.at.x).y(picker.at.y + 4.0));
         }
         let area = mouse_area(layers.width(Length::Fill).height(Length::Fill))
             .on_move(|p| msg(GraphMsg::Moved(p)))
@@ -554,62 +1510,132 @@ impl Graph {
     fn palette_entry(&self, item: PaletteItem) -> Element<'_, Message> {
         let icon: Element<'_, Message> = match item {
             PaletteItem::Object(kind) => crate::modules::registry::command_icon(kind.command())
-                .map_or_else(|| Space::new().width(14.0).into(), |bytes| {
-                    crate::ui::icons::semantic(bytes, 14.0)
-                }),
-            PaletteItem::Op(_) => Space::new().width(14.0).into(),
+                .map_or_else(
+                    || Space::new().width(km::ROW_ICON).into(),
+                    |bytes| crate::ui::icons::semantic(bytes, km::ROW_ICON),
+                ),
+            PaletteItem::Op(_) => Space::new().width(km::ROW_ICON).into(),
         };
-        mouse_area(
-            container(
-                row![icon, text(t!(item.label())).size(12)]
-                    .spacing(6)
-                    .align_y(iced::Center),
-            )
-            .padding([3, 10])
-            .width(Length::Fill),
+        let held = match self.drag {
+            Some(Drag::Palette(held)) => Some(held),
+            _ => None,
+        };
+        let selected = held.is_some_and(|held| held.same(item));
+        let entry = container(
+            row![
+                icon,
+                crate::ui::kit::value_text(t!(item.label()).into_owned(), false)
+            ]
+            .spacing(km::TOOL_GAP)
+            .align_y(iced::Center),
         )
-        .on_press(msg(GraphMsg::PalettePress(item)))
-        .on_release(msg(GraphMsg::PaletteRelease))
-        .interaction(mouse::Interaction::Grab)
-        .into()
+        .padding([0.0, km::CELL_PAD_X + km::INDENT])
+        .height(Length::Fixed(km::ROW_H))
+        .align_y(iced::Center)
+        .width(Length::Fill)
+        .style(move |theme: &Theme| {
+            if selected {
+                palette_highlight(theme)
+            } else {
+                container::Style::default()
+            }
+        });
+        // While an entry is being dragged, only that entry stays lit.
+        let dragging = held.is_some();
+        let hovered = container(Space::new())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |theme: &Theme| {
+                if dragging {
+                    container::Style::default()
+                } else {
+                    palette_highlight(theme)
+                }
+            });
+        let spec = match item {
+            PaletteItem::Op(spec) => Some(spec),
+            PaletteItem::Object(_) => None,
+        };
+        // The highlight is a layer under the entry, so the entry's icon and
+        // name stay on top of it.
+        let lit = hover(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fixed(km::ROW_H)),
+            hovered,
+        );
+        with_tip(
+            mouse_area(iced::widget::stack![lit, entry])
+                .on_press(msg(GraphMsg::PalettePress(item)))
+                .on_release(msg(GraphMsg::PaletteRelease)),
+            node_tip(t!(item.label()).into_owned(), spec),
+            1.0,
+        )
     }
 
     /// The node library as a docked panel: title bar, a search box with the
     /// graph's New / Open / Save beside it, then the categories. Entries are
     /// clicked or dragged onto the canvas.
-    pub fn panel(&self, width: f32, auto_collapse: bool) -> Element<'_, Message> {
+    pub fn panel(
+        &self,
+        width: f32,
+        chrome: crate::ui::dock::Chrome,
+        links: LinkDisplay,
+    ) -> Element<'_, Message> {
         use crate::ui::dock::{self, PanelId};
+        use crate::ui::kit;
         let tool = |icon: &'static [u8], tip: &str, message: GraphMsg| {
-            dock::tool_button(
-                crate::ui::icons::themed(icon, dock::TOOL_H - 6.0),
+            kit::tool_button(
+                kit::tool_icon(icon),
                 t!(tip).into_owned(),
-                msg(message),
+                Some(msg(message)),
+                false,
             )
         };
-        let toolbar = row![
-            text_input(&t!("Search nodes…"), &self.search)
-                .on_input(|value| msg(GraphMsg::Search(value)))
-                .padding([4, 8])
-                .size(12),
-            tool(crate::ui::icons::DOC_NEW, "New graph", GraphMsg::New),
-            tool(crate::ui::icons::FOLDER_OPEN, "Open graph", GraphMsg::Open),
-            tool(crate::ui::icons::SAVE, "Save graph", GraphMsg::Save),
-        ]
-        .spacing(4)
-        .align_y(iced::Center);
+        let toolbar = kit::band(
+            row![
+                kit::search_field(&t!("Search nodes…"), &self.search, |value| {
+                    msg(GraphMsg::Search(value))
+                }),
+                tool(crate::ui::icons::DOC_NEW, "New graph", GraphMsg::New),
+                tool(crate::ui::icons::FOLDER_OPEN, "Open graph", GraphMsg::Open),
+                tool(crate::ui::icons::SAVE, "Save graph", GraphMsg::Save),
+            ]
+            .spacing(km::TOOL_GAP)
+            .align_y(iced::Center),
+        );
+
+        // How links show: a view setting, the same for every graph.
+        let link_switch = kit::tabs(
+            LinkDisplay::ALL
+                .iter()
+                .map(|mode| (t!(mode.label()).into_owned(), msg(GraphMsg::Links(*mode))))
+                .collect(),
+            LinkDisplay::ALL
+                .iter()
+                .position(|mode| *mode == links)
+                .unwrap_or(0),
+        );
 
         let query = self.search.trim().to_lowercase();
         let wanted = |item: PaletteItem| {
             query.is_empty() || t!(item.label()).to_lowercase().contains(&query)
         };
-        let mut tree = column![].spacing(1);
-        let categories = std::iter::once("Objects").chain(graph::CATEGORIES.iter().copied());
+        let mut tree = column![];
+        use crate::app::node_graph::ops;
+        let categories = std::iter::once("Objects")
+            .chain(ops::CATEGORIES.iter().copied())
+            .chain(graph::CATEGORIES.iter().copied());
         for category in categories {
             let items: Vec<PaletteItem> = if category == "Objects" {
-                OBJECTS.iter().map(|kind| PaletteItem::Object(*kind)).collect()
-            } else {
-                graph::LIBRARY
+                OBJECTS
                     .iter()
+                    .map(|kind| PaletteItem::Object(*kind))
+                    .collect()
+            } else {
+                ops::LIBRARY
+                    .iter()
+                    .chain(graph::LIBRARY)
                     .filter(|spec| spec.category == category)
                     .map(PaletteItem::Op)
                     .collect()
@@ -621,81 +1647,75 @@ impl Graph {
             // A search shows every match, collapsed categories included.
             let open = !query.is_empty()
                 || (category == "Objects") != self.toggled_categories.contains(category);
-            tree = tree.push(
-                button(
-                    row![
-                        crate::ui::icons::themed_arrow_toggle(open, 9.0),
-                        text(t!(category)).size(11)
-                    ]
-                    .spacing(4)
-                    .align_y(iced::Center),
-                )
-                .on_press(msg(GraphMsg::Category(category)))
-                .style(|theme: &Theme, status| {
-                    let mut style = button::text(theme, status);
-                    style.background =
-                        Some(Background::Color(theme.palette().background.weak.color));
-                    style
-                })
-                .width(Length::Fill)
-                .padding([3, 6]),
-            );
+            tree = tree.push(kit::category_bar(
+                t!(category).into_owned(),
+                !open,
+                msg(GraphMsg::Category(category)),
+            ));
             if open {
                 for item in items {
                     tree = tree.push(self.palette_entry(item));
                 }
             }
         }
-        let body = scrollable(container(tree).padding(iced::Padding {
-            top: 0.0,
-            right: 8.0,
-            bottom: 6.0,
-            left: 0.0,
-        }))
-        .width(Length::Fill)
-        .height(Length::Fill);
-
-        dock::frame(
+        kit::palette(
+            dock::title_bar(PanelId::NodeGraph, t!("Node Graph").into_owned(), chrome),
             column![
-                dock::title_bar(PanelId::NodeGraph, t!("Node Graph").into_owned(), auto_collapse),
                 toolbar,
-                body
-            ]
-            .spacing(6),
+                Space::new().height(km::TOOL_GAP),
+                link_switch,
+                Space::new().height(km::TOOL_GAP),
+                kit::scroll_area(tree)
+            ],
             width,
         )
     }
 
-    fn node_view(&self, node: &graph::Node, sections: Vec<NodeSection>) -> Element<'_, Message> {
+    /// `labels` names the sources of the linked rows that show a label;
+    /// `lit` outlines the card as the selected node.
+    fn node_view(
+        &self,
+        node: &graph::Node,
+        sections: Vec<NodeSection>,
+        labels: &LinkLabels,
+        lit: bool,
+    ) -> Element<'_, Message> {
         let id = node.id;
-        let title = match &node.kind {
-            Kind::Op(spec) => t!(spec.name).into_owned(),
-            Kind::Object(name) => {
-                let count = self.ui.get(&id).map_or(0, |ui| ui.handles.len());
-                let name = t!(name.as_str()).into_owned();
-                if count > 1 { format!("{name} ×{count}") } else { name }
-            }
+        let title = self.title(node);
+        let zoom = self.zoom();
+        let spec = match &node.kind {
+            Kind::Op(spec) => Some(*spec),
+            Kind::Object(_) => None,
         };
+        let title_tip = node_tip(title.clone(), spec);
         let header = row![
-            mouse_area(
-                container(text(title).size(12))
-                    .padding([4, 8])
-                    .width(Length::Fill)
-                    .height(HEADER_H),
-            )
-            .on_press(msg(GraphMsg::NodePress(id)))
-            .interaction(mouse::Interaction::Grab),
-            button(crate::ui::icons::themed(crate::ui::icons::CLOSE, 10.0))
-                .on_press(msg(GraphMsg::NodeDelete(id)))
-                .style(button::text)
-                .padding([6, 8]),
+            with_tip(
+                mouse_area(
+                    container(text(title).size(12))
+                        .padding([4, 8])
+                        .width(Length::Fill)
+                        .height(HEADER_H),
+                )
+                .on_press(msg(GraphMsg::NodePress(id))),
+                title_tip,
+                zoom,
+            ),
+            with_tip(
+                button(crate::ui::icons::themed(crate::ui::icons::CLOSE, 10.0))
+                    .on_press(msg(GraphMsg::NodeDelete(id)))
+                    .style(button::text)
+                    .padding([6, 8]),
+                t!("Delete").into_owned(),
+                zoom,
+            ),
         ]
         .height(HEADER_H);
         let header = container(header).style(|theme: &Theme| container::Style {
-            background: Some(Background::Color(theme.palette().primary.weak.color)),
-            text_color: Some(theme.palette().primary.weak.text),
+            background: Some(Background::Color(crate::ui::style::chrome::lit(theme))),
+            text_color: Some(crate::ui::style::chrome::strong(theme)),
             ..Default::default()
         });
+        let driven = self.driven_fields(id, &sections);
         let mut col = column![header];
         if sections.is_empty() {
             col = col.push(
@@ -707,36 +1727,78 @@ impl Graph {
         for section in sections {
             let open = self.is_open(id, &section);
             if !section.title.is_empty() {
-                col = col.push(
-                    button(
-                        row![
-                            crate::ui::icons::themed_arrow_toggle(open, 9.0),
-                            text(section.title.clone()).size(11)
-                        ]
-                        .spacing(4)
-                        .align_y(iced::Center),
-                    )
-                    .on_press(msg(GraphMsg::Section(id, section.title)))
+                let (in_port, out_port) = match &section.header {
+                    Some(header) => self.port_views(id, header),
+                    None => (
+                        Space::new().width(PORT_W).into(),
+                        Space::new().width(PORT_W).into(),
+                    ),
+                };
+                let mut caption = row![
+                    crate::ui::icons::themed_arrow_toggle(open, 9.0),
+                    text(section.title.clone()).size(11)
+                ]
+                .spacing(4)
+                .align_y(iced::Center);
+                // A closed section sums up the links into its rows.
+                let key = section_key(id, &section.title);
+                if let Some(names) = labels.folded.get(&key) {
+                    caption = caption.push(folded_label(key, folded_text(names)));
+                }
+                let toggle = button(caption)
+                    .on_press(msg(GraphMsg::Section(id, section.title.clone())))
                     .style(button::secondary)
                     .width(Length::Fill)
                     .height(SECTION_H)
-                    .padding([0, 6]),
-                );
+                    .padding([0, 6]);
+                col = col.push(with_tip(
+                    row![in_port, toggle, out_port]
+                        .spacing(2)
+                        .height(SECTION_H)
+                        .align_y(iced::Center),
+                    section.title.clone(),
+                    zoom,
+                ));
             }
             if open {
                 for node_row in section.rows {
-                    col = col.push(self.row_view(id, node_row));
+                    if self.is_shown(id, &node_row) {
+                        let locked = driven.contains(&node_row.field);
+                        let label = labels
+                            .rows
+                            .get(&Port {
+                                node: id,
+                                field: node_row.field.clone(),
+                            })
+                            .cloned();
+                        let folded = labels
+                            .folded
+                            .get(&Port {
+                                node: id,
+                                field: node_row.field.clone(),
+                            })
+                            .map(|names| folded_text(names));
+                        // Every row of a card shows its dropdown carets, as
+                        // the selected row of a property grid does.
+                        crate::ui::kit::building_row(None, true);
+                        col = col.push(self.row_view(id, node_row, locked, label, folded));
+                        crate::ui::kit::building_row(None, false);
+                    }
                 }
             }
         }
         opaque(
             container(col)
                 .width(NODE_W)
-                .style(|theme: &Theme| container::Style {
-                    background: Some(Background::Color(theme.palette().background.base.color)),
+                .style(move |theme: &Theme| container::Style {
+                    background: Some(Background::Color(crate::ui::style::chrome::surface(theme))),
                     border: Border {
-                        color: theme.palette().background.strong.color,
-                        width: 1.0,
+                        color: if lit {
+                            crate::ui::style::chrome::accent(theme)
+                        } else {
+                            crate::ui::style::chrome::border(theme)
+                        },
+                        width: if lit { 2.0 } else { 1.0 },
                         radius: 4.0.into(),
                     },
                     ..Default::default()
@@ -744,26 +1806,81 @@ impl Graph {
         )
     }
 
-    fn row_view(&self, id: NodeId, node_row: NodeRow) -> Element<'_, Message> {
-        let port = Port { node: id, field: node_row.field };
-        let linked_in = self.engine.is_linked(&port);
-        let linked_out = self.engine.links.iter().any(|link| link.from == port);
-        let shown = display(&node_row.value);
+    /// The input and output port dots of `node_row`, or gaps.
+    fn port_views(
+        &self,
+        id: NodeId,
+        node_row: &NodeRow,
+    ) -> (Element<'_, Message>, Element<'_, Message>) {
+        let port = Port {
+            node: id,
+            field: node_row.field.clone(),
+        };
         let in_port: Element<'_, Message> = if node_row.input {
-            mouse_area(port_dot(linked_in))
+            mouse_area(port_dot(self.engine.is_linked(&port)))
                 .on_press(msg(GraphMsg::InPress(port.clone())))
                 .into()
         } else {
             Space::new().width(PORT_W).into()
         };
         let out_port: Element<'_, Message> = if node_row.output {
-            mouse_area(port_dot(linked_out))
-                .on_press(msg(GraphMsg::OutPress(port.clone())))
+            let linked = self.engine.links.iter().any(|link| link.from == port);
+            mouse_area(port_dot(linked))
+                .on_press(msg(GraphMsg::OutPress(port)))
                 .into()
         } else {
             Space::new().width(PORT_W).into()
         };
-        let value: Element<'_, Message> = if node_row.input && !linked_in {
+        (in_port, out_port)
+    }
+
+    /// `source` is the label of a linked input, naming the output it reads.
+    fn row_view(
+        &self,
+        id: NodeId,
+        node_row: NodeRow,
+        locked: bool,
+        source: Option<String>,
+        folded: Option<String>,
+    ) -> Element<'_, Message> {
+        let tip = match (&source, &folded) {
+            (Some(name), _) => format!("{}\n← {name}", row_tip(&node_row)),
+            (None, Some(summary)) => format!("{}\n{summary}", row_tip(&node_row)),
+            (None, None) => row_tip(&node_row),
+        };
+        let (in_port, out_port) = self.port_views(id, &node_row);
+        let label: Element<'_, Message> = match node_row.widget {
+            RowWidget::Group => {
+                let open = self
+                    .ui
+                    .get(&id)
+                    .is_some_and(|ui| ui.open.contains(&node_row.field));
+                button(
+                    row![
+                        crate::ui::icons::themed_arrow_toggle(open, 9.0),
+                        text(node_row.label).size(11)
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Center),
+                )
+                .on_press(msg(GraphMsg::Section(id, node_row.field.clone())))
+                .style(button::text)
+                .padding(0)
+                .width(LABEL_W)
+                .into()
+            }
+            _ => text(node_row.label).size(11).width(LABEL_W).into(),
+        };
+        let port = Port {
+            node: id,
+            field: node_row.field,
+        };
+        let shown = display(&node_row.value);
+        let value: Element<'_, Message> = if let Some(name) = source {
+            link_label(port, name)
+        } else if let Some(summary) = folded {
+            folded_label(port, summary)
+        } else if node_row.input && !locked {
             match node_row.widget {
                 RowWidget::Slider { min, max, step } => {
                     let current = graph::value::num(&node_row.value).unwrap_or(min);
@@ -788,26 +1905,252 @@ impl Graph {
                         .width(Length::Fill)
                         .into()
                 }
-                RowWidget::Field => {
+                RowWidget::Choice(options) => {
+                    let open = self.menu.as_ref() == Some(&port);
+                    let current = options.iter().position(|(v, _)| *v == node_row.value);
+                    let head = crate::ui::kit::dropdown_head(
+                        current.map_or(shown, |k| options[k].1.clone()),
+                        current.is_none(),
+                        open,
+                        msg(GraphMsg::Menu(Some(port.clone()))),
+                    );
+                    let width = crate::ui::kit::dropdown_width(
+                        options.iter().map(|(_, label)| label.as_str()),
+                        NODE_W - LABEL_W,
+                    );
+                    let rows = options
+                        .into_iter()
+                        .enumerate()
+                        .map(|(k, (value, label))| {
+                            crate::ui::kit::dropdown_option(
+                                label.clone(),
+                                label,
+                                msg(GraphMsg::Set(port.clone(), value)),
+                                Some(k) == current,
+                            )
+                        })
+                        .collect();
+                    let list = crate::ui::dropdown_list::DropdownList::new(rows)
+                        .selected(current)
+                        .select_first_by_default(current.is_some())
+                        .on_escape(msg(GraphMsg::Menu(None)));
+                    crate::ui::kit::dropdown(head, list, width, msg(GraphMsg::Menu(None)), open)
+                }
+                RowWidget::Color => {
+                    let color = crate::app::control::control_color(&node_row.value).ok();
+                    let set = port.clone();
+                    let on_pick = move |c| msg(GraphMsg::Set(set.clone(), crate::app::control::color_value(c)));
+                    let extras = crate::ui::color_select::ColorExtras {
+                        by_layer: true,
+                        by_block: true,
+                        ..Default::default()
+                    };
+                    let open = self.menu.as_ref() == Some(&port);
+                    let toggle = msg(GraphMsg::Menu(Some(port.clone())));
+                    let more = Message::OpenColorWindow(
+                        crate::app::ColorPickTarget::GraphPort(port),
+                        color.unwrap_or(document::types::Color::ByLayer),
+                    );
+                    match color {
+                        Some(color) => crate::ui::color_select::color_selector(color, open, extras, on_pick, toggle, more),
+                        None => crate::ui::color_select::color_selector_varies(open, extras, on_pick, toggle, more),
+                    }
+                }
+                RowWidget::Field
+                | RowWidget::Number
+                | RowWidget::Measure
+                | RowWidget::Coordinate
+                | RowWidget::Group
+                | RowWidget::EditChoice(_) => {
+                    let numeric = matches!(node_row.widget, RowWidget::Number);
                     let draft = self.drafts.get(&port).cloned().unwrap_or(shown);
                     let edit = port.clone();
-                    text_input("", &draft)
-                        .on_input(move |s| msg(GraphMsg::Input(edit.clone(), s)))
-                        .on_submit(msg(GraphMsg::Commit(port)))
+                    let held = draft.clone();
+                    let input = text_input("", &draft)
+                        .id(field_id(&port))
+                        .on_input(move |s| {
+                            let accepted = !numeric || number_prefix(&s);
+                            let s = if accepted { s } else { held.clone() };
+                            msg(GraphMsg::Input(edit.clone(), s))
+                        })
+                        .on_submit(msg(GraphMsg::Commit(port.clone())))
                         .size(11)
                         .padding([2, 4])
-                        .width(Length::Fill)
-                        .into()
+                        .width(Length::Fill);
+                    let RowWidget::EditChoice(options) = node_row.widget else {
+                        return self.row_frame(in_port, label, input.into(), out_port, tip);
+                    };
+                    // The field, and a caret that lists the names to pick.
+                    let open = self.menu.as_ref() == Some(&port);
+                    let caret = button(if open {
+                        crate::ui::icons::themed_arrow_up(9.0)
+                    } else {
+                        crate::ui::icons::themed_arrow_down(9.0)
+                    })
+                    .on_press(msg(GraphMsg::Menu(Some(port.clone()))))
+                    .style(button::text)
+                    .padding([2, 3]);
+                    let width = crate::ui::kit::dropdown_width(
+                        options.iter().map(String::as_str),
+                        NODE_W - LABEL_W,
+                    );
+                    let rows = options
+                        .into_iter()
+                        .map(|option| {
+                            let current = Value::String(option.clone()) == node_row.value;
+                            crate::ui::kit::dropdown_option(
+                                option.clone(),
+                                option.clone(),
+                                msg(GraphMsg::Set(port.clone(), Value::String(option))),
+                                current,
+                            )
+                        })
+                        .collect();
+                    let list = crate::ui::dropdown_list::DropdownList::new(rows)
+                        .on_escape(msg(GraphMsg::Menu(None)));
+                    crate::ui::kit::dropdown(
+                        row![input, caret].align_y(iced::Center).into(),
+                        list,
+                        width,
+                        msg(GraphMsg::Menu(None)),
+                        open,
+                    )
                 }
             }
         } else {
             text(shown).size(11).width(Length::Fill).into()
         };
-        row![in_port, text(node_row.label).size(11).width(LABEL_W), value, out_port]
-            .spacing(2)
-            .height(ROW_H)
-            .align_y(iced::Center)
-            .into()
+        self.row_frame(in_port, label, value, out_port, tip)
+    }
+
+    /// A row's ports, label and value on one line, with its tooltip.
+    fn row_frame<'a>(
+        &self,
+        in_port: Element<'a, Message>,
+        label: Element<'a, Message>,
+        value: Element<'a, Message>,
+        out_port: Element<'a, Message>,
+        tip: String,
+    ) -> Element<'a, Message> {
+        with_tip(
+            row![in_port, label, value, out_port]
+                .spacing(2)
+                .height(ROW_H)
+                .align_y(iced::Center),
+            tip,
+            self.zoom(),
+        )
+    }
+
+    /// The source picker: a search box, Disconnect when the input has a
+    /// link, and the outputs it can read, filtered by the search. The
+    /// current source is lit.
+    fn picker_view(&self, picker: &Picker, offered: &[&Source]) -> Element<'_, Message> {
+        use crate::ui::style::chrome;
+        let current = self
+            .engine
+            .links
+            .iter()
+            .find(|link| link.to == picker.to)
+            .map(|link| link.from.clone());
+        let query = picker.search.trim().to_lowercase();
+        let mut list = column![];
+        let mut count = 0;
+        for source in offered
+            .iter()
+            .filter(|source| query.is_empty() || source.name.to_lowercase().contains(&query))
+        {
+            count += 1;
+            let lit = current.as_ref() == Some(&source.port);
+            let entry = row![
+                text(source.name.clone())
+                    .size(11)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .width(Length::Fill),
+                text(display(&source.value))
+                    .size(10)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .style(|theme: &Theme| iced::widget::text::Style {
+                        color: Some(chrome::muted(theme)),
+                    }),
+            ]
+            .spacing(6)
+            .align_y(iced::Center);
+            list = list.push(
+                button(container(entry).clip(true))
+                    .on_press(msg(GraphMsg::PickSource(
+                        source.port.clone(),
+                        picker.to.clone(),
+                    )))
+                    .width(Length::Fill)
+                    .height(PICKER_ROW_H)
+                    .padding([2, 6])
+                    .style(move |theme: &Theme, status| {
+                        let hovered =
+                            matches!(status, button::Status::Hovered | button::Status::Pressed);
+                        button::Style {
+                            background: (lit || hovered).then(|| {
+                                Background::Color(if lit {
+                                    chrome::row_selected(theme)
+                                } else {
+                                    chrome::hover(theme)
+                                })
+                            }),
+                            text_color: chrome::text(theme),
+                            ..Default::default()
+                        }
+                    }),
+            );
+        }
+        if count == 0 {
+            list = list.push(
+                container(text(t!("No outputs to link")).size(11))
+                    .padding([4, 6])
+                    .style(|theme: &Theme| container::Style {
+                        text_color: Some(chrome::muted(theme)),
+                        ..Default::default()
+                    }),
+            );
+        }
+        let search = text_input(&t!("Search outputs…"), &picker.search)
+            .id(picker_search_id())
+            .on_input(|value| msg(GraphMsg::PickSearch(value)))
+            .size(11)
+            .padding([3, 6]);
+        let mut body = column![row![
+            search,
+            button(crate::ui::icons::themed(crate::ui::icons::CLOSE, 10.0))
+                .on_press(msg(GraphMsg::PickClose))
+                .style(button::text)
+                .padding([4, 6]),
+        ]
+        .align_y(iced::Center)]
+        .spacing(4);
+        if current.is_some() {
+            body = body.push(
+                button(text(t!("Disconnect")).size(11))
+                    .on_press(msg(GraphMsg::PickClear(picker.to.clone())))
+                    .style(button::secondary)
+                    .padding([2, 6])
+                    .width(Length::Fill),
+            );
+        }
+        let height = (count.max(1) as f32 * PICKER_ROW_H).min(PICKER_LIST_H);
+        body = body.push(scrollable(list).height(height));
+        opaque(
+            container(body)
+                .padding(6)
+                .width(PICKER_W)
+                .style(|theme: &Theme| container::Style {
+                    background: Some(Background::Color(chrome::surface_raised(theme))),
+                    border: Border {
+                        color: chrome::border(theme),
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..Default::default()
+                }),
+        )
     }
 
     /// Pure canvas state; document and evaluation work is the app's.
@@ -833,8 +2176,51 @@ impl Graph {
                     _ => {}
                 }
             }
-            GraphMsg::Pressed => self.drag = Some(Drag::Pan(self.cursor, self.pan)),
+            GraphMsg::Pressed => {
+                // A press on the bare canvas also ends the selection and
+                // closes the picker.
+                self.drag = Some(Drag::Pan(self.cursor, self.pan));
+                self.selected = None;
+                self.picker = None;
+            }
+            GraphMsg::LabelHover(port) => self.hovered_label = port.clone(),
+            GraphMsg::Pick(port) => {
+                let same = self.picker.as_ref().is_some_and(|open| open.to == *port);
+                self.picker = (!same).then(|| Picker {
+                    to: port.clone(),
+                    at: self.cursor,
+                    search: String::new(),
+                });
+            }
+            GraphMsg::PickSearch(value) => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.search = value.clone();
+                }
+            }
+            GraphMsg::PickSource(..) | GraphMsg::PickClear(_) | GraphMsg::PickClose => {
+                self.picker = None;
+            }
+            GraphMsg::NodeDelete(id) => {
+                if self.selected == Some(*id) {
+                    self.selected = None;
+                }
+                if self
+                    .picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.to.node == *id)
+                {
+                    self.picker = None;
+                }
+                if self
+                    .hovered_label
+                    .as_ref()
+                    .is_some_and(|port| port.node == *id)
+                {
+                    self.hovered_label = None;
+                }
+            }
             GraphMsg::NodePress(id) => {
+                self.selected = Some(*id);
                 // Raise the grabbed node above the others.
                 if let Some(index) = self.engine.nodes.iter().position(|node| node.id == *id) {
                     let node = self.engine.nodes.remove(index);
@@ -869,15 +2255,75 @@ impl Graph {
                     self.zoom_steps = (self.zoom_steps + lines.signum() as i32)
                         .clamp(*ZOOM_STEPS.start(), *ZOOM_STEPS.end());
                     let zoom = self.zoom();
-                    self.pan = Vector::new(self.cursor.x - anchor.x * zoom, self.cursor.y - anchor.y * zoom);
+                    self.pan = Vector::new(
+                        self.cursor.x - anchor.x * zoom,
+                        self.cursor.y - anchor.y * zoom,
+                    );
                 }
             }
             GraphMsg::Input(port, value) => {
                 self.drafts.insert(port.clone(), value.clone());
             }
+            GraphMsg::Menu(port) => {
+                self.menu = port.clone().filter(|port| self.menu.as_ref() != Some(port));
+            }
+            GraphMsg::Set(..) => self.menu = None,
             _ => {}
         }
     }
+}
+
+/// The label of a linked input, `← Node.output` in the wire colour.
+/// Clicking it opens the source picker; hovering it shows the wire.
+fn link_label<'a>(port: Port, name: String) -> Element<'a, Message> {
+    use crate::ui::style::chrome;
+    let caption = row![
+        text(format!("← {name}"))
+            .size(11)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .width(Length::Fill)
+            .style(|theme: &Theme| iced::widget::text::Style {
+                color: Some(chrome::accent(theme)),
+            }),
+        crate::ui::icons::dropdown_arrow(),
+    ]
+    .spacing(2)
+    .align_y(iced::Center);
+    let field = container(caption)
+        .padding([1, 4])
+        .width(Length::Fill)
+        .clip(true)
+        .style(|theme: &Theme| container::Style {
+            border: Border {
+                color: chrome::accent(theme).scale_alpha(0.5),
+                width: 1.0,
+                radius: 3.0.into(),
+            },
+            ..Default::default()
+        });
+    mouse_area(field)
+        .on_press(msg(GraphMsg::Pick(port.clone())))
+        .on_enter(msg(GraphMsg::LabelHover(Some(port))))
+        .on_exit(msg(GraphMsg::LabelHover(None)))
+        .interaction(mouse::Interaction::Pointer)
+        .into()
+}
+
+/// The sum-up of links folded into a closed section or group, in the wire
+/// colour; hovering it shows their wires. Clicks go to the row beneath, which
+/// opens the fold.
+fn folded_label<'a>(stand_in: Port, summary: String) -> Element<'a, Message> {
+    let caption = text(summary)
+        .size(11)
+        .wrapping(iced::widget::text::Wrapping::None)
+        .width(Length::Fill)
+        .style(|theme: &Theme| iced::widget::text::Style {
+            color: Some(crate::ui::style::chrome::accent(theme)),
+        });
+    mouse_area(container(caption).width(Length::Fill).clip(true))
+        .on_enter(msg(GraphMsg::LabelHover(Some(stand_in))))
+        .on_exit(msg(GraphMsg::LabelHover(None)))
+        .into()
 }
 
 fn port_dot<'a>(linked: bool) -> Element<'a, Message> {
@@ -885,17 +2331,15 @@ fn port_dot<'a>(linked: bool) -> Element<'a, Message> {
         container(Space::new())
             .width(8.0)
             .height(8.0)
-            .style(move |theme: &Theme| {
-                let palette = theme.palette();
-                container::Style {
-                    background: linked.then_some(Background::Color(palette.primary.base.color)),
-                    border: Border {
-                        color: palette.primary.base.color,
-                        width: 1.5,
-                        radius: 4.0.into(),
-                    },
-                    ..Default::default()
-                }
+            .style(move |theme: &Theme| container::Style {
+                background: linked
+                    .then_some(Background::Color(crate::ui::style::chrome::accent(theme))),
+                border: Border {
+                    color: crate::ui::style::chrome::accent(theme),
+                    width: 1.5,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
             }),
     )
     .width(PORT_W)
@@ -907,7 +2351,9 @@ fn port_dot<'a>(linked: bool) -> Element<'a, Message> {
 
 /// Translucent backdrop plus link curves.
 struct Wires {
-    wires: Vec<(Point, Point)>,
+    /// Each link's ends, and whether it shows faintly: a labelled link
+    /// revealed by hover or selection.
+    wires: Vec<(Point, Point, bool)>,
     pending: Option<(Point, Point)>,
     width: f32,
 }
@@ -931,23 +2377,27 @@ impl canvas::Program<Message> for Wires {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        let palette = theme.palette();
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         frame.fill_rectangle(
             Point::ORIGIN,
             bounds.size(),
-            palette.background.base.color.scale_alpha(0.6),
+            crate::ui::style::chrome::surface(theme).scale_alpha(0.6),
         );
         let stroke = canvas::Stroke::default()
-            .with_color(palette.primary.base.color)
+            .with_color(crate::ui::style::chrome::accent(theme))
             .with_width(self.width);
-        for (a, b) in &self.wires {
+        for (a, b, faint) in &self.wires {
+            let stroke = if *faint {
+                stroke.with_color(crate::ui::style::chrome::accent(theme).scale_alpha(0.5))
+            } else {
+                stroke
+            };
             frame.stroke(&wire_path(*a, *b), stroke);
         }
         if let Some((a, b)) = self.pending {
             frame.stroke(
                 &wire_path(a, b),
-                stroke.with_color(palette.primary.weak.color),
+                stroke.with_color(crate::ui::style::chrome::lit(theme)),
             );
         }
         vec![frame.into_geometry()]
@@ -955,23 +2405,240 @@ impl canvas::Program<Message> for Wires {
 }
 
 /// Lays its content out in graph space and draws and hit-tests it through
-/// `pan` and `zoom`, so every widget inside scales as one picture.
+/// `zoom`, so every widget inside scales as one picture.
+///
+/// It also sees every event before the cards do, which is what gives the text
+/// fields Tab order and commit-on-leave: a text input has no focus-lost event.
 struct Zoomed<'a> {
     content: Element<'a, Message>,
-    pan: Vector,
     zoom: f32,
+    /// The text fields in Tab order.
+    fields: Vec<Port>,
+    /// Fields holding uncommitted text.
+    drafts: Vec<Port>,
+}
+
+#[derive(Default)]
+struct ZoomedState {
+    /// A field a press has just focused. Its text is selected when the button
+    /// comes up, as a press and any drag during it place the cursor themselves.
+    select_on_release: Option<Port>,
+}
+
+/// The tooltips of the cards, drawn through the same zoom as the cards. Its
+/// content is laid out relative to the canvas's top-left corner, `origin`.
+struct ZoomedOverlay<'a> {
+    inner: overlay::Element<'a, Message, Theme, iced::Renderer>,
+    zoom: f32,
+    origin: Point,
+}
+
+impl ZoomedOverlay<'_> {
+    /// Overlay content → screen.
+    fn transformation(&self) -> Transformation {
+        Transformation::translate(self.origin.x, self.origin.y) * Transformation::scale(self.zoom)
+    }
+}
+
+impl overlay::Overlay<Message, Theme, iced::Renderer> for ZoomedOverlay<'_> {
+    fn layout(&mut self, renderer: &iced::Renderer, bounds: Size) -> layout::Node {
+        let room = Size::new(
+            (bounds.width - self.origin.x).max(0.0) / self.zoom,
+            (bounds.height - self.origin.y).max(0.0) / self.zoom,
+        );
+        self.inner.as_overlay_mut().layout(renderer, room)
+    }
+
+    fn draw(
+        &self,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+    ) {
+        renderer.with_transformation(self.transformation(), |renderer| {
+            self.inner
+                .as_overlay()
+                .draw(renderer, theme, style, layout, cursor);
+        });
+    }
+
+    // The lists of the cards' dropdowns take the pointer through the zoom
+    // the overlay is drawn with.
+    fn update(
+        &mut self,
+        event: &iced::Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        let cursor = cursor * self.transformation().inverse();
+        self.inner
+            .as_overlay_mut()
+            .update(event, layout, cursor, renderer, shell);
+    }
+
+    fn mouse_interaction(
+        &self,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        let cursor = cursor * self.transformation().inverse();
+        self.inner
+            .as_overlay()
+            .mouse_interaction(layout, cursor, renderer)
+    }
+
+    fn operate(
+        &mut self,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn widget::Operation,
+    ) {
+        self.inner
+            .as_overlay_mut()
+            .operate(layout, renderer, operation);
+    }
+}
+
+/// Finds the focused field.
+#[derive(Default)]
+struct FindFocused(Option<widget::Id>);
+
+impl Operation for FindFocused {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+
+    fn focusable(
+        &mut self,
+        id: Option<&widget::Id>,
+        _bounds: Rectangle,
+        state: &mut dyn Focusable,
+    ) {
+        if state.is_focused() {
+            self.0 = id.cloned();
+        }
+    }
+}
+
+/// Moves focus to one field.
+struct FocusField(widget::Id);
+
+impl Operation for FocusField {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+
+    fn focusable(
+        &mut self,
+        id: Option<&widget::Id>,
+        _bounds: Rectangle,
+        state: &mut dyn Focusable,
+    ) {
+        if id == Some(&self.0) {
+            state.focus();
+        } else {
+            state.unfocus();
+        }
+    }
+}
+
+/// Selects one field's text, so that typing replaces it.
+struct SelectField(widget::Id);
+
+impl Operation for SelectField {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+
+    fn text_input(
+        &mut self,
+        id: Option<&widget::Id>,
+        _bounds: Rectangle,
+        state: &mut dyn TextInput,
+    ) {
+        if id == Some(&self.0) {
+            state.select_all();
+        }
+    }
 }
 
 impl Zoomed<'_> {
     /// Content coordinates → screen, for a layer whose top-left is `origin`.
     fn transformation(&self, origin: Point) -> Transformation {
-        Transformation::translate(origin.x + self.pan.x, origin.y + self.pan.y)
+        Transformation::translate(origin.x, origin.y)
             * Transformation::scale(self.zoom)
             * Transformation::translate(-origin.x, -origin.y)
+    }
+
+    fn run(
+        &mut self,
+        tree: &mut widget::Tree,
+        content: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], content, renderer, operation);
+    }
+
+    fn focused(
+        &mut self,
+        tree: &mut widget::Tree,
+        content: Layout<'_>,
+        renderer: &iced::Renderer,
+    ) -> Option<Port> {
+        let mut find = FindFocused::default();
+        self.run(tree, content, renderer, &mut find);
+        let id = find.0?;
+        self.fields
+            .iter()
+            .find(|port| field_id(port) == id)
+            .cloned()
+    }
+
+    /// Focuses `port` and selects its text.
+    fn enter_field(
+        &mut self,
+        tree: &mut widget::Tree,
+        content: Layout<'_>,
+        renderer: &iced::Renderer,
+        port: &Port,
+    ) {
+        // Focusing puts the cursor at the end, so it has to come first.
+        self.run(tree, content, renderer, &mut FocusField(field_id(port)));
+        self.run(tree, content, renderer, &mut SelectField(field_id(port)));
+    }
+
+    /// The field Tab goes to from `from`: the next on the same card, wrapping
+    /// at its ends.
+    fn tab_target(&self, from: &Port, backward: bool) -> Option<Port> {
+        let card: Vec<&Port> = self
+            .fields
+            .iter()
+            .filter(|port| port.node == from.node)
+            .collect();
+        let at = card.iter().position(|port| *port == from)?;
+        let count = card.len();
+        let next = if backward { at + count - 1 } else { at + 1 } % count;
+        card.get(next).map(|port| (*port).clone())
     }
 }
 
 impl Widget<Message, Theme, iced::Renderer> for Zoomed<'_> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<ZoomedState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(ZoomedState::default())
+    }
+
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fill, Length::Fill)
     }
@@ -1009,6 +2676,40 @@ impl Widget<Message, Theme, iced::Renderer> for Zoomed<'_> {
         let Some(content) = layout.children().next() else {
             return;
         };
+        if let iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Tab),
+            modifiers,
+            ..
+        }) = event
+        {
+            if let Some(from) = self.focused(tree, content, renderer) {
+                if let Some(to) = self.tab_target(&from, modifiers.shift()) {
+                    self.enter_field(tree, content, renderer, &to);
+                }
+                shell.publish(msg(GraphMsg::Commit(from)));
+                shell.capture_event();
+                shell.request_redraw();
+                return;
+            }
+        }
+        // Esc leaves the field (the text input's own handling) and abandons
+        // the edit, which the next click would otherwise commit.
+        if let iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            ..
+        }) = event
+        {
+            if let Some(port) = self.focused(tree, content, renderer) {
+                shell.publish(msg(GraphMsg::Discard(port)));
+            }
+        }
+        let pressed = matches!(
+            event,
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+        );
+        let before = pressed
+            .then(|| self.focused(tree, content, renderer))
+            .flatten();
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -1018,6 +2719,53 @@ impl Widget<Message, Theme, iced::Renderer> for Zoomed<'_> {
             shell,
             &(*viewport * inverse),
         );
+        if pressed {
+            let now = self.focused(tree, content, renderer);
+            if self.drafts.iter().any(|port| Some(port) != now.as_ref()) {
+                shell.publish(msg(GraphMsg::Leave(now.clone())));
+            }
+            tree.state.downcast_mut::<ZoomedState>().select_on_release =
+                now.filter(|port| Some(port) != before.as_ref());
+        } else if matches!(
+            event,
+            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+        ) {
+            let entered = tree
+                .state
+                .downcast_mut::<ZoomedState>()
+                .select_on_release
+                .take();
+            if let Some(port) = entered {
+                self.run(tree, content, renderer, &mut SelectField(field_id(&port)));
+                shell.request_redraw();
+            }
+        }
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut widget::Tree,
+        layout: Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, iced::Renderer>> {
+        let origin = layout.position() + translation;
+        let inverse = self.transformation(layout.position()).inverse();
+        let shift = Point::ORIGIN - layout.position();
+        let zoom = self.zoom;
+        let inner = self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout.children().next()?,
+            renderer,
+            &(*viewport * inverse),
+            shift,
+        )?;
+        Some(overlay::Element::new(Box::new(ZoomedOverlay {
+            inner,
+            zoom,
+            origin,
+        })))
     }
 
     fn mouse_interaction(
@@ -1029,15 +2777,25 @@ impl Widget<Message, Theme, iced::Renderer> for Zoomed<'_> {
         renderer: &iced::Renderer,
     ) -> mouse::Interaction {
         let inverse = self.transformation(layout.position()).inverse();
-        layout.children().next().map_or(mouse::Interaction::None, |content| {
-            self.content.as_widget().mouse_interaction(
-                &tree.children[0],
-                content,
-                cursor * inverse,
-                &(*viewport * inverse),
-                renderer,
-            )
-        })
+        layout
+            .children()
+            .next()
+            .map_or(mouse::Interaction::None, |content| {
+                let interaction = self.content.as_widget().mouse_interaction(
+                    &tree.children[0],
+                    content,
+                    cursor * inverse,
+                    &(*viewport * inverse),
+                    renderer,
+                );
+                // Card buttons, checkboxes and sliders show the plain arrow.
+                match interaction {
+                    mouse::Interaction::Pointer
+                    | mouse::Interaction::Grab
+                    | mouse::Interaction::Grabbing => mouse::Interaction::Idle,
+                    other => other,
+                }
+            })
     }
 
     fn operate(
@@ -1048,9 +2806,12 @@ impl Widget<Message, Theme, iced::Renderer> for Zoomed<'_> {
         operation: &mut dyn widget::Operation,
     ) {
         if let Some(content) = layout.children().next() {
-            self.content
-                .as_widget_mut()
-                .operate(&mut tree.children[0], content, renderer, operation);
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                content,
+                renderer,
+                operation,
+            );
         }
     }
 
@@ -1089,5 +2850,45 @@ impl Widget<Message, Theme, iced::Renderer> for Zoomed<'_> {
 impl<'a> From<Zoomed<'a>> for Element<'a, Message> {
     fn from(zoomed: Zoomed<'a>) -> Self {
         Element::new(zoomed)
+    }
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+
+    fn op(name: &str) -> PaletteItem {
+        PaletteItem::Op(graph::spec(name).expect("library node"))
+    }
+
+    #[test]
+    fn same_entry_is_not_decided_by_the_label() {
+        let object = PaletteItem::Object(ObjectKind::Point);
+        assert!(object.same(object));
+        assert!(op("Point").same(op("Point")));
+        assert!(!object.same(op("Point")), "both are called Point");
+        assert!(!op("Point").same(op("Add")));
+    }
+
+    #[test]
+    fn tooltips_name_a_node_and_its_ports() {
+        let spec = graph::spec("Add");
+        assert_eq!(node_tip("Add".to_owned(), spec), "Add\na, b -> result");
+        assert_eq!(node_tip("Line".to_owned(), None), "Line");
+    }
+
+    #[test]
+    fn a_row_tooltip_shows_the_whole_value() {
+        let row = |value: Value| NodeRow {
+            field: "x".to_owned(),
+            label: "x".to_owned(),
+            value,
+            input: true,
+            output: false,
+            widget: RowWidget::Number,
+            group: None,
+        };
+        assert_eq!(row_tip(&row(json!(-12.75))), "x: -12.75");
+        assert_eq!(row_tip(&row(Value::Null)), "x");
     }
 }

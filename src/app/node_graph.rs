@@ -1,17 +1,179 @@
 //! Node graph handling. An object node's rows are the Properties panel's own
 //! page for its entity, and every write goes through the panel's handlers (via
 //! the control protocol's `set_property_value`) aimed at that entity. The
-//! `graph` crate evaluates; [`AppHost`] gives it the drawing.
+//! `graph` crate evaluates; [`AppHost`] gives it the drawing and the
+//! application's own nodes ([`ops`]).
+//!
+//! Besides its rows, an object node has a port on each section header,
+//! carrying the whole section as `{field: value}`, and on each coordinate
+//! group the panel folds ("Start X/Y/Z"), carrying a point. Linking two
+//! headers or two groups copies every value across.
+
+mod data;
+mod expr;
+pub(crate) mod files;
+pub(crate) mod ops;
+
+#[cfg(test)]
+mod field_tests;
+#[cfg(test)]
+mod open_tests;
 
 use super::{Message, OpenCADStudio};
 use crate::scene::model::object::PropSection;
 use crate::ui::node_graph::{Drag, GraphMsg, NodeRow, NodeSection, ObjectKind, RowWidget};
-use codec::Handle;
+use document::Handle;
 use graph::{Kind, NodeId, Port};
 use iced::Task;
 use rustc_hash::FxHashMap as HashMap;
 use serde_json::{json, Value};
 
+/// Field-key prefix of a section header's port. The key goes on with the
+/// section's first field, which does not change with the interface language.
+const SECTION: &str = "section:";
+
+/// A coordinate group's components (its field joins them with `|`).
+fn components(field: &str) -> Option<std::str::Split<'_, char>> {
+    field.contains('|').then(|| field.split('|'))
+}
+
+/// A point from a point value or from typed text such as `(1, 2, 3)`.
+fn typed_point(value: &Value) -> Option<[f64; 3]> {
+    graph::value::point(value).or_else(|| {
+        let numbers: Option<Vec<f64>> = value
+            .as_str()?
+            .trim_matches(|c: char| c == '(' || c == ')' || c.is_whitespace())
+            .split(',')
+            .map(|part| crate::app::expr_eval::eval_number(part.trim()))
+            .collect();
+        match numbers?.as_slice() {
+            [x, y] => Some([*x, *y, 0.0]),
+            [x, y, z] => Some([*x, *y, *z]),
+            _ => None,
+        }
+    })
+}
+
+/// A panel value as a number: plain, numeric, or as the panel shows it.
+fn row_number(value: &Value) -> Option<f64> {
+    graph::value::num(value)
+        .or_else(|| super::block_parameter_properties::parse_value(value.as_str()?))
+}
+
+/// Whether `text` is a number as the Properties panel reads one.
+fn is_measure(text: &str) -> bool {
+    crate::app::expr_eval::eval_number(text).is_some_and(f64::is_finite)
+        || row_number(&Value::String(text.to_owned())).is_some()
+}
+
+/// What typing `raw` into `row` sets its input to; `None` when `row` cannot
+/// take it.
+fn typed_value(row: &NodeRow, raw: &str) -> Option<Value> {
+    let text = raw.trim();
+    // Typed text is protocol JSON when it parses (numbers, true,
+    // {"rgb":[..]}), otherwise a plain string.
+    let parsed = || serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()));
+    // A list runs the node once per element, each read as the row reads one.
+    if matches!(row.widget, RowWidget::Number | RowWidget::Measure) {
+        if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(text) {
+            return items
+                .iter()
+                .map(|item| match item {
+                    Value::Number(_) => Some(item.clone()),
+                    Value::String(item) => typed_value(row, item),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(Value::Array);
+        }
+    }
+    match row.widget {
+        RowWidget::Number => text
+            .parse()
+            .ok()
+            .filter(|x: &f64| x.is_finite())
+            .map(graph::value::number),
+        // Written as its value: a stored expression would not be evaluated.
+        RowWidget::Measure => match crate::app::expr_eval::eval_number(text) {
+            Some(x) if x.is_finite() => Some(graph::value::number(x)),
+            _ => is_measure(text).then(parsed),
+        },
+        RowWidget::Coordinate if text.is_empty() => Some(Value::Null),
+        RowWidget::Coordinate | RowWidget::Group => match parsed() {
+            // A typed list of points runs the node once per point.
+            Value::Array(points)
+                if matches!(row.widget, RowWidget::Coordinate)
+                    && points.iter().all(|point| typed_point(point).is_some()) =>
+            {
+                Some(Value::Array(points))
+            }
+            value => typed_point(&value).map(graph::value::point_value),
+        },
+        // A name, even one that reads as a number.
+        RowWidget::EditChoice(_) => Some(Value::String(text.to_owned())),
+        _ => Some(parsed()),
+    }
+}
+
+/// Makes room for a value typed into `field`. A coordinate group and its
+/// components are the same numbers, and whichever sorts last would win on
+/// every run: a group replaces its components, and a component takes its
+/// group apart so that its siblings keep their values.
+fn settle_coordinates(params: &mut std::collections::BTreeMap<String, Value>, field: &str) {
+    if components(field).is_some() {
+        for member in field.split('|') {
+            params.remove(member);
+        }
+        return;
+    }
+    let group = params
+        .keys()
+        .find(|key| components(key).is_some_and(|mut members| members.any(|m| m == field)))
+        .cloned();
+    let Some(group) = group else {
+        return;
+    };
+    let point = params.remove(&group).as_ref().and_then(typed_point);
+    for (member, x) in group.split('|').zip(point.into_iter().flatten()) {
+        if member != field {
+            params.insert(member.to_owned(), graph::value::number(x));
+        }
+    }
+}
+
+/// Sets a node parameter: typed, by a slider or through automation alike, so
+/// a coordinate group and its components never both hold the value.
+fn set_param(params: &mut std::collections::BTreeMap<String, Value>, field: String, value: Value) {
+    settle_coordinates(params, &field);
+    params.insert(field, value);
+}
+
+/// Whether `value`, typed as `raw`, is what `row` already holds.
+fn unchanged(row: &NodeRow, raw: &str, value: &Value) -> bool {
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * a.abs().max(1.0);
+    raw.trim() == crate::ui::node_graph::display(&row.value)
+        || row.value == *value
+        || match row.widget {
+            RowWidget::Group | RowWidget::Coordinate => typed_point(&row.value)
+                .zip(typed_point(value))
+                .is_some_and(|(a, b)| a.iter().zip(b).all(|(a, b)| close(*a, b))),
+            RowWidget::Number | RowWidget::Measure => row_number(&row.value)
+                .zip(row_number(value))
+                .is_some_and(|(a, b)| close(a, b)),
+            _ => false,
+        }
+}
+
+/// Parses an `.ocg` file's bytes into a graph.
+pub(in crate::app) type GraphParser =
+    fn(&[u8]) -> Result<crate::ui::node_graph::LoadedGraph, String>;
+
+/// Parse an `.ocg` file's bytes (run on a worker thread).
+pub(in crate::app) fn parse_graph(
+    bytes: &[u8],
+) -> Result<crate::ui::node_graph::LoadedGraph, String> {
+    crate::ui::node_graph::Graph::from_file(bytes).map(crate::ui::node_graph::LoadedGraph::new)
+}
 impl OpenCADStudio {
     /// The Properties panel's single-object page for `handle`.
     fn graph_panel_sections(&self, i: usize, handle: Handle) -> Vec<PropSection> {
@@ -19,9 +181,9 @@ impl OpenCADStudio {
         let Some(entity) = tab.scene.document.get_entity(handle) else {
             return Vec::new();
         };
-        crate::entities::common::set_unit_context(crate::entities::common::UnitContext::from_header(
-            &tab.scene.document.header,
-        ));
+        crate::entities::common::set_unit_context(
+            crate::entities::common::UnitContext::from_header(&tab.scene.document.header),
+        );
         crate::entities::common::set_fixed_text_heights(&tab.scene.document);
         let text_style_names: Vec<String> = tab
             .scene
@@ -42,66 +204,212 @@ impl OpenCADStudio {
         .0
     }
 
-    /// Every row of `handle`'s panel page as `(field, protocol value)`.
-    fn graph_fields(&self, i: usize, handle: Handle) -> Vec<(String, Value)> {
+    /// `handle`'s panel page as node sections: a header port per section,
+    /// and coordinate rows folded under a group row.
+    fn graph_entity_sections(&self, i: usize, handle: Handle) -> Vec<NodeSection> {
+        use crate::ui::properties::{coord_base, coord_component, coord_group_len};
+        let doc = &self.tabs[i].scene.document;
+        let named = |names: Vec<String>| names.into_iter().map(|n| (Value::String(n.clone()), n)).collect();
+        // The Properties panel's widget for each kind of row.
+        let widget = |json: &Value| match json["kind"].as_str() {
+            Some("number") => RowWidget::Measure,
+            Some("bool") => RowWidget::Toggle,
+            Some("color") => RowWidget::Color,
+            Some("choice") => RowWidget::Choice(
+                json["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(|o| (Value::String(o.to_owned()), crate::ui::properties::LocalizedChoice::new(o.to_owned()).to_string()))
+                    .collect(),
+            ),
+            Some("editable_choice") => RowWidget::EditChoice(
+                json["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+            Some("lineweight") => RowWidget::Choice(
+                crate::ui::properties::lw_options()
+                    .into_iter()
+                    .map(|lw| (Value::from(lw.0.value()), lw.to_string()))
+                    .collect(),
+            ),
+            Some("layer") => RowWidget::Choice(named(crate::app::properties::property_layer_names(doc))),
+            Some("linetype") => RowWidget::Choice(named(
+                crate::app::properties::property_linetype_items(doc)
+                    .into_iter()
+                    .map(|item| item.name)
+                    .collect(),
+            )),
+            _ => RowWidget::Field,
+        };
         self.graph_panel_sections(i, handle)
-            .iter()
-            .flat_map(|section| &section.props)
-            .map(|property| {
-                let json = crate::app::control::property_json(property);
-                (property.field.to_owned(), json["value"].clone())
+            .into_iter()
+            .map(|section| {
+                let mut rows = Vec::new();
+                let props = &section.props;
+                let row = |index: usize, label: &str, group: Option<String>| {
+                    let property = &props[index];
+                    let json = crate::app::control::property_json(property);
+                    NodeRow {
+                        field: crate::app::control::row_id(property),
+                        label: label.to_owned(),
+                        input: !matches!(json["kind"].as_str(), Some("readonly" | "specialized")),
+                        output: true,
+                        value: json["value"].clone(),
+                        widget: widget(&json),
+                        group,
+                    }
+                };
+                let mut index = 0;
+                while index < props.len() {
+                    let len = coord_group_len(props, index);
+                    if len < 2 {
+                        rows.push(row(index, &props[index].label, None));
+                        index += 1;
+                        continue;
+                    }
+                    let members: Vec<NodeRow> = (index..index + len)
+                        .map(|k| row(k, coord_component(&props[k].label).trim(), None))
+                        .collect();
+                    let field = members
+                        .iter()
+                        .map(|member| member.field.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    let mut p = [0.0; 3];
+                    let mut complete = true;
+                    for (axis, member) in members.iter().enumerate() {
+                        match row_number(&member.value) {
+                            Some(x) => p[axis] = x,
+                            None => complete = false,
+                        }
+                    }
+                    rows.push(NodeRow {
+                        field: field.clone(),
+                        label: coord_base(&props[index].label).to_owned(),
+                        value: if complete {
+                            graph::value::point_value(p)
+                        } else {
+                            Value::Null
+                        },
+                        input: members.iter().all(|member| member.input),
+                        output: true,
+                        widget: RowWidget::Group,
+                        group: None,
+                    });
+                    rows.extend(members.into_iter().map(|member| NodeRow {
+                        group: Some(field.clone()),
+                        ..member
+                    }));
+                    index += len;
+                }
+                let plain = || {
+                    rows.iter()
+                        .filter(|row| !matches!(row.widget, RowWidget::Group))
+                };
+                let header = NodeRow {
+                    field: format!("{SECTION}{}", props.first().map_or("", |p| p.field)),
+                    label: section.title.clone(),
+                    value: Value::Object(
+                        plain()
+                            .map(|row| (row.field.clone(), row.value.clone()))
+                            .collect(),
+                    ),
+                    input: plain().any(|row| row.input),
+                    output: true,
+                    widget: RowWidget::Field,
+                    group: None,
+                };
+                NodeSection {
+                    title: section.title,
+                    header: Some(header),
+                    rows,
+                }
             })
             .collect()
     }
 
+    /// Every port of `handle`'s panel page as `(field, value)`: headers,
+    /// groups and rows.
+    fn graph_fields(&self, i: usize, handle: Handle) -> Vec<(String, Value)> {
+        self.graph_entity_sections(i, handle)
+            .into_iter()
+            .flat_map(|section| section.header.into_iter().chain(section.rows))
+            .map(|row| (row.field, row.value))
+            .collect()
+    }
+
+    /// The port of `handle` called `name` by field or by label, as
+    /// `(field, value)`.
+    pub(super) fn graph_field(
+        &self,
+        i: usize,
+        handle: Handle,
+        name: &str,
+    ) -> Option<(String, Value)> {
+        let name = name.trim();
+        self.graph_entity_sections(i, handle)
+            .into_iter()
+            .flat_map(|section| section.header.into_iter().chain(section.rows))
+            .find(|row| row.field == name || row.label.eq_ignore_ascii_case(name))
+            .map(|row| (row.field, row.value))
+    }
+
     /// An object node's rows: its object handle(s), then the panel page of its
     /// first entity. With several entities the values shown are the lists.
-    fn graph_object_sections(&self, i: usize, id: NodeId) -> Vec<NodeSection> {
+    fn graph_object_sections(
+        &self,
+        i: usize,
+        id: NodeId,
+        kind: Option<ObjectKind>,
+    ) -> Vec<NodeSection> {
         let graph = &self.tabs[i].graph;
-        let Some(&first) = graph.ui.get(&id).and_then(|ui| ui.handles.first()) else {
-            return Vec::new();
-        };
+        let first = graph.ui.get(&id).and_then(|ui| ui.handles.first()).copied();
         let outputs = graph.engine.node(id).map(|node| &node.outputs);
         let listed = graph.ui.get(&id).is_some_and(|ui| ui.handles.len() > 1);
         let value = |field: &str, own: Value| match outputs.and_then(|outputs| outputs.get(field)) {
             Some(value) if listed => value.clone(),
             _ => own,
         };
-        let panel = self.graph_panel_sections(i, first);
-        if panel.is_empty() {
+        // An `Object` node takes its object in; the others make their own.
+        let input = kind.is_some_and(|kind| !kind.owns());
+        let panel = first.map_or_else(Vec::new, |first| self.graph_entity_sections(i, first));
+        if panel.is_empty() && !input {
             return Vec::new();
         }
         let object = NodeRow {
             field: "object".to_owned(),
             label: crate::t!("Object").into_owned(),
-            value: value("object", json!({ "handle": first.value() })),
-            input: false,
+            value: value(
+                "object",
+                first.map_or(Value::Null, |first| json!({ "handle": first.value() })),
+            ),
+            input,
             output: true,
             widget: RowWidget::Field,
+            group: None,
         };
-        std::iter::once(NodeSection { title: String::new(), rows: vec![object] })
-            .chain(panel.into_iter().map(|section| NodeSection {
-                title: section.title,
-                rows: section
-                    .props
-                    .iter()
-                    .map(|property| {
-                        let json = crate::app::control::property_json(property);
-                        NodeRow {
-                            field: property.field.to_owned(),
-                            label: property.label.clone(),
-                            input: !matches!(
-                                json["kind"].as_str(),
-                                Some("readonly" | "specialized")
-                            ),
-                            output: true,
-                            value: value(property.field, json["value"].clone()),
-                            widget: RowWidget::Field,
-                        }
-                    })
-                    .collect(),
-            }))
-            .collect()
+        let listed_row = |row: NodeRow| NodeRow {
+            value: value(&row.field, row.value),
+            ..row
+        };
+        std::iter::once(NodeSection {
+            title: String::new(),
+            header: None,
+            rows: vec![object],
+        })
+        .chain(panel.into_iter().map(|section| NodeSection {
+            title: section.title,
+            header: section.header.map(listed_row),
+            rows: section.rows.into_iter().map(listed_row).collect(),
+        }))
+        .collect()
     }
 
     /// Every node's rows, parallel to the graph's node list.
@@ -111,23 +419,72 @@ impl OpenCADStudio {
             .engine
             .nodes
             .iter()
-            .filter(|node| matches!(node.kind, Kind::Object(_)))
-            .map(|node| (node.id, self.graph_object_sections(i, node.id)))
+            .filter_map(|node| match &node.kind {
+                Kind::Object(name) => Some((
+                    node.id,
+                    self.graph_object_sections(i, node.id, ObjectKind::from_name(name)),
+                )),
+                Kind::Op(_) => None,
+            })
             .collect();
         graph.sections(objects)
     }
 
-    /// Write one Properties row of `handle` through the panel's handlers.
-    fn graph_write(&mut self, i: usize, handle: Handle, field: &str, value: &Value) -> Task<Message> {
+    /// Write one port of `handle` through the panel's handlers: a row, every
+    /// component of a group, or every writable row of a section that the
+    /// value names.
+    pub(super) fn graph_write(
+        &mut self,
+        i: usize,
+        handle: Handle,
+        field: &str,
+        value: &Value,
+    ) -> Task<Message> {
         // An empty target falls back to the drawing defaults in some handlers.
         if self.tabs[i].scene.is_layer_locked(handle) {
             return Task::none();
+        }
+        if field.starts_with(SECTION) || components(field).is_some() {
+            let wanted: Vec<(String, Value)> = match components(field) {
+                Some(members) => match typed_point(value) {
+                    Some(p) => members
+                        .zip(p)
+                        .map(|(member, x)| (member.to_owned(), graph::value::number(x)))
+                        .collect(),
+                    None => Vec::new(),
+                },
+                None => value
+                    .as_object()
+                    .map(|values| values.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .unwrap_or_default(),
+            };
+            let rows: Vec<NodeRow> = self
+                .graph_entity_sections(i, handle)
+                .into_iter()
+                .flat_map(|section| section.rows)
+                .filter(|row| row.input && !matches!(row.widget, RowWidget::Group))
+                .collect();
+            let tasks: Vec<Task<Message>> = wanted
+                .into_iter()
+                .filter_map(|(member, value)| {
+                    let row = rows.iter().find(|row| row.field == member)?;
+                    let same = row.value == value
+                        || row_number(&row.value)
+                            .zip(row_number(&value))
+                            .is_some_and(|(a, b)| (a - b).abs() <= 1e-12 * a.abs().max(1.0));
+                    (!same).then_some((member, value))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(member, value)| self.graph_write(i, handle, &member, &value))
+                .collect();
+            return Task::batch(tasks);
         }
         let Some(property) = self
             .graph_panel_sections(i, handle)
             .into_iter()
             .flat_map(|section| section.props)
-            .find(|property| property.field == field)
+            .find(|property| crate::app::control::row_id(property) == field)
         else {
             return Task::none();
         };
@@ -148,18 +505,139 @@ impl OpenCADStudio {
         edit: impl FnOnce(&mut Self) -> Vec<Task<Message>>,
     ) -> Task<Message> {
         self.push_undo_snapshot(i, "GRAPH");
+        self.tabs[i].graph_files.edited();
+        let before = self.tabs[i].graph.undo_state();
+        if let Some(pending) = self.tabs[i].history.pending.as_mut() {
+            pending.graph_before = Some(before);
+        }
+        self.graph_evaluate(i, edit)
+    }
+
+    /// Runs the graph of drawing `i` in the open undo step. While a file
+    /// that a node reads is still read, the step stays open (`held`), so
+    /// that the run after the read joins it.
+    fn graph_evaluate(
+        &mut self,
+        i: usize,
+        edit: impl FnOnce(&mut Self) -> Vec<Task<Message>>,
+    ) -> Task<Message> {
         self.graph_undo_open = true;
+        self.graph_unwind(i);
         let mut tasks = edit(self);
+        self.graph_drop_driven_params(i);
+        self.tabs[i].graph_files.begin_run();
         let mut engine = std::mem::take(&mut self.tabs[i].graph.engine);
-        let mut host = AppHost { app: self, i, tasks: Vec::new() };
+        let mut host = AppHost {
+            app: self,
+            i,
+            tasks: Vec::new(),
+        };
         engine.evaluate(&mut host);
         tasks.append(&mut host.tasks);
         self.tabs[i].graph.engine = engine;
+        self.tabs[i].graph_files.end_run();
+        let reading = self.tabs[i].graph_files.reading();
+        if let Some(pending) = self.tabs[i].history.pending.as_mut() {
+            pending.held = reading;
+        }
         self.graph_undo_open = false;
         Task::batch(tasks)
     }
 
-    fn graph_run(&mut self, i: usize) -> Task<Message> {
+    /// The run after a node's file was read: in the graph's undo step when
+    /// it is still open, otherwise in a new one.
+    pub(super) fn graph_rerun_after_read(&mut self, i: usize) -> Task<Message> {
+        let joins = self.tabs[i]
+            .history
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.held && pending.graph_before.is_some());
+        if !joins {
+            self.push_undo_snapshot(i, "GRAPH");
+            let before = self.tabs[i].graph.undo_state();
+            if let Some(pending) = self.tabs[i].history.pending.as_mut() {
+                pending.graph_before = Some(before);
+            }
+        }
+        self.graph_evaluate(i, |_| Vec::new())
+    }
+
+    /// Takes back the last evaluation's edits: objects edited in place get
+    /// their prior state back (latest edit first), created ones are erased.
+    fn graph_unwind(&mut self, i: usize) {
+        let tab = &mut self.tabs[i];
+        let applied = std::mem::take(&mut tab.graph.applied);
+        let created = std::mem::take(&mut tab.graph.created);
+        for (handle, record) in std::mem::take(&mut tab.graph.applied_records)
+            .into_iter()
+            .rev()
+        {
+            tab.scene.document.objects.insert(handle, record);
+        }
+        if applied.is_empty() && created.is_empty() {
+            return;
+        }
+        let mut restored = Vec::new();
+        for (handle, entity) in applied.into_iter().rev() {
+            // An operation that consumed the object erased it: bring it back.
+            if tab.scene.document.get_entity(handle).is_some() {
+                tab.scene.update_entity(entity);
+            } else {
+                tab.scene
+                    .restore_erased_entities(vec![std::sync::Arc::new(entity)]);
+            }
+            restored.push(handle);
+        }
+        // A solid's session body and mesh follow its restored ACIS data.
+        tab.scene.refresh_meshes_for_handles(&restored);
+        let live: Vec<Handle> = created
+            .into_iter()
+            .filter(|handle| tab.scene.document.get_entity(*handle).is_some())
+            .collect();
+        if !live.is_empty() {
+            tab.scene.erase_entities(&live);
+        }
+        tab.dirty = true;
+    }
+
+    /// A link beats a value typed by hand, but an object node applies its
+    /// typed values after its links. So the typed values of everything a link
+    /// supplies go; values of a coordinate's siblings stay.
+    fn graph_drop_driven_params(&mut self, i: usize) {
+        let graph = &self.tabs[i].graph;
+        let is_object = |id: NodeId| {
+            graph
+                .engine
+                .node(id)
+                .is_some_and(|node| matches!(node.kind, Kind::Object(_)))
+        };
+        if !graph
+            .engine
+            .links
+            .iter()
+            .any(|link| is_object(link.to.node))
+        {
+            return;
+        }
+        let sections = self.graph_all_sections(i);
+        let graph = &mut self.tabs[i].graph;
+        let ids: Vec<NodeId> = graph.engine.nodes.iter().map(|node| node.id).collect();
+        for (index, id) in ids.into_iter().enumerate() {
+            let driven = graph.driven_fields(id, &sections[index]);
+            let Some(node) = graph.engine.node_mut(id) else {
+                continue;
+            };
+            if !matches!(node.kind, Kind::Object(_)) {
+                continue;
+            }
+            for field in driven.iter().filter(|field| components(field).is_none()) {
+                settle_coordinates(&mut node.params, field);
+            }
+            node.params.retain(|field, _| !driven.contains(field));
+        }
+    }
+
+    pub(super) fn graph_run(&mut self, i: usize) -> Task<Message> {
         self.graph_step(i, |_| Vec::new())
     }
 
@@ -173,11 +651,7 @@ impl OpenCADStudio {
                     // The node library docks on the right on first use; after
                     // that it stays wherever the user moved it.
                     let id = crate::ui::dock::PanelId::NodeGraph;
-                    if self.dock.location(id).is_none() {
-                        self.dock
-                            .dock(id, crate::app::config::DockSide::Right, usize::MAX);
-                    }
-                    self.dock_expanded = Some(id);
+                    self.dock_open_at_default(id);
                     return self.graph_run(i);
                 }
             }
@@ -198,7 +672,7 @@ impl OpenCADStudio {
                     }
                     Some(Drag::Link(from)) => {
                         if let Some(to) = self.tabs[i].graph.hit_input(&sections) {
-                            self.tabs[i].graph.engine.connect(from, to);
+                            self.graph_connect(i, from, to);
                         }
                         // A link dropped on nothing was detached from an input.
                         return self.graph_run(i);
@@ -208,9 +682,19 @@ impl OpenCADStudio {
             }
             GraphMsg::NodeDelete(id) => {
                 let graph = &mut self.tabs[i].graph;
+                // Only the entities a node made go with it.
+                let owns = graph.engine.node(id).is_some_and(|node| match &node.kind {
+                    Kind::Object(name) => ObjectKind::from_name(name).is_some_and(ObjectKind::owns),
+                    Kind::Op(_) => false,
+                });
                 graph.engine.remove(id);
                 graph.drafts.retain(|port, _| port.node != id);
-                let handles = graph.ui.remove(&id).map(|ui| ui.handles).unwrap_or_default();
+                let handles = graph
+                    .ui
+                    .remove(&id)
+                    .filter(|_| owns)
+                    .map(|ui| ui.handles)
+                    .unwrap_or_default();
                 return self.graph_step(i, |app| {
                     let live: Vec<Handle> = handles
                         .into_iter()
@@ -224,29 +708,71 @@ impl OpenCADStudio {
                     Vec::new()
                 });
             }
-            GraphMsg::Commit(port) => {
-                let Some(raw) = self.tabs[i].graph.drafts.remove(&port) else {
-                    return Task::none();
-                };
-                // Typed text is protocol JSON when it parses (numbers, true,
-                // {"rgb":[..]}), otherwise a plain string.
-                let value = serde_json::from_str(raw.trim()).unwrap_or(Value::String(raw));
-                return self.graph_set(i, port, value);
+            GraphMsg::Commit(port) => return self.graph_commit(i, vec![port]),
+            GraphMsg::Discard(port) => {
+                self.tabs[i].graph.drafts.remove(&port);
+            }
+            GraphMsg::Leave(focused) => {
+                let ports = self.tabs[i]
+                    .graph
+                    .drafts
+                    .keys()
+                    .filter(|port| Some(*port) != focused.as_ref())
+                    .cloned()
+                    .collect();
+                return self.graph_commit(i, ports);
             }
             GraphMsg::Set(port, value) => return self.graph_set(i, port, value),
+            GraphMsg::Links(links) => {
+                self.node_graph_links = links;
+                let graph = &mut self.tabs[i].graph;
+                graph.hovered_label = None;
+                graph.picker = None;
+                self.persist_settings_if_changed();
+            }
+            // With labels, pressing an unlinked input's port picks its
+            // source; a linked one is still dragged off to re-route it.
+            GraphMsg::InPress(port)
+                if self.node_graph_links.labels()
+                    && !matches!(self.tabs[i].graph.drag, Some(Drag::Link(_))) =>
+            {
+                return self.on_graph(GraphMsg::Pick(port));
+            }
+            GraphMsg::Pick(_) => {
+                if self.tabs[i].graph.picker.is_some() {
+                    return iced::widget::operation::focus(
+                        crate::ui::node_graph::picker_search_id(),
+                    );
+                }
+            }
+            GraphMsg::PickSource(from, to) => {
+                // Choosing the current source changes nothing; a source the
+                // input's node reaches would close a loop.
+                let engine = &self.tabs[i].graph.engine;
+                let current = engine
+                    .links
+                    .iter()
+                    .any(|link| link.to == to && link.from == from);
+                if current || engine.reaches(to.node, from.node) {
+                    return Task::none();
+                }
+                return self.graph_step(i, |app| {
+                    app.graph_connect(i, from, to);
+                    Vec::new()
+                });
+            }
+            GraphMsg::PickClear(to) => {
+                if self.tabs[i].graph.engine.is_linked(&to) {
+                    return self.graph_step(i, |app| {
+                        app.tabs[i].graph.engine.disconnect(&to);
+                        Vec::new()
+                    });
+                }
+            }
+            // The last evaluation's edits stay in the drawing as they are.
             GraphMsg::New => self.tabs[i].graph = Default::default(),
             GraphMsg::Save => {
-                // The file names the drawing by its fingerprint so reopening it
-                // elsewhere cannot take over unrelated entities; a drawing that
-                // never had one gets it now and saves it with its next save.
-                let tab = &mut self.tabs[i];
-                let header = &mut tab.scene.document.header;
-                if header.fingerprint_guid.is_empty() {
-                    header.fingerprint_guid =
-                        format!("{{{}}}", crate::app::control::new_guid_v4().to_uppercase());
-                    tab.dirty = true;
-                }
-                let bytes = tab.graph.to_file(&tab.scene.document.header.fingerprint_guid);
+                let bytes = self.graph_file_bytes(i);
                 return Task::perform(
                     async move {
                         let handle = crate::sys::file_dialog()
@@ -255,8 +781,16 @@ impl OpenCADStudio {
                             .set_file_name("graph.ocg")
                             .save_file()
                             .await?;
-                        let name = crate::sys::handle_path(&handle).to_string_lossy().into_owned();
-                        Some(handle.write(&bytes).await.map(|()| name).map_err(|e| e.to_string()))
+                        let name = crate::sys::handle_path(&handle)
+                            .to_string_lossy()
+                            .into_owned();
+                        Some(
+                            handle
+                                .write(&bytes)
+                                .await
+                                .map(|()| name)
+                                .map_err(|e| e.to_string()),
+                        )
                     },
                     |result| Message::Graph(GraphMsg::Saved(result)),
                 );
@@ -280,60 +814,174 @@ impl OpenCADStudio {
                     |bytes| Message::Graph(GraphMsg::Loaded(bytes)),
                 );
             }
-            GraphMsg::Loaded(Some(bytes)) => {
-                let (mut graph, drawing) = match crate::ui::node_graph::Graph::from_file(&bytes) {
-                    Ok(loaded) => loaded,
+            GraphMsg::Loaded(Some(bytes)) => return self.graph_parse_with(i, bytes, parse_graph),
+            GraphMsg::Parsed(tab_id, generation, parsed) => {
+                let graph = match parsed {
+                    Ok(graph) => graph.take(),
                     Err(error) => {
                         self.command_line.push_error(&error);
                         return Task::none();
                     }
                 };
-                // Entities are reused only in the drawing the graph was saved
-                // against, and only while they are still the node's kind;
-                // otherwise evaluation creates fresh ones.
-                let document = &self.tabs[i].scene.document;
-                let same_drawing =
-                    !drawing.is_empty() && drawing == document.header.fingerprint_guid;
-                for node in &graph.engine.nodes {
-                    let kind = match &node.kind {
-                        Kind::Object(name) => ObjectKind::from_name(name),
-                        Kind::Op(_) => None,
-                    };
-                    if let Some(ui) = graph.ui.get_mut(&node.id) {
-                        ui.handles.retain(|handle| {
-                            same_drawing
-                                && kind.zip(document.get_entity(*handle)).is_some_and(
-                                    |(kind, entity)| kind.matches(entity),
-                                )
-                        });
-                    }
-                }
-                self.tabs[i].graph = graph;
-                return self.graph_run(i);
+                // The graph goes into the drawing it was opened in, while
+                // that drawing is open and not replaced.
+                let (Some(i), Some((graph, drawing))) =
+                    (self.import_target(tab_id, generation), graph)
+                else {
+                    return Task::none();
+                };
+                return self.graph_loaded(i, graph, drawing);
             }
             _ => {}
         }
         Task::none()
     }
 
-    /// An edited input: an operation keeps it as a parameter; an object node
-    /// writes it to every entity it owns.
-    fn graph_set(&mut self, i: usize, port: Port, value: Value) -> Task<Message> {
+    /// Parse an Open's `.ocg` bytes on a worker (`parser`; a test can give
+    /// one that panics); the graph loads into drawing `i` when the parse
+    /// ends ([`GraphMsg::Parsed`]).
+    pub(in crate::app) fn graph_parse_with(
+        &mut self,
+        i: usize,
+        bytes: Vec<u8>,
+        parser: GraphParser,
+    ) -> Task<Message> {
+        let (tab_id, generation) = (self.tabs[i].id, self.tabs[i].document_generation);
+        crate::app::update::background_task(
+            crate::t!("Open Node Graph"),
+            move || parser(&bytes),
+            move |parsed| Message::Graph(GraphMsg::Parsed(tab_id, generation, parsed)),
+        )
+    }
+
+    /// Load a graph read from a file into drawing `i`, and evaluate it.
+    pub(in crate::app) fn graph_loaded(
+        &mut self,
+        i: usize,
+        mut graph: crate::ui::node_graph::Graph,
+        drawing: String,
+    ) -> Task<Message> {
+        // Entities are reused only in the drawing the graph was saved
+        // against, and only while they are still the node's kind;
+        // otherwise evaluation creates fresh ones. The same holds for
+        // the last evaluation's edits, which the next one takes back.
+        let document = &self.tabs[i].scene.document;
+        let same_drawing = !drawing.is_empty() && drawing == document.header.fingerprint_guid;
+        for node in &graph.engine.nodes {
+            let kind = match &node.kind {
+                Kind::Object(name) => ObjectKind::from_name(name).filter(|kind| kind.owns()),
+                Kind::Op(_) => None,
+            };
+            if let Some(ui) = graph.ui.get_mut(&node.id) {
+                ui.handles.retain(|handle| {
+                    same_drawing
+                        && kind
+                            .zip(document.get_entity(*handle))
+                            .is_some_and(|(kind, entity)| kind.matches(entity))
+                });
+            }
+        }
+        if !same_drawing {
+            graph.applied.clear();
+            graph.created.clear();
+        }
+        // Evaluating unwinds what the open graph did first.
+        let (applied, created, records) = {
+            let open = &mut self.tabs[i].graph;
+            (
+                std::mem::take(&mut open.applied),
+                std::mem::take(&mut open.created),
+                std::mem::take(&mut open.applied_records),
+            )
+        };
+        graph.applied_records.splice(0..0, records);
+        graph.applied.splice(0..0, applied);
+        graph.created.extend(created);
+        self.tabs[i].graph = graph;
+        self.graph_run(i)
+    }
+
+    /// Links `from` into `to`; false when that would close a loop. The link
+    /// replaces what was typed into an object's row or group; an operation
+    /// keeps its value for when the link goes again.
+    pub(super) fn graph_connect(&mut self, i: usize, from: Port, to: Port) -> bool {
+        let engine = &mut self.tabs[i].graph.engine;
+        if !engine.connect(from, to.clone()) {
+            return false;
+        }
+        if let Some(node) = engine.node_mut(to.node) {
+            if matches!(node.kind, Kind::Object(_)) {
+                node.params.retain(|field, _| {
+                    *field != to.field && !to.field.split('|').any(|member| member == field)
+                });
+            }
+        }
+        true
+    }
+
+    /// The `.ocg` file of tab `i`'s graph. The file names the drawing by its
+    /// fingerprint so reopening it elsewhere cannot take over unrelated
+    /// entities; a drawing that never had one gets it now and saves it with
+    /// its next save.
+    pub(super) fn graph_file_bytes(&mut self, i: usize) -> Vec<u8> {
+        let tab = &mut self.tabs[i];
+        let header = &mut tab.scene.document.header;
+        if header.fingerprint_guid.is_empty() {
+            header.fingerprint_guid =
+                format!("{{{}}}", crate::app::control::new_guid_v4().to_uppercase());
+            tab.dirty = true;
+        }
+        tab.graph
+            .to_file(&tab.scene.document.header.fingerprint_guid)
+    }
+
+    /// Turns the drafts of `ports` into the values of their inputs, then runs
+    /// the graph once. A draft that is invalid or changes nothing is dropped,
+    /// so the field shows its value again and no undo step is made.
+    fn graph_commit(&mut self, i: usize, ports: Vec<Port>) -> Task<Message> {
+        let sections = self.graph_all_sections(i);
         let graph = &mut self.tabs[i].graph;
-        let Some(node) = graph.engine.node_mut(port.node) else {
+        let mut changed = false;
+        for port in ports {
+            let Some(raw) = graph.drafts.remove(&port) else {
+                continue;
+            };
+            let row = graph
+                .engine
+                .nodes
+                .iter()
+                .position(|node| node.id == port.node)
+                .into_iter()
+                .flat_map(|index| sections[index].iter())
+                .flat_map(|section| section.rows.iter())
+                .find(|row| row.input && row.field == port.field);
+            let value = row.and_then(|row| {
+                typed_value(row, &raw).filter(|value| !unchanged(row, &raw, value))
+            });
+            let Some(value) = value else {
+                continue;
+            };
+            if let Some(node) = graph.engine.node_mut(port.node) {
+                set_param(&mut node.params, port.field, value);
+                changed = true;
+            }
+        }
+        if changed {
+            self.graph_run(i)
+        } else {
+            Task::none()
+        }
+    }
+
+    /// An edited input, kept as the node's parameter: an operation reads it
+    /// while nothing is linked, an object node writes it to every entity it
+    /// stands for on each evaluation.
+    fn graph_set(&mut self, i: usize, port: Port, value: Value) -> Task<Message> {
+        let Some(node) = self.tabs[i].graph.engine.node_mut(port.node) else {
             return Task::none();
         };
-        if let Kind::Op(_) = node.kind {
-            node.params.insert(port.field, value);
-            return self.graph_run(i);
-        }
-        let handles = graph.ui.get(&port.node).map(|ui| ui.handles.clone()).unwrap_or_default();
-        self.graph_step(i, |app| {
-            handles
-                .into_iter()
-                .map(|handle| app.graph_write(i, handle, &port.field, &value))
-                .collect()
-        })
+        set_param(&mut node.params, port.field, value);
+        self.graph_run(i)
     }
 }
 
@@ -355,63 +1003,85 @@ impl graph::Host for AppHost<'_> {
         let Some(kind) = ObjectKind::from_name(kind) else {
             return Vec::new();
         };
-        let mut handles: Vec<Handle> = app.tabs[i]
-            .graph
-            .ui
-            .get(&node)
-            .map(|ui| ui.handles.clone())
-            .unwrap_or_default();
-        handles.retain(|handle| app.tabs[i].scene.document.get_entity(*handle).is_some());
-        // New entities copy the node's first one, so edits made by hand to
-        // unlinked rows carry over to every element.
-        while handles.len() < instances.len() {
-            let mut entity = handles
-                .first()
-                .and_then(|handle| app.tabs[i].scene.document.get_entity(*handle))
-                .cloned()
-                .unwrap_or_else(|| kind.entity());
-            entity.common_mut().handle = Handle::NULL;
-            let Some(handle) = app.commit_entity_handle(entity) else {
-                break;
-            };
-            handles.push(handle);
-            app.tabs[i].dirty = true;
-        }
-        if handles.len() > instances.len() {
-            let extra = handles.split_off(instances.len());
-            app.tabs[i].scene.erase_entities(&extra);
-            app.tabs[i].dirty = true;
-        }
+        let targets: Vec<Option<Handle>> = if kind.owns() {
+            let mut handles: Vec<Handle> = app.tabs[i]
+                .graph
+                .ui
+                .get(&node)
+                .map(|ui| ui.handles.clone())
+                .unwrap_or_default();
+            handles.retain(|handle| app.tabs[i].scene.document.get_entity(*handle).is_some());
+            // New entities copy the node's first one, so edits made by hand
+            // to unlinked rows carry over to every element.
+            while handles.len() < instances.len() {
+                let Some(mut entity) = handles
+                    .first()
+                    .and_then(|handle| app.tabs[i].scene.document.get_entity(*handle))
+                    .cloned()
+                    .or_else(|| kind.entity(&app.tabs[i].scene.document))
+                else {
+                    break;
+                };
+                entity.common_mut().handle = Handle::NULL;
+                let Some(handle) = app.commit_entity_handle(entity) else {
+                    break;
+                };
+                handles.push(handle);
+                app.tabs[i].dirty = true;
+            }
+            if handles.len() > instances.len() {
+                let extra = handles.split_off(instances.len());
+                app.tabs[i].scene.erase_entities(&extra);
+                app.tabs[i].dirty = true;
+            }
+            handles.into_iter().map(Some).collect()
+        } else {
+            // `Object` stands for whatever each instance links in.
+            instances
+                .iter()
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .find(|(field, _)| field == "object")
+                        .and_then(|(_, value)| ops::handle(value))
+                        .filter(|handle| app.tabs[i].scene.document.get_entity(*handle).is_some())
+                })
+                .collect()
+        };
         if let Some(ui) = app.tabs[i].graph.ui.get_mut(&node) {
-            ui.handles = handles.clone();
+            ui.handles = targets.iter().flatten().copied().collect();
         }
-        for (handle, fields) in handles.iter().zip(instances) {
-            for (field, value) in fields {
+        for (handle, fields) in targets.iter().zip(instances) {
+            let Some(handle) = *handle else {
+                continue;
+            };
+            for (field, value) in fields.iter().filter(|(field, _)| field != "object") {
                 let current = app
-                    .graph_fields(i, *handle)
+                    .graph_fields(i, handle)
                     .into_iter()
                     .find(|(name, _)| name == field)
                     .map(|(_, value)| value);
                 if current.as_ref() != Some(value) {
-                    let task = app.graph_write(i, *handle, field, value);
+                    let task = app.graph_write(i, handle, field, value);
                     self.tasks.push(task);
                 }
             }
         }
-        handles
+        targets
             .iter()
-            .map(|handle| {
-                let mut fields = app.graph_fields(i, *handle);
-                fields.push(("object".to_owned(), json!({ "handle": handle.value() })));
-                fields
+            .map(|handle| match handle {
+                Some(handle) => {
+                    let mut fields = app.graph_fields(i, *handle);
+                    fields.push(("object".to_owned(), ops::object(*handle)));
+                    fields
+                }
+                None => Vec::new(),
             })
             .collect()
     }
 
-    fn curve(&self, object: &Value) -> Option<kernel::space::PlanarCurve> {
-        let handle = Handle::new(object.get("handle")?.as_u64()?);
-        let entity = self.app.tabs[self.i].scene.document.get_entity(handle)?;
-        crate::entities::curve::entity_curve(entity)
+    fn call(&mut self, node: NodeId, spec: &'static graph::Spec, args: &[Value]) -> Vec<Value> {
+        self.op(node, spec, args)
     }
 
     fn expression(&self, text: &str) -> Option<f64> {

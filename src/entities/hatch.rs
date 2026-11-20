@@ -1,50 +1,25 @@
-use codec::entities::{BoundaryEdge, Hatch};
-use kernel::geom2d::{
+use crate::t;
+use document::entities::{BoundaryEdge, Hatch};
+use glam::Vec3;
+use ocs_geom::geom2d::{
     Arc as KernelArc, Curve as KernelCurve, Ellipse as KernelEllipse,
     EllipseArc as KernelEllipseArc, Line as KernelLine, NurbsCurve as KernelNurbs,
     Parameterization, Polyline as KernelPolyline, PolylineVertex as KernelVertex,
 };
-use glam::Vec3;
-use crate::t;
 
-use crate::command::EntityTransform;
-use crate::entities::common::{center_grip, circle_grip, edit_angle_prop as edit_angle, edit_prop as edit, parse_f64, ro_prop as ro};
+use crate::entities::common::{
+    center_grip, circle_grip, edit_angle_prop as edit_angle, edit_prop as edit, parse_f64,
+    ro_prop as ro,
+};
 use crate::entities::traits::{FallbackTess, Grippable, PropertyEditable, Transformable};
-use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::tess_util::FallbackGeometry;
+use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::model::wire_model::SnapHint;
 
 /// The area enclosed by the hatch boundary paths.
 pub(crate) fn boundary_area(h: &Hatch) -> f64 {
-    let mut path_areas = Vec::new();
-    let mut rings = Vec::new();
-    for path in &h.paths {
-        let mut path_area = 0.0;
-        let directions = crate::scene::hatch_path_directions(path);
-        let curves = path.edges.iter().filter_map(edge_curve);
-        for (curve, direction) in curves.zip(directions) {
-            path_area += direction * curve.enclosed_area();
-        }
-        path_areas.push(path_area.abs());
-        rings.push(crate::scene::hatch_path_ring(path).unwrap_or_default());
-    }
-    let depths = kernel::geom2d::ring_nesting_depths(&rings);
-    path_areas
-        .into_iter()
-        .zip(depths)
-        .filter_map(|(area, depth)| match h.style {
-            codec::entities::HatchStyleType::Normal => {
-                Some(if depth % 2 == 0 { area } else { -area })
-            }
-            codec::entities::HatchStyleType::Outer if depth <= 1 => {
-                Some(if depth == 0 { area } else { -area })
-            }
-            codec::entities::HatchStyleType::Outer => None,
-            codec::entities::HatchStyleType::Ignore if depth == 0 => Some(area),
-            codec::entities::HatchStyleType::Ignore => None,
-        })
-        .sum::<f64>()
-        .abs()
+    h.area().unwrap_or(0.0)
 }
 
 /// A hatch boundary edge as a kernel curve in the hatch OCS.
@@ -122,18 +97,14 @@ pub(crate) fn edge_curve(edge: &BoundaryEdge) -> Option<KernelCurve> {
             let weights = s
                 .rational
                 .then(|| s.control_points.iter().map(|p| p.z).collect::<Vec<f64>>());
-            let curve = KernelNurbs::new(
-                s.degree.max(1) as usize,
-                control,
-                s.knots.clone(),
-                weights,
-            )
-            .or_else(|| {
-                // A fit-point boundary spline, interpolated the same way a
-                // SPLINE entity's is.
-                let fit: Vec<[f64; 2]> = s.fit_points.iter().map(|p| [p.x, p.y]).collect();
-                KernelNurbs::interpolate(&fit, None, None, Parameterization::Chord)
-            })?;
+            let curve =
+                KernelNurbs::new(s.degree.max(1) as usize, control, s.knots.clone(), weights)
+                    .or_else(|| {
+                        // A fit-point boundary spline, interpolated the same way a
+                        // SPLINE entity's is.
+                        let fit: Vec<[f64; 2]> = s.fit_points.iter().map(|p| [p.x, p.y]).collect();
+                        KernelNurbs::interpolate(&fit, None, None, Parameterization::Chord)
+                    })?;
             KernelCurve::Nurbs(curve)
         }
     })
@@ -185,10 +156,7 @@ fn boundary_centroid(h: &Hatch) -> Option<(f64, f64)> {
 /// Scale a catalog pattern about its intrinsic coordinate origin.
 /// Pattern lines loaded from DXF/DWG are rendered prebaked, so their metadata
 /// scale is not applied again by the renderer.
-pub(crate) fn scale_pattern_geometry(
-    pattern: &mut codec::entities::HatchPattern,
-    factor: f64,
-) {
+pub(crate) fn scale_pattern_geometry(pattern: &mut document::entities::HatchPattern, factor: f64) {
     let (origin_x, origin_y) = (0.0, 0.0);
     for line in pattern.lines.iter_mut() {
         line.base_point.x = origin_x + (line.base_point.x - origin_x) * factor;
@@ -203,18 +171,12 @@ pub(crate) fn scale_pattern_geometry(
 
 /// Rotate a catalog pattern about its intrinsic coordinate origin.
 /// This keeps the line angle, base point and world-space offset in sync.
-pub(crate) fn rotate_pattern_geometry(
-    pattern: &mut codec::entities::HatchPattern,
-    angle: f64,
-) {
+pub(crate) fn rotate_pattern_geometry(pattern: &mut document::entities::HatchPattern, angle: f64) {
     let (sin, cos) = angle.sin_cos();
     let (origin_x, origin_y) = (0.0, 0.0);
     for line in pattern.lines.iter_mut() {
         line.angle += angle;
-        let (x, y) = (
-            line.base_point.x - origin_x,
-            line.base_point.y - origin_y,
-        );
+        let (x, y) = (line.base_point.x - origin_x, line.base_point.y - origin_y);
         line.base_point.x = origin_x + x * cos - y * sin;
         line.base_point.y = origin_y + x * sin + y * cos;
         let (x, y) = (line.offset.x, line.offset.y);
@@ -225,7 +187,7 @@ pub(crate) fn rotate_pattern_geometry(
 
 /// Move every stored line by the same amount, preserving the pattern phase.
 pub(crate) fn translate_pattern_geometry(
-    pattern: &mut codec::entities::HatchPattern,
+    pattern: &mut document::entities::HatchPattern,
     dx: f64,
     dy: f64,
 ) {
@@ -238,34 +200,34 @@ pub(crate) fn translate_pattern_geometry(
 /// Read the hatch background colour from its `HATCHBACKGROUNDCOLOR` extended
 /// data (group 1071, packed true colour: high byte = colour method, low three =
 /// RGB). `None` when unset or not a true-colour value.
-pub fn background_color(h: &Hatch) -> Option<codec::types::Color> {
+pub fn background_color(h: &Hatch) -> Option<document::types::Color> {
     let rec = h.common.extended_data.get_record("HATCHBACKGROUNDCOLOR")?;
     let raw = rec.values.iter().find_map(|v| match v {
-        codec::xdata::XDataValue::Integer32(n) => Some(*n as u32),
+        document::xdata::XDataValue::Integer32(n) => Some(*n as u32),
         _ => None,
     })?;
     match (raw >> 24) & 0xFF {
         // Colour-method byte: C0 = ByLayer, C1 = ByBlock, C2 = true colour,
         // C3 = ACI index.
-        0xC0 => Some(codec::types::Color::ByLayer),
-        0xC1 => Some(codec::types::Color::ByBlock),
-        0xC2 => Some(codec::types::Color::Rgb {
+        0xC0 => Some(document::types::Color::ByLayer),
+        0xC1 => Some(document::types::Color::ByBlock),
+        0xC2 => Some(document::types::Color::Rgb {
             r: ((raw >> 16) & 0xFF) as u8,
             g: ((raw >> 8) & 0xFF) as u8,
             b: (raw & 0xFF) as u8,
         }),
-        0xC3 => Some(codec::types::Color::Index((raw & 0xFF) as u8)),
+        0xC3 => Some(document::types::Color::Index((raw & 0xFF) as u8)),
         _ => None,
     }
 }
 
 /// Pack an RGB colour into a `HATCHBACKGROUNDCOLOR` group-1071 true-colour word.
-pub fn pack_background_color(c: &codec::types::Color) -> i32 {
-    use codec::types::Color;
+pub fn pack_background_color(c: &document::types::Color) -> i32 {
+    use document::types::Color;
     (match c {
         Color::ByLayer => 0xC0000000u32,
         Color::ByBlock => 0xC1000000u32,
-        Color::Index(i) => 0xC3000000u32 | (*i as u8 as u32),
+        Color::Index(i) => 0xC3000000u32 | (*i as u32),
         _ => {
             let (r, g, b) = c.rgb().unwrap_or((255, 255, 255));
             0xC2000000u32 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
@@ -275,8 +237,8 @@ pub fn pack_background_color(c: &codec::types::Color) -> i32 {
 
 /// Replace (or insert) the hatch's `HATCHBACKGROUNDCOLOR` extended-data record,
 /// preserving every other application's records.
-pub fn set_background_color(h: &mut Hatch, c: &codec::types::Color) {
-    use codec::xdata::{ExtendedDataRecord, XDataValue};
+pub fn set_background_color(h: &mut Hatch, c: &document::types::Color) {
+    use document::xdata::{ExtendedDataRecord, XDataValue};
     const APP: &str = "HATCHBACKGROUNDCOLOR";
     let kept: Vec<ExtendedDataRecord> = h
         .common
@@ -298,7 +260,7 @@ pub fn set_background_color(h: &mut Hatch, c: &codec::types::Color) {
 /// Remove the hatch's `HATCHBACKGROUNDCOLOR` extended-data record (background
 /// off), preserving every other application's records.
 pub fn clear_background_color(h: &mut Hatch) {
-    use codec::xdata::ExtendedDataRecord;
+    use document::xdata::ExtendedDataRecord;
     const APP: &str = "HATCHBACKGROUNDCOLOR";
     let kept: Vec<ExtendedDataRecord> = h
         .common
@@ -315,11 +277,7 @@ pub fn clear_background_color(h: &mut Hatch) {
 }
 
 fn associative_property(h: &Hatch) -> Property {
-    if h
-        .paths
-        .iter()
-        .any(|path| !path.boundary_handles.is_empty())
-    {
+    if h.paths.iter().any(|path| !path.boundary_handles.is_empty()) {
         Property {
             label: t!("Associative").into_owned(),
             field: "associative",
@@ -343,30 +301,35 @@ fn associative_property(h: &Hatch) -> Property {
 
 fn properties(h: &Hatch) -> Vec<PropSection> {
     let pattern_type = match h.pattern_type {
-        codec::entities::HatchPatternType::Predefined => "Predefined",
-        codec::entities::HatchPatternType::UserDefined => "User Defined",
-        codec::entities::HatchPatternType::Custom => "Custom",
+        document::entities::HatchPatternType::Predefined => "Predefined",
+        document::entities::HatchPatternType::UserDefined => "User Defined",
+        document::entities::HatchPatternType::Custom => "Custom",
     };
     let style = match h.style {
-        codec::entities::HatchStyleType::Normal => "Normal",
-        codec::entities::HatchStyleType::Outer => "Outer",
-        codec::entities::HatchStyleType::Ignore => "Ignore",
+        document::entities::HatchStyleType::Normal => "Normal",
+        document::entities::HatchStyleType::Outer => "Outer",
+        document::entities::HatchStyleType::Ignore => "Ignore",
     };
     let area = boundary_area(h);
     let g = &h.gradient_color;
-    let default_col = codec::types::Color::Index(7);
+    let default_col = document::types::Color::Index(7);
     let grad_c1 = g.colors.first().map(|e| e.color).unwrap_or(default_col);
     let grad_c2 = g.colors.get(1).map(|e| e.color).unwrap_or(default_col);
-    let bg_on = background_color(h).is_some();
-    let bg_col = background_color(h).unwrap_or(default_col);
 
     if g.enabled {
         // ── Gradient fill ──────────────────────────────────────────────────
-        let grad_type = if g.is_single_color { "One color" } else { "Two color" };
-        let (kind, inverted) =
-            crate::scene::model::hatch_model::GradientKind::from_name(&g.name);
+        let grad_type = if g.is_single_color {
+            "One color"
+        } else {
+            "Two color"
+        };
+        let (kind, inverted) = crate::scene::model::hatch_model::GradientKind::from_name(&g.name);
         let mut pattern_props = vec![
-            ro(t!("Type").as_ref(), "fill_kind", t!("Gradient").into_owned()),
+            ro(
+                t!("Type").as_ref(),
+                "fill_kind",
+                t!("Gradient").into_owned(),
+            ),
             Property {
                 label: t!("Color mode").into_owned(),
                 field: "fill_type",
@@ -428,8 +391,16 @@ fn properties(h: &Hatch) -> Vec<PropSection> {
                 title: t!("Geometry").into_owned(),
                 props: vec![
                     edit(t!("Elevation").as_ref(), "elevation", h.elevation),
-                    ro(t!("Area").as_ref(), "area", crate::entities::common::format_area(area)),
-                    ro(t!("Cumulative area").as_ref(), "cumulative_area", crate::entities::common::format_area(area)),
+                    ro(
+                        t!("Area").as_ref(),
+                        "area",
+                        crate::entities::common::format_area(area),
+                    ),
+                    ro(
+                        t!("Cumulative area").as_ref(),
+                        "cumulative_area",
+                        crate::entities::common::format_area(area),
+                    ),
                 ],
             },
             PropSection {
@@ -450,33 +421,37 @@ fn properties(h: &Hatch) -> Vec<PropSection> {
         ];
     }
 
-
     // ── Hatch (pattern / solid) ────────────────────────────────────────────
     // Show only controls used by the selected fill type.
-    let type_row = if h.is_solid {
-        ro(t!("Type").as_ref(), "fill_kind", t!("Solid").into_owned())
+    // A solid fill is the predefined _SOLID pattern and lists its rows as a
+    // pattern does (measured): angle, scale and origin live, spacing, ISO
+    // pen width and double greyed.
+    let type_row = Property {
+        label: t!("Type").into_owned(),
+        field: "pattern_type_label",
+        value: PropValue::Choice {
+            selected: pattern_type.to_string(),
+            options: vec!["Predefined".into(), "User Defined".into(), "Custom".into()],
+        },
+    };
+    // A user-defined pattern's name is fixed (measured: greyed `_U`).
+    let user_defined = matches!(h.pattern_type, document::entities::HatchPatternType::UserDefined);
+    let pattern_name_row = if user_defined {
+        ro(t!("Pattern name").as_ref(), "pattern_name", h.pattern.name.clone())
     } else {
         Property {
-            label: t!("Type").into_owned(),
-            field: "pattern_type_label",
-            value: PropValue::Choice {
-                selected: pattern_type.to_string(),
-                options: vec!["Predefined".into(), "User Defined".into(), "Custom".into()],
-            },
+            label: t!("Pattern name").into_owned(),
+            field: "pattern_name",
+            value: PropValue::HatchPatternChoice(h.pattern.name.clone()),
         }
-    };
-    let pattern_name_row = Property {
-        label: t!("Pattern name").into_owned(),
-        field: "pattern_name",
-        value: PropValue::HatchPatternChoice(h.pattern.name.clone()),
     };
     let associative_row = associative_property(h);
     let double_row = Property {
         label: t!("Double").into_owned(),
         field: "double",
-        value: PropValue::BoolToggle {
-            field: "double",
-            value: h.is_double,
+        value: PropValue::Choice {
+            selected: if h.is_double { t!("Yes") } else { t!("No") }.into_owned(),
+            options: vec![t!("Yes").into_owned(), t!("No").into_owned()],
         },
     };
     let island_row = Property {
@@ -491,7 +466,31 @@ fn properties(h: &Hatch) -> Vec<PropSection> {
 
     let mut pattern_props = vec![type_row, pattern_name_row];
     pattern_props.push(ro(t!("Annotative").as_ref(), "annotative", String::new()));
-    if !h.is_solid {
+    if h.is_solid {
+        pattern_props.push(edit_angle(
+            t!("Angle").as_ref(),
+            "pattern_angle",
+            h.pattern_angle.to_degrees(),
+        ));
+        pattern_props.push(edit(t!("Scale").as_ref(), "pattern_scale", h.pattern_scale));
+        pattern_props.push(edit(t!("Origin X").as_ref(), "origin_x", 0.0));
+        pattern_props.push(edit(t!("Origin Y").as_ref(), "origin_y", 0.0));
+        pattern_props.push(ro(
+            t!("Spacing").as_ref(),
+            "spacing",
+            crate::entities::common::format_length(h.pattern_scale),
+        ));
+        pattern_props.push(ro(
+            t!("ISO pen width").as_ref(),
+            "iso_pen_width",
+            format!("{:.2} mm", h.pattern_scale),
+        ));
+        pattern_props.push(ro(
+            t!("Double").as_ref(),
+            "double",
+            if h.is_double { t!("Yes") } else { t!("No") }.into_owned(),
+        ));
+    } else {
         pattern_props.push(edit_angle(
             t!("Angle").as_ref(),
             "pattern_angle",
@@ -499,36 +498,65 @@ fn properties(h: &Hatch) -> Vec<PropSection> {
         ));
         if matches!(
             h.pattern_type,
-            codec::entities::HatchPatternType::UserDefined
+            document::entities::HatchPatternType::UserDefined
         ) {
+            // Measured order: the scale (the spacing, greyed) and origin
+            // sit between angle and spacing.
+            pattern_props.push(ro(
+                t!("Scale").as_ref(),
+                "pattern_scale",
+                crate::entities::common::format_decimal(h.pattern_scale),
+            ));
+            pattern_props.push(edit(t!("Origin X").as_ref(), "origin_x", 0.0));
+            pattern_props.push(edit(t!("Origin Y").as_ref(), "origin_y", 0.0));
             pattern_props.push(spacing_row);
             pattern_props.push(double_row);
         } else {
+            // A predefined or custom pattern lists spacing, pen width and
+            // double greyed after its origin (measured); an ISO pattern's
+            // pen width stays editable.
             pattern_props.push(edit(t!("Scale").as_ref(), "pattern_scale", h.pattern_scale));
             // Origin edits are relative offsets.
             pattern_props.push(edit(t!("Origin X").as_ref(), "origin_x", 0.0));
             pattern_props.push(edit(t!("Origin Y").as_ref(), "origin_y", 0.0));
+            pattern_props.push(ro(
+                t!("Spacing").as_ref(),
+                "spacing",
+                crate::entities::common::format_length(h.pattern_scale),
+            ));
             if h.pattern.name.to_ascii_uppercase().starts_with("ISO") {
                 pattern_props.push(edit(
                     t!("ISO pen width").as_ref(),
                     "iso_pen_width",
                     h.pattern_scale,
                 ));
+            } else {
+                pattern_props.push(ro(
+                    t!("ISO pen width").as_ref(),
+                    "iso_pen_width",
+                    format!("{:.2} mm", h.pattern_scale),
+                ));
             }
+            pattern_props.push(ro(
+                t!("Double").as_ref(),
+                "double",
+                if h.is_double { t!("Yes") } else { t!("No") }.into_owned(),
+            ));
         }
     }
     pattern_props.push(associative_row);
     pattern_props.push(island_row);
-    pattern_props.push(Property {
-        label: t!("Background").into_owned(),
-        field: "bg_enabled",
-        value: PropValue::BoolToggle {
-            field: "bg_enabled",
-            value: bg_on,
-        },
-    });
+    // A solid fill has no background colour row; a pattern lists its
+    // background colour, None while it has none.
+    if !h.is_solid {
+        pattern_props.push(Property {
+            label: t!("Background color").into_owned(),
+            field: "background_color",
+            value: PropValue::ColorChoice(background_color(h).unwrap_or(document::types::Color::None)),
+        });
+    }
 
-    let mut sections = vec![
+    let sections = vec![
         PropSection {
             title: t!("Pattern").into_owned(),
             props: pattern_props,
@@ -537,25 +565,24 @@ fn properties(h: &Hatch) -> Vec<PropSection> {
             title: t!("Geometry").into_owned(),
             props: vec![
                 edit(t!("Elevation").as_ref(), "elevation", h.elevation),
-                ro(t!("Area").as_ref(), "area", crate::entities::common::format_area(area)),
-                ro(t!("Cumulative area").as_ref(), "cumulative_area", crate::entities::common::format_area(area)),
+                ro(
+                    t!("Area").as_ref(),
+                    "area",
+                    crate::entities::common::format_area(area),
+                ),
+                ro(
+                    t!("Cumulative area").as_ref(),
+                    "cumulative_area",
+                    crate::entities::common::format_area(area),
+                ),
             ],
         },
     ];
-    if bg_on {
-        if let Some(sec) = sections.first_mut() {
-            sec.props.push(Property {
-                label: t!("Background color").into_owned(),
-                field: "background_color",
-                value: PropValue::ColorChoice(bg_col),
-            });
-        }
-    }
     sections
 }
 
 fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
-    use codec::entities::{HatchPatternType, HatchStyleType};
+    use document::entities::{HatchPatternType, HatchStyleType};
     // Non-numeric fields (bool toggles / enum choices) — handled before the
     // f64 parse below, which would otherwise reject their string values.
     match field {
@@ -566,7 +593,7 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
             if background_color(h).is_some() {
                 clear_background_color(h);
             } else {
-                set_background_color(h, &codec::types::Color::ByLayer);
+                set_background_color(h, &document::types::Color::ByLayer);
             }
             return;
         }
@@ -574,7 +601,7 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
             h.is_double = if value == "toggle" {
                 !h.is_double
             } else {
-                value == "true"
+                value == "true" || value == t!("Yes").as_ref() || value.eq_ignore_ascii_case("yes")
             };
             return;
         }
@@ -588,11 +615,7 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
             // update from boundary edits. Only enable it when a real
             // relationship is available; disabling retains the handles so the
             // user can turn it back on later.
-            if !requested
-                || h.paths
-                    .iter()
-                    .any(|path| !path.boundary_handles.is_empty())
-            {
+            if !requested || h.paths.iter().any(|path| !path.boundary_handles.is_empty()) {
                 h.is_associative = requested;
             }
             return;
@@ -611,12 +634,10 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
                 match requested {
                     HatchPatternType::UserDefined => {
                         // Rebuild user-defined geometry from its parameters.
-                        h.pattern = codec::entities::HatchPattern::new("_USER");
+                        h.pattern = document::entities::HatchPattern::new("_USER");
                     }
                     HatchPatternType::Predefined => {
-                        if let Some(entry) =
-                            crate::scene::model::hatch_patterns::find("ANSI31")
-                        {
+                        if let Some(entry) = crate::scene::model::hatch_patterns::find("ANSI31") {
                             let mut pattern =
                                 crate::scene::model::hatch_patterns::build_dxf_pattern(entry);
                             scale_pattern_geometry(&mut pattern, h.pattern_scale);
@@ -700,7 +721,7 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
             h.pattern_scale = v;
             if matches!(
                 h.pattern_type,
-                codec::entities::HatchPatternType::UserDefined
+                document::entities::HatchPatternType::UserDefined
             ) {
                 h.pattern.lines.clear();
                 h.pattern.name = "_USER".to_string();
@@ -709,11 +730,11 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
         // Origin rows are relative offsets and return to zero after commit.
         "origin_x" => {
             let origin = h.pattern_origin();
-            h.set_pattern_origin(codec::types::Vector2::new(origin.x + v, origin.y));
+            h.set_pattern_origin(document::types::Vector2::new(origin.x + v, origin.y));
         }
         "origin_y" => {
             let origin = h.pattern_origin();
-            h.set_pattern_origin(codec::types::Vector2::new(origin.x, origin.y + v));
+            h.set_pattern_origin(document::types::Vector2::new(origin.x, origin.y + v));
         }
         "iso_pen_width" if v > 0.0 => {
             let old = h.pattern_scale;
@@ -727,11 +748,185 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
     }
 }
 
+/// Transparency as the Hatch panel shows it: a percentage, `None` when the
+/// hatch follows its layer or block.
+fn transparency_percent(t: document::types::Transparency) -> Option<u8> {
+    match t {
+        document::types::Transparency::Explicit(alpha) => {
+            Some((f64::from(alpha) * 100.0 / 255.0).round() as u8)
+        }
+        _ => None,
+    }
+}
+
+/// The Hatch panel's settings for an existing hatch, as HATCHEDIT shows
+/// them. A user-defined hatch's spacing is its pattern scale, as in the
+/// Properties palette.
+pub(crate) fn panel_settings(
+    h: &Hatch,
+    annotative: bool,
+) -> crate::modules::draw::draw::hatch::HatchSettings {
+    use crate::modules::draw::draw::hatch::{HatchFill, HatchSettings, GRADIENT_COLORS};
+    use crate::scene::model::hatch_model::GradientKind;
+    let fill = if h.gradient_color.enabled {
+        let (kind, invert) = GradientKind::from_name(&h.gradient_color.name);
+        HatchFill::Gradient(kind, invert)
+    } else if h.is_solid {
+        HatchFill::Solid
+    } else if matches!(
+        h.pattern_type,
+        document::entities::HatchPatternType::UserDefined
+    ) {
+        HatchFill::User {
+            spacing: h.pattern_scale,
+            double: h.is_double,
+        }
+    } else {
+        HatchFill::Pattern(h.pattern.name.clone())
+    };
+    let mut gradient_colors = GRADIENT_COLORS;
+    for (slot, entry) in gradient_colors.iter_mut().zip(&h.gradient_color.colors) {
+        *slot = entry.color;
+    }
+    let origin = h.pattern_origin();
+    HatchSettings {
+        fill,
+        angle_deg: if h.gradient_color.enabled {
+            h.gradient_color.angle
+        } else {
+            h.pattern_angle
+        }
+        .to_degrees(),
+        scale: h.pattern_scale,
+        origin: [origin.x, origin.y],
+        method: 0,
+        islands: h.style,
+        associative: h.is_associative,
+        separate: false,
+        keep_boundaries: false,
+        gap_tolerance: 0.0,
+        color: Some(h.common.color),
+        background: background_color(h),
+        layer: Some(h.common.layer.clone()),
+        transparency: transparency_percent(h.common.transparency),
+        gradient_colors,
+        draw_order: 0,
+        annotative,
+    }
+}
+
+/// Swap the hatch's lines for the predefined pattern `name`, kept at the
+/// hatch's scale, angle and origin.
+fn set_predefined_pattern(h: &mut Hatch, name: &str) {
+    if name.eq_ignore_ascii_case("SOLID") {
+        h.pattern = document::entities::HatchPattern::new("SOLID");
+        h.pattern_type = document::entities::HatchPatternType::Predefined;
+        h.is_solid = true;
+        h.gradient_color.enabled = false;
+        return;
+    }
+    let Some(entry) = crate::scene::model::hatch_patterns::find(name) else {
+        return;
+    };
+    let mut pattern = crate::scene::model::hatch_patterns::build_dxf_pattern(entry);
+    scale_pattern_geometry(&mut pattern, h.pattern_scale.max(1.0e-6));
+    rotate_pattern_geometry(&mut pattern, h.pattern_angle);
+    let origin = h.pattern_origin();
+    translate_pattern_geometry(&mut pattern, origin.x, origin.y);
+    h.pattern = pattern;
+    h.pattern_type = document::entities::HatchPatternType::Predefined;
+    h.is_solid = false;
+    h.gradient_color.enabled = false;
+}
+
+/// Apply what changed on the Hatch panel between `before` and `after` to an
+/// existing hatch (HATCHEDIT's OK). Fields the panel did not change keep
+/// the hatch's own values; colour, layer and transparency are set by the
+/// caller, which owns the layer table.
+pub(crate) fn apply_panel_settings(
+    h: &mut Hatch,
+    before: &crate::modules::draw::draw::hatch::HatchSettings,
+    after: &crate::modules::draw::draw::hatch::HatchSettings,
+) {
+    use crate::modules::draw::draw::hatch::HatchFill;
+    use document::entities::HatchPatternType;
+    let number = |value: f64| value.to_string();
+    if after.fill != before.fill {
+        match &after.fill {
+            HatchFill::Solid => set_predefined_pattern(h, "SOLID"),
+            HatchFill::Pattern(name) => set_predefined_pattern(h, name),
+            HatchFill::User { spacing, double } => {
+                h.gradient_color.enabled = false;
+                if h.pattern_type != HatchPatternType::UserDefined {
+                    apply_geom_prop(h, "pattern_type_label", "User Defined");
+                }
+                h.is_solid = false;
+                apply_geom_prop(h, "spacing", &number(*spacing));
+                h.is_double = *double;
+            }
+            HatchFill::Gradient(kind, invert) => {
+                h.is_solid = true;
+                h.gradient_color.enabled = true;
+                h.gradient_color.name = kind.dxf_name(*invert).to_string();
+                h.gradient_color.angle = after.angle_deg.to_radians();
+                h.gradient_color.is_single_color = false;
+                h.gradient_color.colors = after
+                    .gradient_colors
+                    .iter()
+                    .enumerate()
+                    .map(|(n, color)| document::entities::hatch::GradientColorEntry {
+                        value: n as f64,
+                        color: *color,
+                        ..Default::default()
+                    })
+                    .collect();
+            }
+        }
+    } else if after.gradient_colors != before.gradient_colors && h.gradient_color.enabled {
+        for (entry, color) in h
+            .gradient_color
+            .colors
+            .iter_mut()
+            .zip(&after.gradient_colors)
+        {
+            entry.color = *color;
+        }
+    }
+    if after.angle_deg != before.angle_deg {
+        apply_geom_prop(h, "pattern_angle", &number(after.angle_deg));
+    }
+    if after.scale != before.scale && !matches!(after.fill, HatchFill::User { .. }) {
+        apply_geom_prop(h, "pattern_scale", &number(after.scale));
+    }
+    if after.origin != before.origin {
+        h.set_pattern_origin(document::types::Vector2::new(
+            after.origin[0],
+            after.origin[1],
+        ));
+    }
+    if after.islands != before.islands {
+        h.style = after.islands;
+    }
+    if after.associative != before.associative {
+        apply_geom_prop(
+            h,
+            "associative",
+            if after.associative { "true" } else { "false" },
+        );
+    }
+    if after.background != before.background {
+        match &after.background {
+            Some(color) => set_background_color(h, color),
+            None => clear_background_color(h),
+        }
+    }
+}
+
 fn apply_transform(h: &mut Hatch, t: &EntityTransform) {
     crate::scene::view::transform::apply_standard_entity_transform(h, t, |entity, p1, p2| {
         // Keep boundary directions, angles, and sweeps consistent.
         let t = crate::scene::view::transform::reflection_about_xy_line(p1, p2);
-        codec::entities::Entity::apply_transform(entity, &t);
+        document::entities::Entity::apply_transform(entity, &t);
     });
 }
 
@@ -756,7 +951,8 @@ impl Transformable for Hatch {
 /// Assign sequential grip IDs across all boundary paths and edges.
 /// Exposed control points per edge type:
 ///   Polyline       → each vertex (x, y)
-///   Line           → start, end
+///   Line           → each corner once: where one line ends and the next
+///                    starts is a single grip moving both ends
 ///   CircularArc    → center
 ///   EllipticArc    → center
 ///   Spline         → fit points if present, else control points (x, y)
@@ -769,8 +965,7 @@ impl Grippable for Hatch {
         // pattern exists). Dragging it moves the pattern tiling origin; boundary
         // grips follow from the next id.
         if let Some(l0) = self.pattern.lines.first() {
-            let (gx, gy) =
-                boundary_centroid(self).unwrap_or((l0.base_point.x, l0.base_point.y));
+            let (gx, gy) = boundary_centroid(self).unwrap_or((l0.base_point.x, l0.base_point.y));
             out.push(circle_grip(id, glam::DVec3::new(gx, gy, elev)));
             id += 1;
         } else if self.is_associative {
@@ -783,51 +978,9 @@ impl Grippable for Hatch {
         if self.is_associative {
             return out;
         }
-        for path in &self.paths {
-            for edge in &path.edges {
-                match edge {
-                    BoundaryEdge::Polyline(p) => {
-                        for v in &p.vertices {
-                            out.push(center_grip(id, glam::DVec3::new(v.x, v.y, elev)));
-                            id += 1;
-                        }
-                    }
-                    BoundaryEdge::Line(l) => {
-                        out.push(center_grip(
-                            id,
-                            glam::DVec3::new(l.start.x, l.start.y, elev),
-                        ));
-                        id += 1;
-                        out.push(center_grip(id, glam::DVec3::new(l.end.x, l.end.y, elev)));
-                        id += 1;
-                    }
-                    BoundaryEdge::CircularArc(a) => {
-                        out.push(center_grip(
-                            id,
-                            glam::DVec3::new(a.center.x, a.center.y, elev),
-                        ));
-                        id += 1;
-                    }
-                    BoundaryEdge::EllipticArc(e) => {
-                        out.push(center_grip(
-                            id,
-                            glam::DVec3::new(e.center.x, e.center.y, elev),
-                        ));
-                        id += 1;
-                    }
-                    BoundaryEdge::Spline(s) => {
-                        let pts: Vec<[f64; 2]> = if !s.fit_points.is_empty() {
-                            s.fit_points.iter().map(|p| [p.x, p.y]).collect()
-                        } else {
-                            s.control_points.iter().map(|p| [p.x, p.y]).collect()
-                        };
-                        for [x, y] in pts {
-                            out.push(center_grip(id, glam::DVec3::new(x, y, elev)));
-                            id += 1;
-                        }
-                    }
-                }
-            }
+        for (_, [x, y]) in boundary_points(self) {
+            out.push(center_grip(id, glam::DVec3::new(x, y, elev)));
+            id += 1;
         }
         out
     }
@@ -859,103 +1012,49 @@ impl Grippable for Hatch {
                     GripApply::Translate(delta) => (delta.x, delta.y),
                 };
                 let origin = self.pattern_origin();
-                self.set_pattern_origin(codec::types::Vector2::new(origin.x + dx, origin.y + dy));
+                self.set_pattern_origin(document::types::Vector2::new(
+                    origin.x + dx,
+                    origin.y + dy,
+                ));
                 return;
             }
             id += 1;
         }
 
-        'outer: for path in &mut self.paths {
-            for edge in &mut path.edges {
-                match edge {
-                    BoundaryEdge::Polyline(p) => {
-                        for v in &mut p.vertices {
-                            if id == grip_id {
-                                let (nx, ny) =
-                                    resolve(&apply, Vec3::new(v.x as f32, v.y as f32, elev));
-                                v.x = nx;
-                                v.y = ny;
-                                break 'outer;
-                            }
-                            id += 1;
-                        }
-                    }
-                    BoundaryEdge::Line(l) => {
-                        if id == grip_id {
-                            let (nx, ny) = resolve(
-                                &apply,
-                                Vec3::new(l.start.x as f32, l.start.y as f32, elev),
-                            );
-                            l.start.x = nx;
-                            l.start.y = ny;
-                            break 'outer;
-                        }
-                        id += 1;
-                        if id == grip_id {
-                            let (nx, ny) =
-                                resolve(&apply, Vec3::new(l.end.x as f32, l.end.y as f32, elev));
-                            l.end.x = nx;
-                            l.end.y = ny;
-                            break 'outer;
-                        }
-                        id += 1;
-                    }
-                    BoundaryEdge::CircularArc(a) => {
-                        if id == grip_id {
-                            let (nx, ny) = resolve(
-                                &apply,
-                                Vec3::new(a.center.x as f32, a.center.y as f32, elev),
-                            );
-                            a.center.x = nx;
-                            a.center.y = ny;
-                            break 'outer;
-                        }
-                        id += 1;
-                    }
-                    BoundaryEdge::EllipticArc(e) => {
-                        if id == grip_id {
-                            let (nx, ny) = resolve(
-                                &apply,
-                                Vec3::new(e.center.x as f32, e.center.y as f32, elev),
-                            );
-                            e.center.x = nx;
-                            e.center.y = ny;
-                            break 'outer;
-                        }
-                        id += 1;
-                    }
-                    BoundaryEdge::Spline(s) => {
-                        if !s.fit_points.is_empty() {
-                            for fp in &mut s.fit_points {
-                                if id == grip_id {
-                                    let (nx, ny) =
-                                        resolve(&apply, Vec3::new(fp.x as f32, fp.y as f32, elev));
-                                    fp.x = nx;
-                                    fp.y = ny;
-                                    break 'outer;
-                                }
-                                id += 1;
-                            }
-                        } else {
-                            for cp in &mut s.control_points {
-                                if id == grip_id {
-                                    let (nx, ny) =
-                                        resolve(&apply, Vec3::new(cp.x as f32, cp.y as f32, elev));
-                                    cp.x = nx;
-                                    cp.y = ny;
-                                    break 'outer;
-                                }
-                                id += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let Some(&(point, [x, y])) = boundary_points(self).get(grip_id.wrapping_sub(id)) else {
+            return;
+        };
+        let (nx, ny) = resolve(&apply, Vec3::new(x as f32, y as f32, elev));
+        set_boundary_point(self, point, nx, ny);
     }
 
     fn grip_menu(&self, grip_id: usize) -> Vec<crate::scene::model::object::GripMenuItem> {
         use crate::scene::model::object::{GripMenuAction, GripMenuItem};
+        if let Some(point) = vertex_point_at(self, grip_id) {
+            let removable = match point {
+                BoundaryPoint::LineVertex {
+                    ending, starting, ..
+                } => ending.is_some() && starting.is_some(),
+                _ => true,
+            };
+            let mut items = vec![
+                GripMenuItem {
+                    label: "Stretch",
+                    action: GripMenuAction::Stretch,
+                },
+                GripMenuItem {
+                    label: "Add Vertex",
+                    action: GripMenuAction::AddVertex,
+                },
+            ];
+            if removable {
+                items.push(GripMenuItem {
+                    label: "Remove Vertex",
+                    action: GripMenuAction::RemoveVertex,
+                });
+            }
+            return items;
+        }
         if self.pattern.lines.is_empty() || grip_id != 0 {
             return vec![GripMenuItem {
                 label: "Stretch",
@@ -982,14 +1081,25 @@ impl Grippable for Hatch {
         ]
     }
 
-    fn apply_grip_menu(&mut self, grip_id: usize, action: crate::scene::model::object::GripMenuAction) {
+    fn apply_grip_menu(
+        &mut self,
+        grip_id: usize,
+        action: crate::scene::model::object::GripMenuAction,
+    ) {
         use crate::scene::model::object::GripMenuAction as A;
+        if let Some(point) = vertex_point_at(self, grip_id) {
+            edit_boundary_vertex(self, point, action);
+            return;
+        }
         if grip_id == 0 && matches!(action, A::OriginPoint) {
             if let (Some((gx, gy)), Some((_ox, _oy))) = (
                 boundary_centroid(self),
-                self.pattern.lines.first().map(|line| (line.base_point.x, line.base_point.y)),
+                self.pattern
+                    .lines
+                    .first()
+                    .map(|line| (line.base_point.x, line.base_point.y)),
             ) {
-                self.set_pattern_origin(codec::types::Vector2::new(gx, gy));
+                self.set_pattern_origin(document::types::Vector2::new(gx, gy));
             }
         }
     }
@@ -1054,8 +1164,7 @@ impl FallbackTess for Hatch {
                 let Some(curve) = edge_curve(edge) else {
                     continue;
                 };
-                let local = curve
-                    .tessellate_angle(kernel::tessellation::DEFAULT_ANGLE);
+                let local = curve.tessellate_angle(ocs_geom::tessellation::DEFAULT_ANGLE);
                 if local.len() < 2 {
                     continue;
                 }
@@ -1067,11 +1176,9 @@ impl FallbackTess for Hatch {
                     .map(|point| to_wcs(point[0], point[1]))
                     .collect();
                 match edge {
-                    BoundaryEdge::Polyline(poly) => key_verts.extend(
-                        poly.vertices
-                            .iter()
-                            .map(|point| to_wcs(point.x, point.y)),
-                    ),
+                    BoundaryEdge::Polyline(poly) => {
+                        key_verts.extend(poly.vertices.iter().map(|point| to_wcs(point.x, point.y)))
+                    }
                     _ => key_verts.extend([world[0], *world.last().unwrap()]),
                 }
                 match edge {
@@ -1092,5 +1199,347 @@ impl FallbackTess for Hatch {
             pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
         }
         (pts, snap_pts, vec![], key_verts)
+    }
+}
+
+/// Where one boundary grip's point lives.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BoundaryPoint {
+    PolylineVertex {
+        path: usize,
+        edge: usize,
+        vertex: usize,
+    },
+    /// A corner of a chain of line edges: the end of `ending` and the start
+    /// of `starting`, kept together so moving it never opens the boundary.
+    LineVertex {
+        path: usize,
+        ending: Option<usize>,
+        starting: Option<usize>,
+    },
+    ArcCenter {
+        path: usize,
+        edge: usize,
+    },
+    EllipseCenter {
+        path: usize,
+        edge: usize,
+    },
+    SplinePoint {
+        path: usize,
+        edge: usize,
+        index: usize,
+        fit: bool,
+    },
+}
+
+fn same_point(a: &document::types::Vector2, b: &document::types::Vector2) -> bool {
+    let scale = a.x.abs().max(a.y.abs()).max(1.0);
+    (a.x - b.x).abs() <= 1e-9 * scale && (a.y - b.y).abs() <= 1e-9 * scale
+}
+
+/// The non-associative boundary's grip points, in grip order (after the
+/// pattern-origin grip), each joined corner of a line chain once.
+fn boundary_points(hatch: &Hatch) -> Vec<(BoundaryPoint, [f64; 2])> {
+    let mut out = Vec::new();
+    for (path_index, path) in hatch.paths.iter().enumerate() {
+        let mut pending_end: Option<usize> = None;
+        let mut first_start: Option<usize> = None;
+        let line = |edge: usize| match &path.edges[edge] {
+            BoundaryEdge::Line(line) => Some(line),
+            _ => None,
+        };
+        for (edge_index, edge) in path.edges.iter().enumerate() {
+            if let BoundaryEdge::Line(current) = edge {
+                match pending_end {
+                    Some(previous) if same_point(&line(previous).unwrap().end, &current.start) => {
+                        out.push((
+                            BoundaryPoint::LineVertex {
+                                path: path_index,
+                                ending: Some(previous),
+                                starting: Some(edge_index),
+                            },
+                            [current.start.x, current.start.y],
+                        ));
+                    }
+                    pending => {
+                        if let Some(previous) = pending {
+                            let end = &line(previous).unwrap().end;
+                            out.push((
+                                BoundaryPoint::LineVertex {
+                                    path: path_index,
+                                    ending: Some(previous),
+                                    starting: None,
+                                },
+                                [end.x, end.y],
+                            ));
+                        }
+                        if edge_index == 0 {
+                            first_start = Some(out.len());
+                        }
+                        out.push((
+                            BoundaryPoint::LineVertex {
+                                path: path_index,
+                                ending: None,
+                                starting: Some(edge_index),
+                            },
+                            [current.start.x, current.start.y],
+                        ));
+                    }
+                }
+                pending_end = Some(edge_index);
+                continue;
+            }
+            if let Some(previous) = pending_end.take() {
+                let end = &line(previous).unwrap().end;
+                out.push((
+                    BoundaryPoint::LineVertex {
+                        path: path_index,
+                        ending: Some(previous),
+                        starting: None,
+                    },
+                    [end.x, end.y],
+                ));
+            }
+            match edge {
+                BoundaryEdge::Polyline(polyline) => {
+                    for (vertex, v) in polyline.vertices.iter().enumerate() {
+                        out.push((
+                            BoundaryPoint::PolylineVertex {
+                                path: path_index,
+                                edge: edge_index,
+                                vertex,
+                            },
+                            [v.x, v.y],
+                        ));
+                    }
+                }
+                BoundaryEdge::CircularArc(arc) => out.push((
+                    BoundaryPoint::ArcCenter {
+                        path: path_index,
+                        edge: edge_index,
+                    },
+                    [arc.center.x, arc.center.y],
+                )),
+                BoundaryEdge::EllipticArc(ellipse) => out.push((
+                    BoundaryPoint::EllipseCenter {
+                        path: path_index,
+                        edge: edge_index,
+                    },
+                    [ellipse.center.x, ellipse.center.y],
+                )),
+                BoundaryEdge::Spline(spline) => {
+                    let fit = !spline.fit_points.is_empty();
+                    let points: Vec<[f64; 2]> = if fit {
+                        spline.fit_points.iter().map(|p| [p.x, p.y]).collect()
+                    } else {
+                        spline.control_points.iter().map(|p| [p.x, p.y]).collect()
+                    };
+                    for (index, point) in points.into_iter().enumerate() {
+                        out.push((
+                            BoundaryPoint::SplinePoint {
+                                path: path_index,
+                                edge: edge_index,
+                                index,
+                                fit,
+                            },
+                            point,
+                        ));
+                    }
+                }
+                BoundaryEdge::Line(_) => {}
+            }
+        }
+        // A closed chain: the last line ends where the first one starts.
+        if let Some(last) = pending_end {
+            let end = line(last).unwrap().end;
+            match first_start.map(|slot| (slot, &mut out[slot])) {
+                Some((
+                    _,
+                    (
+                        BoundaryPoint::LineVertex {
+                            ending,
+                            starting: Some(0),
+                            ..
+                        },
+                        _,
+                    ),
+                )) if ending.is_none() && same_point(&line(0).unwrap().start, &end) => {
+                    *ending = Some(last);
+                }
+                _ => out.push((
+                    BoundaryPoint::LineVertex {
+                        path: path_index,
+                        ending: Some(last),
+                        starting: None,
+                    },
+                    [end.x, end.y],
+                )),
+            }
+        }
+    }
+    out
+}
+
+/// Move one boundary grip point, every edge end it stands for included.
+fn set_boundary_point(hatch: &mut Hatch, point: BoundaryPoint, x: f64, y: f64) {
+    match point {
+        BoundaryPoint::PolylineVertex { path, edge, vertex } => {
+            if let BoundaryEdge::Polyline(polyline) = &mut hatch.paths[path].edges[edge] {
+                polyline.vertices[vertex].x = x;
+                polyline.vertices[vertex].y = y;
+            }
+        }
+        BoundaryPoint::LineVertex {
+            path,
+            ending,
+            starting,
+        } => {
+            if let Some(edge) = ending {
+                if let BoundaryEdge::Line(line) = &mut hatch.paths[path].edges[edge] {
+                    line.end = document::types::Vector2::new(x, y);
+                }
+            }
+            if let Some(edge) = starting {
+                if let BoundaryEdge::Line(line) = &mut hatch.paths[path].edges[edge] {
+                    line.start = document::types::Vector2::new(x, y);
+                }
+            }
+        }
+        BoundaryPoint::ArcCenter { path, edge } => {
+            if let BoundaryEdge::CircularArc(arc) = &mut hatch.paths[path].edges[edge] {
+                arc.center.x = x;
+                arc.center.y = y;
+            }
+        }
+        BoundaryPoint::EllipseCenter { path, edge } => {
+            if let BoundaryEdge::EllipticArc(ellipse) = &mut hatch.paths[path].edges[edge] {
+                ellipse.center.x = x;
+                ellipse.center.y = y;
+            }
+        }
+        BoundaryPoint::SplinePoint {
+            path,
+            edge,
+            index,
+            fit,
+        } => {
+            if let BoundaryEdge::Spline(spline) = &mut hatch.paths[path].edges[edge] {
+                if fit {
+                    if let Some(point) = spline.fit_points.get_mut(index) {
+                        point.x = x;
+                        point.y = y;
+                    }
+                } else if let Some(point) = spline.control_points.get_mut(index) {
+                    point.x = x;
+                    point.y = y;
+                }
+            }
+        }
+    }
+}
+
+/// The boundary vertex a grip stands for, when it is one that vertices can
+/// be added after or removed at.
+fn vertex_point_at(hatch: &Hatch, grip_id: usize) -> Option<BoundaryPoint> {
+    if hatch.is_associative {
+        return None;
+    }
+    // Grip 0 is the pattern origin when there is a pattern.
+    let first = usize::from(!hatch.pattern.lines.is_empty());
+    let (point, _) = *boundary_points(hatch).get(grip_id.checked_sub(first)?)?;
+    matches!(
+        point,
+        BoundaryPoint::PolylineVertex { .. } | BoundaryPoint::LineVertex { .. }
+    )
+    .then_some(point)
+}
+
+/// Add a vertex after `point` (halfway along the following segment, on
+/// the arc for a bulged one) or remove `point`, keeping the loop closed.
+fn edit_boundary_vertex(
+    hatch: &mut Hatch,
+    point: BoundaryPoint,
+    action: crate::scene::model::object::GripMenuAction,
+) {
+    use crate::scene::model::object::GripMenuAction as A;
+    match point {
+        BoundaryPoint::PolylineVertex { path, edge, vertex } => {
+            let BoundaryEdge::Polyline(polyline) = &mut hatch.paths[path].edges[edge] else {
+                return;
+            };
+            let n = polyline.vertices.len();
+            match action {
+                A::AddVertex => {
+                    if vertex + 1 == n && !polyline.is_closed {
+                        let last = polyline.vertices[vertex];
+                        polyline
+                            .vertices
+                            .push(document::types::Vector3::new(last.x, last.y, 0.0));
+                        return;
+                    }
+                    let a = polyline.vertices[vertex];
+                    let b = polyline.vertices[(vertex + 1) % n];
+                    let (cx, cy) = (b.x - a.x, b.y - a.y);
+                    // The arc's midpoint sits off the chord by the sagitta,
+                    // to the right of a positive (counter-clockwise) bulge.
+                    let sagitta = a.z * 0.5;
+                    let half = (a.z.atan() * 0.5).tan();
+                    let mid = document::types::Vector3::new(
+                        (a.x + b.x) * 0.5 + cy * sagitta,
+                        (a.y + b.y) * 0.5 - cx * sagitta,
+                        half,
+                    );
+                    polyline.vertices[vertex].z = half;
+                    polyline.vertices.insert(vertex + 1, mid);
+                }
+                A::RemoveVertex if n > if polyline.is_closed { 3 } else { 2 } => {
+                    polyline.vertices.remove(vertex);
+                }
+                _ => {}
+            }
+        }
+        BoundaryPoint::LineVertex {
+            path,
+            ending,
+            starting,
+        } => {
+            let edges = &mut hatch.paths[path].edges;
+            match (action, ending, starting) {
+                (A::AddVertex, _, Some(edge)) => {
+                    let BoundaryEdge::Line(line) = &mut edges[edge] else {
+                        return;
+                    };
+                    let mid = document::types::Vector2::new(
+                        (line.start.x + line.end.x) * 0.5,
+                        (line.start.y + line.end.y) * 0.5,
+                    );
+                    let tail = document::entities::LineEdge {
+                        start: mid,
+                        end: line.end,
+                    };
+                    line.end = mid;
+                    edges.insert(edge + 1, BoundaryEdge::Line(tail));
+                }
+                (A::RemoveVertex, Some(previous), Some(edge)) if previous != edge => {
+                    let lines = edges
+                        .iter()
+                        .filter(|edge| matches!(edge, BoundaryEdge::Line(_)))
+                        .count();
+                    if lines <= 3 {
+                        return;
+                    }
+                    let BoundaryEdge::Line(removed) = edges[edge].clone() else {
+                        return;
+                    };
+                    if let BoundaryEdge::Line(line) = &mut edges[previous] {
+                        line.end = removed.end;
+                    }
+                    edges.remove(edge);
+                }
+                _ => {}
+            }
+        }
+        _ => {}
     }
 }

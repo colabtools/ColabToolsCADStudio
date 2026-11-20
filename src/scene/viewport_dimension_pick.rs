@@ -3,9 +3,9 @@
 
 use super::*;
 
-use crate::command::EntityTransform;
+use crate::entities::transform::EntityTransform;
 use crate::scene::viewport_ref::ViewportFrame;
-use codec::types::{Matrix4, Transform};
+use document::types::{Matrix4, Transform};
 #[cfg(test)]
 use glam::DVec2;
 use glam::DVec3;
@@ -177,7 +177,7 @@ impl Scene {
     /// Returns the entity already transformed into WCS plus the INSERT path.
     fn descend_block_instance(
         &self,
-        insert: &codec::entities::Insert,
+        insert: &document::entities::Insert,
         outer: Transform,
         model_point: DVec3,
         depth: usize,
@@ -206,7 +206,13 @@ impl Scene {
             let frozen = viewport.and_then(|h| self.document.get_entity(h)).is_some_and(|entity| {
                 matches!(entity, EntityType::Viewport(vp) if layer.is_some_and(|l| vp.frozen_layers.contains(&l.handle)))
             });
-            if common.invisible || layer.is_some_and(|l| l.flags.off || l.flags.frozen) || frozen {
+            if common.invisible
+                || layer.is_some_and(|l| l.flags.off || l.flags.frozen)
+                || frozen
+                // LAYWALK: block-internal measurement targets obey the walk
+                // of the space being picked, exactly like the rendered wires.
+                || self.layer_walk_hidden(layer)
+            {
                 continue;
             }
             if let EntityType::Insert(child_insert) = child_entity {
@@ -312,11 +318,11 @@ fn wire_polyline_nearest(
             continue;
         }
         let nearest = previous.map_or(current, |start| {
-            let segment = kernel::geom2d::Curve::Line(kernel::geom2d::Line {
+            let segment = ocs_geom::geom2d::Curve::Line(ocs_geom::geom2d::Line {
                 start: start.truncate().to_array(),
                 end: current.truncate().to_array(),
             });
-            let near = kernel::geom2d::closest_point(&segment, point.truncate().to_array());
+            let near = ocs_geom::geom2d::closest_point(&segment, point.truncate().to_array());
             start.lerp(current, near.t)
         });
         let distance = (nearest - point).truncate().length();
@@ -332,13 +338,30 @@ fn wire_polyline_nearest(
 /// Distance from `point` to the planar geometry object-pick dimensioning
 /// supports. `None` for entity types that cannot be dimensioned by picking.
 pub fn planar_pick_distance(entity: &EntityType, point: DVec3) -> Option<f64> {
+    // A centre mark is picked by every line it draws, not only the stored
+    // carrier line (its horizontal cross arm).
+    if let EntityType::Line(line) = entity {
+        if let Some(mark) =
+            document::entities::CenterMarkAssociation::read(&line.common.extended_data)
+        {
+            return crate::scene::centermark::render_segments(&mark)
+                .into_iter()
+                .map(|[a, b]| {
+                    let (a, b, p) = (a.truncate(), b.truncate(), point.truncate());
+                    let ab = b - a;
+                    let t = ((p - a).dot(ab) / ab.length_squared().max(1e-24)).clamp(0.0, 1.0);
+                    (a + ab * t - p).length()
+                })
+                .reduce(f64::min);
+        }
+    }
     let planar = crate::entities::curve::entity_curve(entity)?;
     let normal = DVec3::from_array(planar.plane.normal()?);
     if normal.cross(DVec3::Z).length_squared() > 1e-12 {
         return None;
     }
     let uv = planar.plane.project(point.to_array())?;
-    let nearest = kernel::geom2d::closest_point(&planar.curve, uv);
+    let nearest = ocs_geom::geom2d::closest_point(&planar.curve, uv);
     Some(
         (DVec3::from_array(planar.plane.point_at(nearest.point)) - point)
             .truncate()
@@ -371,7 +394,7 @@ mod tests {
             DVec3::new(940.5, 2113.25, 0.0),
         ] {
             let expected = f.model_to_paper(model);
-            let actual = t.apply(codec::types::Vector3::new(model.x, model.y, model.z));
+            let actual = t.apply(document::types::Vector3::new(model.x, model.y, model.z));
             assert!(
                 (actual.x - expected.x).abs() < 1e-9 && (actual.y - expected.y).abs() < 1e-9,
                 "{actual:?} != {expected:?}"
@@ -388,7 +411,7 @@ pub(crate) fn feature_pick_distance(
     kind: Option<crate::snap::SnapType>,
 ) -> Option<f64> {
     use crate::snap::SnapType as S;
-    let points: Vec<codec::types::Vector3> = match kind {
+    let points: Vec<document::types::Vector3> = match kind {
         Some(S::Center) => match entity {
             EntityType::Circle(c) => vec![c.center_wcs()],
             EntityType::Arc(a) => vec![a.center_wcs()],
@@ -402,15 +425,15 @@ pub(crate) fn feature_pick_distance(
         },
         Some(S::Midpoint | S::Quadrant) => {
             let planar = crate::entities::curve::entity_curve(entity)?;
-            kernel::geom2d::snap::characteristic_points(&planar.curve)
+            ocs_geom::geom2d::snap::characteristic_points(&planar.curve)
                 .into_iter()
                 .filter(|p| match kind {
-                    Some(S::Midpoint) => p.kind == kernel::geom2d::snap::SnapKind::Midpoint,
-                    _ => p.kind == kernel::geom2d::snap::SnapKind::Quadrant,
+                    Some(S::Midpoint) => p.kind == ocs_geom::geom2d::snap::SnapKind::Midpoint,
+                    _ => p.kind == ocs_geom::geom2d::snap::SnapKind::Quadrant,
                 })
                 .map(|p| {
                     let p = planar.plane.point_at(p.point);
-                    codec::types::Vector3::new(p[0], p[1], p[2])
+                    document::types::Vector3::new(p[0], p[1], p[2])
                 })
                 .collect()
         }

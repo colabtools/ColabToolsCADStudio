@@ -7,11 +7,12 @@
 //! 4. Recent Colors row (up to 9 swatches)
 //! 5. "Select Color..." action to open the full Select Color dialog
 
-use super::widgets::{muted_text_style, popup_panel_style, popup_row_style};
+use super::widgets::muted_text_style;
 use crate::app::Message;
 use crate::t;
 use crate::ui::properties::acad_color_display;
-use codec::types::Color as AcadColor;
+use crate::ui::style::{chrome, text as ui_text};
+use document::types::Color as AcadColor;
 use iced::widget::{button, column, container, row, text, Space};
 use iced::{Background, Border, Element, Length, Padding, Theme};
 
@@ -82,7 +83,7 @@ pub const QUICK_PICK_GRID: [[(u8, u8, u8); 9]; 5] = [
 #[allow(dead_code)]
 pub fn aci_1_9() -> [(u8, u8, u8); 9] {
     std::array::from_fn(|i| {
-        codec::types::aci_table::aci_to_rgb((i + 1) as u8).unwrap_or((128, 128, 128))
+        document::types::aci_table::aci_to_rgb((i + 1) as u8).unwrap_or((128, 128, 128))
     })
 }
 
@@ -97,17 +98,16 @@ fn swatch_btn<'a>(color: AcadColor, cur_color: AcadColor) -> Element<'a, Message
     )
     .on_press(Message::RibbonColorChanged(color))
     .style(move |theme: &Theme, status| {
-        let palette = theme.palette();
         let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
         button::Style {
             background: Some(Background::Color(bg)),
             border: Border {
                 color: if selected {
-                    palette.primary.base.color
+                    chrome::accent(theme)
                 } else if hovered {
-                    palette.background.base.text
+                    chrome::strong(theme)
                 } else {
-                    palette.background.neutral.color
+                    chrome::border(theme)
                 },
                 width: if selected {
                     2.0
@@ -131,40 +131,35 @@ fn placeholder_swatch<'a>() -> Element<'a, Message> {
             .width(Length::Fixed(SWATCH_SIZE))
             .height(Length::Fixed(SWATCH_SIZE)),
     )
-    .style(|theme: &Theme| {
-        let palette = theme.palette();
-        container::Style {
-            background: Some(Background::Color(palette.background.weak.color.scale_alpha(0.5))),
-            border: Border {
-                color: palette.background.neutral.color.scale_alpha(0.5),
-                width: 1.0,
-                radius: 1.0.into(),
-            },
-            ..Default::default()
-        }
-    })
-    .into()
-}
-
-fn divider<'a>() -> Element<'a, Message> {
-    container(
-        Space::new()
-            .width(Length::Fill)
-            .height(Length::Fixed(1.0)),
-    )
     .style(|theme: &Theme| container::Style {
-        background: Some(Background::Color(theme.palette().background.neutral.color)),
+        background: Some(Background::Color(chrome::hover(theme).scale_alpha(0.5))),
+        border: Border {
+            color: chrome::border(theme).scale_alpha(0.5),
+            width: 1.0,
+            radius: 1.0.into(),
+        },
         ..Default::default()
     })
     .into()
 }
 
+fn divider<'a>() -> Element<'a, Message> {
+    container(Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
+        .style(|theme: &Theme| container::Style {
+            background: Some(Background::Color(chrome::border(theme))),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// `shown` overrides the swatch, so ByLayer can show the layer's colour.
 fn logical_row<'a>(
     color: AcadColor,
     cur_color: AcadColor,
     label: &'static str,
+    shown: Option<iced::Color>,
 ) -> Element<'a, Message> {
-    let (bg, _) = acad_color_display(color);
+    let bg = shown.unwrap_or_else(|| acad_color_display(color).0);
     let selected = color == cur_color;
 
     let swatch = container(
@@ -172,61 +167,81 @@ fn logical_row<'a>(
             .width(Length::Fixed(SWATCH_SIZE))
             .height(Length::Fixed(SWATCH_SIZE)),
     )
-    .style(move |theme: &Theme| {
-        let palette = theme.palette();
-        container::Style {
-            background: Some(Background::Color(bg)),
-            border: Border {
-                color: if selected {
-                    palette.primary.base.color
-                } else {
-                    palette.background.neutral.color
-                },
-                width: if selected { 2.0 } else { 1.0 },
-                radius: 1.0.into(),
+    .style(move |theme: &Theme| container::Style {
+        background: Some(Background::Color(bg)),
+        border: Border {
+            color: if selected {
+                chrome::accent(theme)
+            } else {
+                chrome::border(theme)
             },
-            ..Default::default()
-        }
+            width: if selected { 2.0 } else { 1.0 },
+            radius: 1.0.into(),
+        },
+        ..Default::default()
     });
 
     button(
-        row![
-            swatch,
-            text(t!(label)).size(11),
-        ]
-        .spacing(8)
-        .align_y(iced::Center),
+        row![swatch, text(t!(label)).size(ui_text::UI),]
+            .spacing(8)
+            .align_y(iced::Center),
     )
     .on_press(Message::RibbonColorChanged(color))
-    .style(popup_row_style)
+    .style(crate::ui::kit::dropdown_row_style)
     .padding([3, 4])
     .width(Length::Fill)
     .into()
 }
 
 fn more_colors_row<'a>(active_color: AcadColor) -> Element<'a, Message> {
-    button(
-        row![text(t!("Select Color...")).size(11)]
-            .align_y(iced::Center),
-    )
-    .on_press(Message::OpenColorWindow(
-        crate::app::ColorPickTarget::Ribbon,
-        active_color,
-    ))
-    .style(popup_row_style)
-    .padding([4, 4])
-    .width(Length::Fill)
-    .into()
+    button(row![text(t!("Select Color...")).size(ui_text::UI)].align_y(iced::Center))
+        .on_press(Message::OpenColorWindow(
+            crate::app::ColorPickTarget::Ribbon,
+            active_color,
+        ))
+        .style(crate::ui::kit::dropdown_row_style)
+        .padding([4, 4])
+        .width(Length::Fill)
+        .into()
 }
 
 /// Builds the complete 5-section color dropdown panel element.
+/// `layer_color` is the current layer's colour, shown on the ByLayer row.
 pub fn color_dropdown_panel<'a>(
     active_color: AcadColor,
     recent_colors: &[AcadColor],
+    layer_color: Option<iced::Color>,
+) -> Element<'a, Message> {
+    color_panel(active_color, recent_colors, layer_color, true)
+}
+
+pub fn layer_color_dropdown_panel<'a>(
+    active_color: AcadColor,
+    recent_colors: &[AcadColor],
+    layer: String,
+) -> Element<'a, Message> {
+    color_panel(active_color, recent_colors, None, false).map(move |message| match message {
+        Message::RibbonColorChanged(color) => Message::RibbonLayerColorChanged {
+            layer: layer.clone(),
+            color,
+        },
+        Message::OpenColorWindow(_, color) => Message::OpenColorWindow(
+            crate::app::ColorPickTarget::RibbonLayer(layer.clone()),
+            color,
+        ),
+        message => message,
+    })
+}
+
+fn color_panel<'a>(
+    active_color: AcadColor,
+    recent_colors: &[AcadColor],
+    layer_color: Option<iced::Color>,
+    logical_colors: bool,
 ) -> Element<'a, Message> {
     // 1. ByLayer and ByBlock
-    let by_layer = logical_row(AcadColor::ByLayer, active_color, "ByLayer");
-    let by_block = logical_row(AcadColor::ByBlock, active_color, "ByBlock");
+    let by_layer = logical_row(AcadColor::ByLayer, active_color, "ByLayer", layer_color);
+    let by_block = logical_row(AcadColor::ByBlock, active_color, "ByBlock", None);
     let section1 = column![by_layer, by_block].spacing(2);
 
     // 2. 45-swatch Quick Pick Grid (5 rows × 9 columns)
@@ -245,7 +260,9 @@ pub fn color_dropdown_panel<'a>(
     }
 
     // 3. Standard Index Colors (ACI 1..=9)
-    let index_header = text(t!("Index Color")).size(10).style(muted_text_style);
+    let index_header = text(t!("Index Color"))
+        .size(ui_text::UI_SMALL)
+        .style(muted_text_style);
     let mut standard_row = row![].spacing(SWATCH_GAP);
     for idx in 1u8..=9 {
         let color = AcadColor::Index(idx);
@@ -254,7 +271,9 @@ pub fn color_dropdown_panel<'a>(
     let section3 = column![index_header, standard_row].spacing(4);
 
     // 4. Recent Colors row (up to 9 swatches; pad with placeholders if fewer)
-    let recent_header = text(t!("Recent Colors")).size(10).style(muted_text_style);
+    let recent_header = text(t!("Recent Colors"))
+        .size(ui_text::UI_SMALL)
+        .style(muted_text_style);
     let mut recent_row = row![].spacing(SWATCH_GAP);
     let mut count = 0;
     for &color in recent_colors.iter().take(9) {
@@ -270,18 +289,22 @@ pub fn color_dropdown_panel<'a>(
     // 5. Select Color...
     let section5 = more_colors_row(active_color);
 
-    let content = column![
-        section1,
-        divider(),
-        grid_rows,
-        divider(),
-        section3,
-        divider(),
-        section4,
-        divider(),
-        section5,
-    ]
-    .spacing(6);
+    let mut content = column![].spacing(6);
+    if logical_colors {
+        content = content.push(section1).push(divider());
+    }
+    let content = content.push(
+        column![
+            grid_rows,
+            divider(),
+            section3,
+            divider(),
+            section4,
+            divider(),
+            section5,
+        ]
+        .spacing(6),
+    );
 
     container(content)
         .padding(Padding {
@@ -291,13 +314,30 @@ pub fn color_dropdown_panel<'a>(
             right: 12.0,
         })
         .width(Length::Fixed(PANEL_W))
-        .style(popup_panel_style)
+        .style(crate::ui::kit::menu::frame_style)
         .into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ribbon_layer_color_palette_routes_to_layer_and_hides_logical_colors() {
+        let mut ui = iced_test::simulator::Simulator::with_size(
+            iced::Settings::default(),
+            (220., 420.),
+            layer_color_dropdown_panel(AcadColor::Index(7), &[], "Walls".into()),
+        );
+        assert!(ui.find("ByLayer").is_err());
+        assert!(ui.find("ByBlock").is_err());
+        ui.click(t!("Select Color...").as_ref()).unwrap();
+        assert!(ui.into_messages().any(|m| matches!(
+            m,
+            Message::OpenColorWindow(crate::app::ColorPickTarget::RibbonLayer(layer), _)
+                if layer == "Walls"
+        )));
+    }
 
     #[test]
     fn test_quick_pick_grid_dimensions() {

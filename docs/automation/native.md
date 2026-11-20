@@ -33,13 +33,38 @@ Two request styles share the channel, told apart by the `protocol` field:
 
 | Style | Shape | Operations |
 |---|---|---|
-| protocol 1 | `{"protocol":1,"request_id":"…","document_id":N,"op":"…"}` — the same requests and replies as `ocs_execute` / `ocs_read`, described in the README | `new`, `open`, `save`, `save_verified`, `activate`, `select`, `run`, `start`, `input`, `cancel`, `stop`, `action`, `property`, `set_properties`, `embed_image`, `undo`, `redo`, `text_replace`; reads `state`, `capabilities`, `audit`, `text_audit`, `text_search`, `query`, `entities`, `records`, `record_schema`, `layers`, `header`, `properties`, `measure`, `history`, `commands`, `events`, `operation` |
-| legacy | `{"op":"…"}` without `protocol` | `new`, `open`, `run`, `entities`, `audit`, `query`, `records`, `record_schema`, `capabilities`, `layers`, `header`, `select`, `save`, `undo`, `redo` |
+| protocol 1 | `{"protocol":1,"request_id":"…","document_id":N,"op":"…"}` — the same requests and replies as `ocs_execute` / `ocs_read`, described in the README | `new`, `open`, `save`, `save_verified`, `activate`, `select`, `run`, `start`, `input`, `cancel`, `stop`, `action`, `property`, `set_properties`, `embed_image`, `dgn_import`, `entities_set`, `layout_create`, `layout_rename`, `layout_activate`, `layout_delete`, `page_setup_set`, `xref_reload`, `xref_unload`, `xref_detach`, `xref_bind`, `xref_set_path`, `xref_set_type`, `undo`, `redo`, `text_replace`; reads `state`, `capabilities`, `audit`, `text_audit`, `text_search`, `query`, `entities`, `records`, `record_schema`, `layers`, `layouts`, `xrefs`, `page_setup_get`, `header`, `properties`, `measure`, `history`, `commands`, `events`, `operation` |
+| legacy | `{"op":"…"}` without `protocol` | `new`, `open`, `run`, `entities`, `audit`, `query`, `records`, `record_schema`, `capabilities`, `layers`, `layouts`, `xrefs`, `page_setup_get`, `header`, `select`, `save`, `undo`, `redo` |
 
 The two styles differ in how a waiting command is treated. A protocol-1 `run`
 or `start` while a command is still active is refused with `command_busy`:
 continue it with `input` or drop it with `cancel`. A legacy `run` line ends the
 waiting command and starts the new one.
+
+### Protocol-1 `save` destinations
+
+Saving to the current drawing path keeps the fingerprint recorded when the
+drawing was opened and respects a known edit-lock conflict. Supplying that
+same path explicitly does not waive either check. Directory aliases are
+compared using the native path-matching rules.
+For a current-file symlink, the save replaces its resolved drawing target
+and preserves the symlink and logical document path. Relative references
+keep that logical path as their base. Directory aliases retain the
+current-file check even if the drawing was deleted externally.
+An alias with a different physical file extension is refused, so the
+writer cannot silently switch formats. The logical alias must still name
+the captured destination before placement and when a GUI save completes.
+
+A different existing destination is refused with `destination_exists` unless
+the native control request includes `"overwrite":true`. A new destination
+needs no overwrite acknowledgement. After a native Save As from A to B,
+a later control request naming A therefore needs explicit acknowledgement.
+The requirement to create a new file survives queued saves and is enforced
+atomically when the finished file is placed. If another application creates
+the destination first, the save fails and preserves that application's file.
+On Unix this uses a hard link beside the destination; a filesystem without
+hard-link support refuses the save rather than replacing an existing file.
+The MCP save schema and REST `/save` route do not yet expose `overwrite`.
 
 ### The legacy `run` line
 
@@ -139,6 +164,6 @@ For commands whose answers cannot be written on one line, use `start` and then
 |---|---|---|
 | measure | `{"protocol":1,"op":"measure","handles":["2A"]}` — kernel-computed length, area, bounds and mass properties; no window needed | `ocs_read` with `op: "measure"` and `parameters.handles` |
 | capture | `{"protocol":1,"op":"capture","path":"out.png"}` — needs the editor window, so it answers `gui_required` here | `ocs_capture` with `scope` (`viewport` or `window`) and `max_dimension` |
-| `set_properties` | requires `collection`; colours are the serialised enum — `{"Index": 1}` or `"ByLayer"`; a colour name such as `"Red"` is rejected with `invalid_value` | same request through `ocs_execute` |
+| `set_properties` | requires `collection`; a colour takes an index number (`3`; `0` ByBlock, `256` ByLayer), `{"rgb":[r,g,b]}`, or the serialised enum — `{"Index": 1}` or `"ByLayer"`; a colour name such as `"Red"` is rejected with `invalid_value` | same request through `ocs_execute` |
 | audit | `{"protocol":1,"op":"audit","target_format":"dwg","target_version":"2000"}` | `ocs_read` with `op: "audit"` and the same target parameters |
 | save verified | protocol-1 `save_verified` with absolute `path`, unique `request_id`, and target fields | `ocs_execute` with `op: "save_verified"`; returns hash, reopened version and semantic manifest |

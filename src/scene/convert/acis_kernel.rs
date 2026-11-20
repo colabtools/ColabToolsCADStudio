@@ -1,23 +1,20 @@
-//! Drawing an ACIS solid by lifting it into the geometry kernel.
+//! Drawing an ACIS solid by reading it into Solidcore records and meshing them.
 //!
-//! A DWG or DXF carries its solids as ACIS records — analytic surfaces and the
-//! topology joining them — and the kernel holds exactly that. So the shortest
-//! path from a file to a picture is to lift the document into a `Body` and ask
-//! the kernel for triangles, rather than to re-derive each surface's extent by
-//! sampling it.
+//! A DWG or DXF carries its solids as ACIS records — analytic surfaces and the topology joining
+//! them — and a Solidcore record holds exactly that, so the shortest path from a file to a
+//! picture is to read the document into records and ask Solidcore's mesher for triangles.
 //!
-//! Lift and tessellation failures are reported as an incomplete result.
+//! Read and mesh failures are reported as an incomplete result.
 
-use kernel::acis::lift;
-use codec::entities::acis::SatDocument;
-use kernel::brep;
+use document::entities::acis::SatDocument;
+use ocs_solid::lift;
 
-use crate::scene::convert::solid3d_tess::{body_transform, finalize_mesh};
+use crate::scene::convert::solid3d_tess::finalize_mesh;
 use crate::scene::model::mesh_model::{CurvedGen, MeshLodSet};
+use crate::scene::model::silhouette::SilhouetteSource;
+use crate::scene::model::solid_model::{self, DisplayTolerance};
 
-const DEFAULT_FIT_TOLERANCE: f64 = 1e-6;
-
-/// Tessellate an ACIS document through the kernel.
+/// Tessellate an ACIS document through Solidcore.
 pub fn tessellate_sat(
     document: &SatDocument,
     name: String,
@@ -25,72 +22,59 @@ pub fn tessellate_sat(
     facet_res: f64,
     chordal_deflection: Option<f64>,
     isolines: [usize; 2],
-    planar_isolines: bool,
+    planar_isolines: Option<bool>,
 ) -> Option<MeshLodSet> {
     let (bodies, loss) = lift(document);
     if bodies.is_empty() {
         return None;
     }
-    let mut placed_bodies = Vec::with_capacity(bodies.len());
-    for body in bodies {
-        let source = body.provenance.source()?;
-        let transform = body_transform(document, source.index() as usize).ok()?;
-        let placement_scale = transform.map_or(1.0, |(_, _, scale)| scale.abs());
-        let placed = if let Some((matrix, translation, scale)) = transform {
-            let placement = brep::Placement {
-                x_axis: [scale * matrix[0], scale * matrix[1], scale * matrix[2]],
-                y_axis: [scale * matrix[3], scale * matrix[4], scale * matrix[5]],
-                z_axis: [scale * matrix[6], scale * matrix[7], scale * matrix[8]],
-                origin: translation,
-            };
-            brep::transform(&body, &placement)?
-        } else {
-            body
-        };
-        placed_bodies.push((placed, placement_scale));
-    }
-    let bodies = placed_bodies;
-    let resolution = if facet_res.is_finite() && facet_res > 0.0 {
-        facet_res.clamp(0.01, 10.0)
-    } else {
-        1.0
+    let max_angle = match chordal_deflection {
+        Some(_) => solid_model::display_angle_for_resolution(facet_res),
+        None => solid_model::angle_for_resolution(facet_res),
     };
-    let max_angle = chordal_deflection.map_or_else(
-        || kernel::tessellation::angle_for_resolution(resolution),
-        |_| kernel::tessellation::display_angle_for_resolution(resolution),
-    );
 
-    // Positions stay f64 until `finalize_mesh` splits them into the coarse
-    // and fine pair, so a solid at survey coordinates keeps its millimetres.
+    // Positions stay f64 until `finalize_mesh` splits them into the coarse and fine pair, so a
+    // solid at survey coordinates keeps its millimetres.
     let mut positions: Vec<[f64; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     let mut edges: Vec<[f64; 3]> = Vec::new();
+    let mut edge_colors: Vec<Option<[f32; 4]>> = Vec::new();
     let mut triangle_materials = Vec::new();
     let mut triangle_colors = Vec::new();
     let mut curved_gens = Vec::new();
-    let face_materials: std::collections::HashMap<i32, codec::Handle> = document
+    let face_materials: std::collections::HashMap<i32, document::Handle> = document
         .records
         .iter()
         .filter(|record| record.entity_type == "material-adesk-attrib")
         .filter_map(|record| {
             let owner = record.token_pointer(2)?.0;
             let handle = record.token(3)?.as_integer()?;
-            (owner >= 0 && handle > 0)
-                .then(|| (owner, codec::Handle::new(handle as u64)))
+            (owner >= 0 && handle > 0).then(|| (owner, document::Handle::new(handle as u64)))
         })
         .collect();
+    // A true colour attribute outranks the index one beside it, which only
+    // holds its nearest index.
     let face_colors: std::collections::HashMap<i32, [f32; 4]> = document
         .records
         .iter()
         .filter(|record| record.entity_type == "color-adesk-attrib")
+        .chain(
+            document
+                .records
+                .iter()
+                .filter(|record| record.entity_type == "truecolor-adesk-attrib"),
+        )
         .filter_map(|record| {
             let owner = record.token_pointer(2)?.0;
-            let value = record.token(3)?.as_integer()?;
+            let mut value = record.token(3)?.as_integer()?;
+            if record.entity_type == "truecolor-adesk-attrib" {
+                value = (value & 0x00FF_FFFF) | 0x0100_0000;
+            }
             let source = if (1..=255).contains(&value) {
-                codec::Color::from_index(value as i16)
+                document::Color::from_index(value as i16)
             } else if value > 257 {
-                codec::Color::from_true_color_value(value as i32)
+                document::Color::from_true_color_value(value as i32)
             } else {
                 return None;
             };
@@ -99,64 +83,39 @@ pub fn tessellate_sat(
             Some((owner, rgba))
         })
         .collect();
-    // A face the kernel holds but cannot express in its surface's own
-    // parameters leaves a hole, the same as one that never lifted — so both
+    // A face Solidcore cannot mesh leaves a hole, the same as one that never read — so both
     // are counted before calling the mesh whole.
     let mut undrawn = 0usize;
-    let source_fit = if document.header.spatial_resolution.is_finite()
-        && document.header.spatial_resolution > 0.0
-    {
-        document.header.spatial_resolution
-    } else {
-        DEFAULT_FIT_TOLERANCE
-    };
-    for (body, placement_scale) in &bodies {
-        let mut tolerance = brep::mesh::TessellationTolerance::new(
-            max_angle,
-            source_fit * placement_scale,
-        )
-        .with_uv_isolines(isolines[0], isolines[1])
-        .with_planar_isolines(planar_isolines);
-        if let Some(deflection) = chordal_deflection {
-            tolerance = tolerance.with_chordal_deflection(deflection);
-        }
-        let tessellation = brep::mesh::tessellate(body, tolerance);
-        undrawn += tessellation.missing_faces.len();
-        for face in &tessellation.triangle_faces {
-            let record = body
-                .faces
-                .get(*face)
-                .and_then(|face| face.provenance.source())
-                .map(|source| source.index() as i32);
+    for body in &bodies {
+        let tolerance = DisplayTolerance::new(max_angle)
+            .with_isolines(isolines, planar_isolines)
+            .with_chord(chordal_deflection);
+        let Some(mesh) = solid_model::tessellate(&body.brep, tolerance) else {
+            undrawn += body.brep.faces.len().max(1);
+            continue;
+        };
+        undrawn += mesh.missing_faces.len();
+        for face in &mesh.triangle_faces {
+            let record = body.face_records.get(*face as usize).map(|r| *r as i32);
             triangle_materials.push(record.and_then(|record| face_materials.get(&record).copied()));
             triangle_colors.push(record.and_then(|record| face_colors.get(&record).copied()));
         }
         curved_gens.push(CurvedGen {
-            source: tessellation.silhouette_source(),
+            source: SilhouetteSource::of_mesh(&mesh.positions, &mesh.normals, &mesh.triangles, &mesh.triangle_faces),
         });
         let base = positions.len() as u32;
-        positions.extend_from_slice(&tessellation.mesh.positions);
-        normals.extend(
-            tessellation
-                .mesh
-                .normals
-                .iter()
-                .map(|n| [n[0] as f32, n[1] as f32, n[2] as f32]),
-        );
-        indices.extend(tessellation.mesh.triangles.iter().flat_map(|triangle| {
-            [
-                base + triangle[0] as u32,
-                base + triangle[1] as u32,
-                base + triangle[2] as u32,
-            ]
-        }));
-        for edge in tessellation.edges {
-            for segment in edge.positions.windows(2) {
+        positions.extend_from_slice(&mesh.positions);
+        normals.extend(mesh.normals.iter().map(|n| n.map(|v| v as f32)));
+        indices.extend(mesh.triangles.iter().flat_map(|t| t.map(|i| base + i as u32)));
+        for (_, points) in &mesh.edges {
+            for segment in points.windows(2) {
                 edges.extend_from_slice(segment);
+                edge_colors.push(None);
+                edge_colors.push(None);
             }
         }
-        for isoline in tessellation.isolines {
-            for segment in isoline.positions.windows(2) {
+        for (_, points) in &mesh.isolines {
+            for segment in points.windows(2) {
                 edges.extend_from_slice(segment);
             }
         }
@@ -180,11 +139,16 @@ pub fn tessellate_sat(
         None,
     ));
     if let [single] = bodies.as_slice() {
-        if let Some(properties) = brep::analytic_mass_properties(&single.0) {
-            set.apply_mass_properties(properties);
+        if ocs_solid::model::is_solid(&single.brep) {
+            if let Ok(estimate) = ocs_solid::model::mass_properties(&single.brep) {
+                set.apply_mass_properties(crate::scene::model::mass::MassProperties::from_estimate(&estimate));
+            }
         }
     }
     set.curved_gens = curved_gens;
+    if edge_colors.iter().any(Option::is_some) {
+        set.edge_vert_colors = edge_colors;
+    }
     for point in edges {
         let high = [point[0] as f32, point[1] as f32, point[2] as f32];
         set.edge_verts.push(high);
@@ -195,6 +159,7 @@ pub fn tessellate_sat(
         ]);
     }
     set.complete = loss.is_empty() && undrawn == 0;
+    set.build_display_lods();
     Some(set)
 }
 
@@ -257,5 +222,4 @@ mod tests {
         let moved = placed([0.0, 0.0, 0.0], quarter_turn());
         assert_eq!(moved, [10.0, 20.0, 30.0]);
     }
-
 }

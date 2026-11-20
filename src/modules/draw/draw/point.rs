@@ -3,9 +3,9 @@
 // Command:  POINT (PO)
 //   POINT commits one entity and exits. MULTIPOINT stays active.
 
-use codec::types::Vector3;
-use codec::{EntityType, Point as CadPoint};
 use crate::t;
+use document::types::Vector3;
+use document::{EntityType, Point as CadPoint};
 
 use crate::command::{CadCommand, CmdResult};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
@@ -26,6 +26,12 @@ pub struct PointCommand {
     multiple: bool,
 }
 
+impl Default for PointCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PointCommand {
     pub fn new() -> Self {
         Self { multiple: false }
@@ -38,7 +44,11 @@ impl PointCommand {
 
 impl CadCommand for PointCommand {
     fn name(&self) -> &'static str {
-        if self.multiple { "MULTIPOINT" } else { "POINT" }
+        if self.multiple {
+            "MULTIPOINT"
+        } else {
+            "POINT"
+        }
     }
     fn prompt(&self) -> String {
         crate::t!("POINT  Specify point:").into_owned()
@@ -55,7 +65,7 @@ impl CadCommand for PointCommand {
 
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
         let p = CadPoint {
-            location: Vector3::new(pt.x as f64, pt.y as f64, pt.z as f64),
+            location: Vector3::new(pt.x, pt.y, pt.z),
             ..Default::default()
         };
         if self.multiple {
@@ -76,10 +86,11 @@ impl CadCommand for PointCommand {
     }
 }
 
-
 // ── Autocomplete registry ─────────────────────────────────
-inventory::submit!(crate::command::CommandRegistration { names: &["POINT", "MULTIPOINT"] });  // PointCommand
-// Point display style system variables + dialog.
 inventory::submit!(crate::command::CommandRegistration {
-    names: &["PDMODE", "PDSIZE", "DDPTYPE"]
+    names: &["POINT", "MULTIPOINT"]
+}); // PointCommand
+    // Point display style system variables + dialog.
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["PDMODE", "PDSIZE", "DDPTYPE", "PTYPE"]
 });

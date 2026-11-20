@@ -16,12 +16,18 @@
 //! and must not block. For heavy work, forward the notification to a channel.
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::host::{HostApi, HostNotification, PluginNotification};
 use crate::process::{PluginError, PluginProcess};
-use crate::ribbon::owned::{to_shared_module, SharedCadModule};
+use crate::ribbon::owned::{to_shared_module, OwnedEntityClasses, SharedCadModule};
+
+/// Maximum notifications parked in the boot-window `attach.pending` queue
+/// (review finding 6): a plugin that never acks its ChannelReady cannot grow
+/// host memory without bound during the grace period.
+const MAX_PENDING_ATTACH: usize = 256;
 
 /// Callback the host installs to receive plugin-to-host notifications.
 pub type NotificationHandler = Arc<dyn Fn(&str, Option<u64>, PluginNotification) + Send + Sync>;
@@ -30,12 +36,50 @@ pub type NotificationHandler = Arc<dyn Fn(&str, Option<u64>, PluginNotification)
 pub struct PluginManager {
     plugins: Vec<LoadedPlugin>,
     notification_handler: Option<NotificationHandler>,
+    /// Ids of plugins whose spawn/bootstrap is IN FLIGHT (`load_with_expected_id`
+    /// began and has not returned): owner-scoped declarations (entity classes,
+    /// quad panels, custom grips) arrive as nested requests during that window —
+    /// the host is actively authenticated with the very process making them —
+    /// but the registry entry does not exist until the load returns, and the
+    /// empty-identity manifest call used to refuse them. Cleared when the load
+    /// finishes (entry inserted) or fails, so a marker never outlives a plugin.
+    booting: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 struct LoadedPlugin {
     process: Arc<PluginProcess>,
     module: SharedCadModule,
+    /// API v13 notification-attach state (interior: broadcasts reach the
+    /// manager through a shared reference): notifications to this process
+    /// are deferred (parked) until its runner acks
+    /// `PluginNotification::ChannelReady` — the main loop entered and is
+    /// draining — or the boot grace window expires (an older runner never
+    /// acks; the host cannot distinguish it from a slow boot, so after the
+    /// grace the queue flushes, exactly like the dispatch table's boot
+    /// retry heals the command side).
+    attach: std::sync::Mutex<NotificationAttach>,
 }
+
+/// Per-plugin notification-attach bookkeeping (API v13).
+#[derive(Default)]
+struct NotificationAttach {
+    attached: bool,
+    /// Boot grace deadline (set at spawn); `None` once attached or expired.
+    grace_deadline: Option<std::time::Instant>,
+    /// Set when the grace expired without an ack (logged once).
+    grace_expired: bool,
+    /// Deferred boot-window notifications, flushed on attach or grace.
+    pending: Vec<(Option<u64>, HostNotification)>,
+}
+
+/// The boot-grace window a runner has to ack `ChannelReady` before the
+/// host treats it as an older (never-acking) runner and flushes anyway.
+fn notification_boot_grace() -> std::time::Duration {
+    std::time::Duration::from_millis(NOTIFICATION_BOOT_GRACE_MS.load(Ordering::Relaxed))
+}
+
+static NOTIFICATION_BOOT_GRACE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(60_000);
 
 impl Default for PluginManager {
     fn default() -> Self {
@@ -56,12 +100,31 @@ pub struct DispatchResult {
     pub errors: Vec<(String, String)>,
 }
 
+/// The outcome of [`PluginManager::attach_notification_channel`] — honest
+/// diagnostics for the ChannelReady drain: the ambiguous case used to be
+/// indistinguishable from a successful attach in the log (both printed as
+/// "attached (0 deferred flushed)"), which masked the boot-death class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachOutcome {
+    /// The plugin's channel attached; N deferred boot notifications flushed.
+    Attached(usize),
+    /// A duplicate ack for an already-live channel; nothing to do.
+    AlreadyAttached,
+    /// An empty-id ack with several unattached candidates: ambiguous — the
+    /// ack cannot name its plugin, nothing attached; the boot grace is the
+    /// fallback (its flush path logs separately).
+    Ambiguous(usize),
+    /// No loaded plugin carries this id (a stale ack after an unload).
+    UnknownPlugin,
+}
+
 impl PluginManager {
     /// Create an empty manager.
     pub fn new() -> Self {
         Self {
             plugins: Vec::new(),
             notification_handler: None,
+            booting: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -80,41 +143,170 @@ impl PluginManager {
         cdylib_path: &Path,
         host: &mut dyn HostApi,
     ) -> Result<String, PluginError> {
+        self.load_with_expected_id(cdylib_path, None, host)
+    }
+
+    /// Like [`PluginManager::load`], but with the package's expected plugin id:
+    /// the runner's self-declared manifest id must match (the transport stays
+    /// the verified identity), the id must not collide with an already-loaded
+    /// plugin, and the spawn bootstrap's declaration window carries it.
+    pub fn load_with_expected_id(
+        &mut self,
+        cdylib_path: &Path,
+        expected_id: Option<&str>,
+        host: &mut dyn HostApi,
+    ) -> Result<String, PluginError> {
+        if let Some(expected) = expected_id {
+            if self
+                .plugins
+                .iter()
+                .any(|p| p.process.id().eq_ignore_ascii_case(expected))
+            {
+                return Err(PluginError::Runner(format!(
+                    "a plugin with id `{expected}` is already loaded; refusing duplicate \
+                     registration"
+                )));
+            }
+        }
         let handler: NotificationHandler = match self.notification_handler.as_ref() {
             Some(h) => Arc::clone(h),
             None => Arc::new(|_id, _cmd, _notif| {}),
         };
-        let process = PluginProcess::spawn(cdylib_path, host, handler)?;
-        let id = process.id().to_string();
-        let name = process.manifest().name.clone();
-        let module = to_shared_module(id.clone(), name, process.ribbon().to_vec());
-        self.plugins.push(LoadedPlugin {
-            process: Arc::new(process),
-            module,
-        });
-        Ok(id)
+        // The spawn bootstrap IS the declaration window: quad panels/classes/
+        // grips register while GetManifest is still in flight (the spawn
+        // attributes them to the package-declared id). Mark the boot so the
+        // declaration law sees a live transport; every exit path closes it.
+        let booting: Option<String> = expected_id.map(str::to_string);
+        if let Some(id) = &booting {
+            self.begin_boot(id);
+        }
+        let load = (|| {
+            let process = PluginProcess::spawn(cdylib_path, host, handler, expected_id)?;
+            let id = process.id().to_string();
+            if self
+                .plugins
+                .iter()
+                .any(|p| p.process.id().eq_ignore_ascii_case(&id))
+            {
+                process.shutdown();
+                return Err(PluginError::Runner(format!(
+                    "a plugin with id `{id}` is already loaded; refusing duplicate registration"
+                )));
+            }
+            let name = process.manifest().name.clone();
+            let module = to_shared_module(id.clone(), name, process.ribbon().to_vec());
+            self.plugins.push(LoadedPlugin {
+                process: Arc::new(process),
+                module,
+                attach: std::sync::Mutex::new(NotificationAttach {
+                    grace_deadline: Some(std::time::Instant::now() + notification_boot_grace()),
+                    ..Default::default()
+                }),
+            });
+            Ok(id)
+        })();
+        if let Some(id) = &booting {
+            self.end_boot(id);
+        }
+        load
     }
 
     /// Fan out a host notification to every alive V4 plugin. Per-process errors
     /// are logged; this is best-effort.
-    pub fn broadcast_notification(
+    ///
+    /// API v13 attach determinism: a process whose runner has not acked
+    /// `PluginNotification::ChannelReady` yet gets the notification DEFERRED
+    /// (parked, flushed on attach) — a fresh boot's notifications can never
+    /// race the runner's startup and vanish. The boot grace bounds the
+    /// deferral for older runners that never ack: past the deadline the
+    /// queue flushes once (logged), and the process is treated as attached
+    /// from then on.
+    pub fn broadcast_notification(&self, command_id: Option<u64>, notification: HostNotification) {
+        self.broadcast_for_api(command_id, &|_| Some(notification.clone()));
+    }
+
+    /// Fan out a notification chosen PER PLUGIN by its manifest API major
+    /// (`None` skips the endpoint entirely). Same deferral/boot-window
+    /// semantics and best-effort error handling as
+    /// [`Self::broadcast_notification`]; the per-endpoint choice lets a v22+
+    /// plugin receive an O(1) digest while pre-v22 plugins keep the exact
+    /// legacy streams.
+    pub fn broadcast_for_api(
         &self,
         command_id: Option<u64>,
-        notification: HostNotification,
+        for_api: &dyn Fn(u32) -> Option<HostNotification>,
     ) {
         for p in &self.plugins {
-            if !p.process.is_alive() {
+            if !p.process.is_alive() || !p.process.is_v4() {
                 continue;
             }
-            if !p.process.is_v4() {
-                if crate::process::verbose() {
-                    eprintln!(
-                        "[plugin] skipping notification for {} (not V4)",
-                        p.process.id()
-                    );
+            let notification = match for_api(p.process.manifest().api_version) {
+                Some(notification) => notification,
+                None => continue,
+            };
+            let flush_now = {
+                let mut attach = p.attach.lock().unwrap_or_else(|e| e.into_inner());
+                if attach.attached {
+                    false
+                } else if attach
+                    .grace_deadline
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                {
+                    // Boot grace expired: an older runner never acks. Flush
+                    // the parked boot window once (logged) and treat the
+                    // channel as live from here on.
+                    if !attach.grace_expired {
+                        attach.grace_expired = true;
+                        eprintln!(
+                            "[plugin] {} did not ack ChannelReady within the boot grace; \
+                             flushing {} deferred notifications (older runner assumed)",
+                            p.process.id(),
+                            attach.pending.len()
+                        );
+                    }
+                    attach.attached = true;
+                    attach.grace_deadline = None;
+                    let pending = std::mem::take(&mut attach.pending);
+                    for (cid, deferred) in pending {
+                        if let Err(e) = p.process.notify_plugin(cid, deferred) {
+                            eprintln!(
+                                "[plugin] deferred notification flush failed for {}: {e}",
+                                p.process.id()
+                            );
+                        }
+                    }
+                    // The new notification follows below through the normal
+                    // send path.
+                    true
+                } else {
+                    // Bounded park (review finding 6): a never-acking plugin
+                    // during the boot grace cannot grow host memory without
+                    // bound; the OLDEST parked is dropped (the plugin's
+                    // listener never saw it anyway).
+                    if attach.pending.len() >= MAX_PENDING_ATTACH {
+                        attach.pending.remove(0);
+                        if crate::process::verbose() {
+                            eprintln!(
+                                "[plugin] dropped the oldest boot-window notification for {} \
+                                 ({} parked)",
+                                p.process.id(),
+                                attach.pending.len()
+                            );
+                        }
+                    }
+                    attach.pending.push((command_id, notification.clone()));
+                    if crate::process::verbose() {
+                        eprintln!(
+                            "[plugin] deferring notification for {} until ChannelReady \
+                             ({} parked)",
+                            p.process.id(),
+                            attach.pending.len()
+                        );
+                    }
+                    continue;
                 }
-                continue;
-            }
+            };
+            let _ = flush_now;
             if let Err(e) = p.process.notify_plugin(command_id, notification.clone()) {
                 eprintln!(
                     "[plugin] broadcast_notification failed for {}: {e}",
@@ -122,6 +314,129 @@ impl PluginManager {
                 );
             }
         }
+    }
+
+    /// Selection-boundary router (v22): API-22+ endpoints receive the O(1)
+    /// `SelectionChangedDigest`; older endpoints keep the tab-tagged handle
+    /// list (`SelectionChangedV4`) and, when `legacy_plain` is set (the app's
+    /// own selection boundary), the plain `SelectionChanged` after it, as
+    /// before v22.
+    pub fn broadcast_selection_changed(
+        &self,
+        tab_id: u64,
+        handles: &[crate::ipc::protocol::Handle],
+        revision: u64,
+        legacy_plain: bool,
+    ) {
+        let count = handles.len() as u64;
+        self.broadcast_for_api(None, &|api: u32| match api {
+            22.. => Some(HostNotification::SelectionChangedDigest {
+                tab_id,
+                revision,
+                count,
+            }),
+            _ => Some(HostNotification::SelectionChangedV4 {
+                tab_id,
+                handles: handles.to_vec(),
+            }),
+        });
+        if legacy_plain {
+            self.broadcast_for_api(None, &|api: u32| {
+                (api < 22).then(|| HostNotification::SelectionChanged {
+                    handles: handles.to_vec(),
+                })
+            });
+        }
+    }
+
+    /// Mark a plugin's notification channel verifiably live and flush every
+    /// notification deferred during its boot window (API v13). Called when
+    /// the runner acks `PluginNotification::ChannelReady`.
+    pub fn attach_notification_channel(&self, plugin_id: &str) -> AttachOutcome {
+        // A handshake-window ack may reach the reader thread before the spawn
+        // thread has pinned the manifest id (the empty placeholder id): the
+        // ack itself is what proves the channel is live, so attach by
+        // elimination — but only when exactly one plugin waits. With several
+        // booting at once the ack is ambiguous; the boot grace covers them.
+        if plugin_id.is_empty() {
+            let unattached =
+                |p: &&LoadedPlugin| !p.attach.lock().unwrap_or_else(|e| e.into_inner()).attached;
+            let mut waiting = self
+                .plugins
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| unattached(p))
+                .map(|(index, _)| index);
+            return match (waiting.next(), waiting.next()) {
+                (Some(index), None) => self.attach_by_index(index),
+                (None, _) => AttachOutcome::AlreadyAttached,
+                (_, _) => AttachOutcome::Ambiguous(self.plugins.iter().filter(unattached).count()),
+            };
+        }
+        match self
+            .plugins
+            .iter()
+            .position(|p| p.process.id() == plugin_id)
+        {
+            Some(index) => self.attach_by_index(index),
+            None => AttachOutcome::UnknownPlugin,
+        }
+    }
+
+    /// Attach one plugin by index (shared helper).
+    fn attach_by_index(&self, index: usize) -> AttachOutcome {
+        let p = &self.plugins[index];
+        let pending = {
+            let mut attach = p.attach.lock().unwrap_or_else(|e| e.into_inner());
+            if attach.attached {
+                // A second ack (runner restart on the same process, a
+                // duplicate frame): idempotent, nothing deferred.
+                return AttachOutcome::AlreadyAttached;
+            }
+            attach.attached = true;
+            attach.grace_deadline = None;
+            std::mem::take(&mut attach.pending)
+        };
+        let flushed = pending.len();
+        if flushed > 0 {
+            eprintln!(
+                "[plugin] {} acked ChannelReady; flushing {} deferred boot notifications",
+                p.process.id(),
+                flushed
+            );
+        }
+        for (command_id, notification) in pending {
+            if let Err(e) = p.process.notify_plugin(command_id, notification) {
+                eprintln!(
+                    "[plugin] deferred notification flush failed for {}: {e}",
+                    p.process.id()
+                );
+            }
+        }
+        AttachOutcome::Attached(flushed)
+    }
+
+    /// Whether a plugin's notification channel has been acked live (or the
+    /// boot grace has passed for an older runner).
+    pub fn notification_channel_attached(&self, plugin_id: &str) -> Option<bool> {
+        self.plugins
+            .iter()
+            .find(|p| p.process.id() == plugin_id)
+            .map(|p| p.attach.lock().unwrap_or_else(|e| e.into_inner()).attached)
+    }
+
+    /// Deferred-boot-notification count for one plugin (diagnostics).
+    pub fn pending_notification_count(&self, plugin_id: &str) -> Option<usize> {
+        self.plugins
+            .iter()
+            .find(|p| p.process.id() == plugin_id)
+            .map(|p| {
+                p.attach
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending
+                    .len()
+            })
     }
 
     /// Ribbon modules for alive, non-disabled plugins, sorted by `ribbon_order`.
@@ -183,6 +498,76 @@ impl PluginManager {
             .collect()
     }
 
+    /// The process of the loaded plugin `id`, for host calls that outlive a
+    /// manager borrow (AI tool calls serve nested HostApi requests).
+    pub fn process(&self, id: &str) -> Option<Arc<PluginProcess>> {
+        self.plugins
+            .iter()
+            .find(|p| p.process.id() == id)
+            .map(|p| Arc::clone(&p.process))
+    }
+
+    /// Ids of loaded plugins whose processes are currently alive (API v11).
+    pub fn alive_ids(&self) -> Vec<String> {
+        self.plugins
+            .iter()
+            .filter(|p| p.process.is_alive())
+            .map(|p| p.process.id().to_string())
+            .collect()
+    }
+
+    /// Live endpoint of one loaded plugin for custom-grip event routing (API
+    /// v11): its process handle, its declared API version, and whether the
+    /// process is alive. `None` when no plugin with that id is loaded.
+    pub fn grip_endpoint(&self, id: &str) -> Option<(Arc<PluginProcess>, u32, bool)> {
+        self.plugins.iter().find(|p| p.process.id() == id).map(|p| {
+            (
+                Arc::clone(&p.process),
+                p.process.manifest().api_version,
+                p.process.is_alive(),
+            )
+        })
+    }
+
+    /// Mark a plugin's boot as in flight: between this and [`Self::end_boot`],
+    /// the owner-scoped declaration laws treat `id` as a live, authenticated
+    /// transport (the spawn is actively talking to that process — see the
+    /// struct docs for `booting`). Callers must pair this with `end_boot` on
+    /// every return path (a leaked marker would make a never-loaded id
+    /// declare owner-scoped state forever).
+    pub fn begin_boot(&self, id: &str) {
+        self.booting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string());
+    }
+
+    /// Close the in-flight boot marker for `id` (idempotent).
+    pub fn end_boot(&self, id: &str) {
+        self.booting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+    }
+
+    /// Whether owner-scoped declarations from `id` are attributable to a real,
+    /// current transport: either the loaded registry entry is alive, or the
+    /// plugin's spawn/bootstrap is in flight right now (its manifest will
+    /// confirm the id before the load returns). This is the declaration law's
+    /// gate ONLY — grip event routing keeps the stricter live-channel check.
+    pub fn declaration_endpoint_alive(&self, id: &str) -> bool {
+        if self
+            .grip_endpoint(id)
+            .is_some_and(|(_, _, alive)| alive)
+        {
+            return true;
+        }
+        self.booting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+    }
+
     /// Command names advertised by every alive, non-disabled plugin: each
     /// ribbon tool's command id plus the manifest's `command_prefixes`. The
     /// host merges these into command-line autocomplete so plugin commands are
@@ -197,6 +582,29 @@ impl PluginManager {
                 out.append(&mut group.command_ids());
             }
             out.extend(p.process.manifest().command_prefixes.iter().cloned());
+        }
+        out
+    }
+
+    /// Entity-class declarations of every alive, non-disabled plugin that
+    /// made one (API v10), in load order, as `(plugin id, declaration)`.
+    ///
+    /// The host consults this at display time only — never cached — so the
+    /// result always mirrors the live loaded set: a plugin that failed to
+    /// load, is disabled, was removed, or whose process has died contributes
+    /// nothing, and entities it stamped fall back to their native type names.
+    pub fn entity_class_declarations<F: Fn(&str) -> bool>(
+        &self,
+        is_disabled: F,
+    ) -> Vec<(String, OwnedEntityClasses)> {
+        let mut out = Vec::new();
+        for p in &self.plugins {
+            if is_disabled(p.process.id()) || !p.process.is_alive() {
+                continue;
+            }
+            if let Some(classes) = p.process.manifest().entity_classes.clone() {
+                out.push((p.process.id().to_string(), classes));
+            }
         }
         out
     }
@@ -223,9 +631,11 @@ impl PluginManager {
     pub fn drain_io(&self) -> Vec<crate::process::PluginIoLine> {
         let mut out = Vec::new();
         for p in &self.plugins {
-            if !p.process.is_alive() {
-                continue;
-            }
+            // NO is_alive gate: the "dead" flag can be set by a mere call
+            // timeout while the OS runner is alive and its stderr holds the
+            // ONLY trace of the hang (e.g. a plugin's dispatch echo never
+            // printed anywhere else). A dead process's pipes drain EOF
+            // instantly, so the un-gated drain costs nothing.
             out.extend(p.process.drain_io());
         }
         out
@@ -286,10 +696,10 @@ mod tests {
                 0
             }
             fn for_each_entity(&self, _f: &mut dyn FnMut(crate::host::ReaderEntity<'_>)) {}
-            fn layer_name(&self, _handle: codec::Handle) -> Option<&str> {
+            fn layer_name(&self, _handle: document::Handle) -> Option<&str> {
                 None
             }
-            fn app_id_name(&self, _handle: codec::Handle) -> Option<&str> {
+            fn app_id_name(&self, _handle: document::Handle) -> Option<&str> {
                 None
             }
         }
@@ -299,34 +709,34 @@ mod tests {
             fn tab_index(&self) -> usize {
                 0
             }
-            fn document(&self) -> &codec::CadDocument {
+            fn document(&self) -> &document::Document {
                 panic!("not used")
             }
-            fn document_mut(&mut self) -> &mut codec::CadDocument {
+            fn document_mut(&mut self) -> &mut document::Document {
                 panic!("not used")
             }
             fn document_reader(&self) -> Box<dyn crate::host::DocumentReader + '_> {
                 Box::new(EmptyReader)
             }
-            fn add_entity(&mut self, _entity: codec::EntityType) -> codec::Handle {
+            fn add_entity(&mut self, _entity: document::EntityType) -> document::Handle {
                 panic!("not used")
             }
             fn bump_geometry(&mut self) {}
             fn read_record(
                 &self,
-                _handle: codec::Handle,
+                _handle: document::Handle,
                 _app_name: &str,
-            ) -> Option<&codec::xdata::ExtendedDataRecord> {
+            ) -> Option<&document::xdata::ExtendedDataRecord> {
                 None
             }
             fn write_record(
                 &mut self,
-                _handle: codec::Handle,
-                _record: codec::xdata::ExtendedDataRecord,
+                _handle: document::Handle,
+                _record: document::xdata::ExtendedDataRecord,
             ) -> bool {
                 false
             }
-            fn remove_record(&mut self, _handle: codec::Handle, _app_name: &str) -> bool {
+            fn remove_record(&mut self, _handle: document::Handle, _app_name: &str) -> bool {
                 false
             }
             fn push_undo(&mut self, _label: &str) {}
@@ -351,8 +761,8 @@ mod tests {
                 &mut self,
                 _plugin_id: &'static str,
                 _init: &mut dyn FnMut() -> Box<dyn std::any::Any + Send + Sync>,
-            ) -> &mut (dyn std::any::Any + Send + Sync) {
-                panic!("not used")
+            ) -> Option<&mut (dyn std::any::Any + Send + Sync)> {
+                None
             }
         }
 
@@ -361,5 +771,120 @@ mod tests {
         let result = manager.dispatch(&mut host, "FOO", |_| false);
         assert!(!result.handled);
         assert!(result.started.is_none());
+    }
+
+    fn manifest_with_entity_classes(id: &str) -> crate::ribbon::owned::OwnedPluginManifest {
+        crate::ribbon::owned::OwnedPluginManifest {
+            id: id.to_string(),
+            name: format!("{id} name"),
+            version: "0.1.0".to_string(),
+            description: "test".to_string(),
+            api_version: 10,
+            ribbon_order: 0,
+            xdata_apps: vec![],
+            command_prefixes: vec![],
+            entity_classes: Some(OwnedEntityClasses {
+                app_id: "CVIFC".to_string(),
+                class_prefix: "CVIFC-CLASS:".to_string(),
+                labels: [("LINE".to_string(), "Linear Element".to_string())]
+                    .into_iter()
+                    .collect(),
+            }),
+        }
+    }
+
+    fn plain_manifest(id: &str) -> crate::ribbon::owned::OwnedPluginManifest {
+        crate::ribbon::owned::OwnedPluginManifest {
+            id: id.to_string(),
+            name: format!("{id} name"),
+            version: "0.1.0".to_string(),
+            description: "test".to_string(),
+            api_version: 10,
+            ribbon_order: 0,
+            xdata_apps: vec![],
+            command_prefixes: vec![],
+            entity_classes: None,
+        }
+    }
+
+    #[test]
+    fn entity_class_declarations_skip_disabled_and_undeclaring_plugins() {
+        let mut manager = PluginManager::new();
+        manager.plugins.push(LoadedPlugin {
+            process: Arc::new(PluginProcess::fake(manifest_with_entity_classes(
+                "test.live",
+            ))),
+            module: to_shared_module("test.live".into(), "Live".into(), vec![]),
+            attach: std::sync::Mutex::new(NotificationAttach {
+                grace_deadline: Some(std::time::Instant::now() + notification_boot_grace()),
+                ..Default::default()
+            }),
+        });
+        manager.plugins.push(LoadedPlugin {
+            process: Arc::new(PluginProcess::fake(plain_manifest("test.plain"))),
+            module: to_shared_module("test.plain".into(), "Plain".into(), vec![]),
+            attach: std::sync::Mutex::new(NotificationAttach {
+                grace_deadline: Some(std::time::Instant::now() + notification_boot_grace()),
+                ..Default::default()
+            }),
+        });
+        manager.plugins.push(LoadedPlugin {
+            process: Arc::new(PluginProcess::fake(manifest_with_entity_classes(
+                "test.off",
+            ))),
+            module: to_shared_module("test.off".into(), "Off".into(), vec![]),
+            attach: std::sync::Mutex::new(NotificationAttach {
+                grace_deadline: Some(std::time::Instant::now() + notification_boot_grace()),
+                ..Default::default()
+            }),
+        });
+
+        // Alive + enabled + declaring → reported, with the declaration intact.
+        let declarations = manager.entity_class_declarations(|id| id == "test.off");
+        assert_eq!(
+            declarations.len(),
+            1,
+            "only the live, enabled plugin reports"
+        );
+        assert_eq!(declarations[0].0, "test.live");
+        assert_eq!(declarations[0].1.app_id, "CVIFC");
+        assert_eq!(declarations[0].1.class_prefix, "CVIFC-CLASS:");
+        assert_eq!(
+            declarations[0].1.labels.get("LINE").map(String::as_str),
+            Some("Linear Element")
+        );
+
+        // Everything disabled → nothing contributes.
+        assert!(manager.entity_class_declarations(|_| true).is_empty());
+    }
+
+    #[test]
+    fn entity_class_declarations_revert_when_the_plugin_process_dies() {
+        let mut manager = PluginManager::new();
+        manager.plugins.push(LoadedPlugin {
+            process: Arc::new(PluginProcess::fake(manifest_with_entity_classes(
+                "test.live",
+            ))),
+            module: to_shared_module("test.live".into(), "Live".into(), vec![]),
+            attach: std::sync::Mutex::new(NotificationAttach {
+                grace_deadline: Some(std::time::Instant::now() + notification_boot_grace()),
+                ..Default::default()
+            }),
+        });
+        assert_eq!(
+            manager.entity_class_declarations(|_| false).len(),
+            1,
+            "declaration visible while the process is alive"
+        );
+
+        manager.plugins[0]
+            .process
+            .shutdown_and_wait(Duration::from_secs(5))
+            .expect("child shut down");
+
+        assert!(
+            manager.entity_class_declarations(|_| false).is_empty(),
+            "a dead plugin process must contribute no declarations"
+        );
     }
 }

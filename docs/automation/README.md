@@ -11,14 +11,55 @@ Every native OpenCADStudio build contains the same MCP server as the editor. `Op
 OpenCADStudio --mcp
 ```
 
-The client must start that command over standard input/output. If it asks for the executable and arguments separately, select the installed `OpenCADStudio` executable and enter `--mcp` as its only argument. The exact registration screen or configuration location belongs to the client. Once connected, the four tools below should appear in the client's MCP tool list.
+The copy button next to the **MCP** button in the command line copies a ready-to-paste `mcpServers` entry with the path of the running install, and prints the matching `claude mcp add` line in the command history. The client must start that command over standard input/output. If it asks for the executable and arguments separately, select the installed `OpenCADStudio` executable and enter `--mcp` as its only argument. The exact registration screen or configuration location belongs to the client. Once connected, the 20 tools below should appear in the client's MCP tool list.
 
-The server provides four tools:
+The server provides four general-purpose tools:
 
 - `ocs_sessions` finds running editor sessions and opens OpenCADStudio when none exists.
 - `ocs_read` discovers capabilities and reads document state, complete database records, command manifests, entities, properties, kernel measurements and spatial relationships, history, events, and operation status.
 - `ocs_execute` performs one operation, an atomic record update, or a sequential batch against the real editor.
 - `ocs_capture` returns a bounded PNG of the drawing viewport or complete window.
+
+It also provides 16 intent tools for common work:
+
+| Inspect | Change | Render |
+|---|---|---|
+| `ocs_inspect`, `ocs_query`, `ocs_find_text` | `ocs_run`, `ocs_new`, `ocs_open`, `ocs_save` | `ocs_render` |
+| `ocs_audit`, `ocs_commands`, `ocs_measure` | `ocs_save_verified`, `ocs_select`, `ocs_cancel` | |
+| | `ocs_undo`, `ocs_redo` | |
+
+Intent tools accept their operation arguments directly. When exactly one editor
+session is available, `ocs_session_id` is optional; pass it when several are
+open. Execute intents also make `request_id` optional and generate one when it
+is missing. Pass your own ID and reuse it with the identical request when a
+mutation must be retried safely. Automatic IDs preserve the existing
+idempotency mechanism, but they cannot make a retry safe without knowing the
+key.
+
+`ocs_render` is the low-friction drawing view. It delegates to the capture
+implementation and frames to extents by default. Use `ocs_capture` for tiles,
+window capture, and resource delivery. `ocs_read` and `ocs_execute`
+remain the full-control surface for advanced operations and explicit envelopes.
+
+A complete drawing and verification flow needs no session or request IDs:
+
+```json
+{"name":"ocs_new","arguments":{}}
+{"name":"ocs_run","arguments":{"command":"LINE 0,0 10,0"}}
+{"name":"ocs_run","arguments":{"command":"CIRCLE 5,5 2"}}
+{"name":"ocs_inspect","arguments":{}}
+{"name":"ocs_query","arguments":{"type":"Circle"}}
+{"name":"ocs_render","arguments":{}}
+```
+
+### Stale sessions clean themselves up
+
+Dead editor sessions used to leave descriptor files behind that slowed down
+session discovery. Discovery now skips processes that are gone (and removes
+their leftover files), and a bridge started from an older build exits on its
+own once it detects a rebuild so the client starts a fresh one. No action is
+needed on your side; if a client reports version errors after an upgrade,
+reconnecting its MCP servers picks up the new build.
 
 Run `python docs/automation/mcp_acceptance.py target/debug/OpenCADStudio.exe`
 for a repeatable end-to-end acceptance. It creates visible geometry through
@@ -37,7 +78,7 @@ Native builds also accept a second, headless entry point (`OpenCADStudio --serve
 JSON request per line) for scripts and CI; the two native channels, their startup dialogs
 and their limits are described in [native.md](native.md).
 
-The normal flow is to call `ocs_sessions`, pass its returned `session_id` as `ocs_session_id` to the other tools, read the chosen session with `ocs_read`, then pass the returned document state into `ocs_execute`. For example, an undo request has this shape:
+For the full-control flow, call `ocs_sessions`, pass its returned `session_id` as `ocs_session_id` to the other facade tools, read the chosen session with `ocs_read`, then pass the returned document state into `ocs_execute`. For example, an undo request has this shape:
 
 ```json
 {
@@ -182,6 +223,22 @@ Use `batch` when the steps are already known. OCS supplies each step with the st
 
 Execute responses use `response_detail: "compact"` by default and return only the state needed for the next edit. Use `changed_entities` to receive the current geometry of affected handles in the same response, or `full` when the complete editor state is needed.
 
+For large batches, use `response_detail: "summary"`. It omits the full step
+results and change list, returning step counts, `failed_steps`, `change_count`,
+compact final state and a `details` tool request. `change_count` counts change
+records, not unique entities. Warnings, failed or waiting-input steps in
+`attention`, and any `active_step` are retained so the next action remains clear.
+For non-batch operations, `summary` behaves like `compact`.
+
+To inspect the retained full result, call the tool and arguments in `details`:
+`ocs_read` with the same `ocs_session_id`, `op: "batch_result"`, and
+`parameters: {"request_id": "<original batch request_id>"}`. This reads a cached
+snapshot without executing or resuming any step. Results are retained in the
+originating MCP connection, for up to 64 batches per session; after eviction or
+reconnection the read fails explicitly. Do not replay a mutation merely to
+retrieve expired details. A `running` snapshot is not completion; resume work
+through the existing batch retry/task workflow.
+
 `ocs_read` query accepts exact handles, type/layer filters, field projection, world-XY bounds, nearest-curve ranking, closed-curve containment, and exact intersections between two planar curves. `detail: "full"` adds the complete serialized entity properties. Nearest points, containment, curve length, area, and intersections are calculated by the geometry kernel:
 
 ```json
@@ -217,6 +274,12 @@ same input typed into the GUI command line would: one `Text` entity, nothing
 unconsumed, and the command closed rather than left armed for a second line. Geometry stays in OpenCADStudio and its geometry kernel.
 
 `ocs_capture` defaults to the drawing viewport and a longest edge of 1600 pixels. Set `scope` to `window` for the full interface or change `max_dimension` between 256 and 4096.
+
+Every capture delivers its image under the requested `delivery`. The retired
+`diff`, `diff_mode` and `reset_diff_baseline` parameters are refused by name: the
+comparison's baseline moved with the camera and the on-screen command line
+counted as changed pixels, so it was removed rather than repaired. Capture twice
+and compare the two images if you need a visual delta.
 
 Clients using MCP 2026-07-28 can advertise `io.modelcontextprotocol/tasks`. OCS then returns a standard task handle when an operation is still running and accepts `tasks/get`, `tasks/update`, and `tasks/cancel`. Other clients continue to receive the existing operation status and can read it with `ocs_read`.
 
@@ -255,15 +318,15 @@ Either a handle list or a block name, never both. The open document is not modif
 
 The result reports `{"path":…, "entities":<count>}`. Referenced layer definitions travel with the entities; block definitions export flattened into model space.
 
-### `plot` — render to PDF
+### `plot` — render to PDF or SVG
 
-Plots the active document without any dialog. `layout` selects `"Model"` (default), one layout name, or `"all"`. `area` is `"extents"` (default), `"display"`, `"limits"`, `"window"` (needs `window:[x0,y0,x1,y1]`), or `"layout"` (the laid-out sheet, layouts only). `paper` names a catalog sheet, `orientation` is `"Portrait"`/`"Landscape"`, sizing is `"fit":true` (default) or `"scale":"1:100"`, plus `center`, `offset_x/offset_y`, `upside_down`, `plot_style` (CTB path or discovered name) and the output toggles `transparency`, `lineweights`, `merge_lines`, `stamp`:
+Plots the active document without any dialog. The `path` extension selects PDF or SVG. `layout` selects `"Model"` (default), one layout name, or `"all"`. `area` is `"extents"` (default), `"display"`, `"limits"`, `"window"` (needs `window:[x0,y0,x1,y1]`), or `"layout"` (the laid-out sheet, layouts only). `paper` names a catalog sheet, `orientation` is `"Portrait"`/`"Landscape"`, and `shade` selects the shaded-viewport plot mode. Sizing is `"fit":true` (default) or `"scale":"1:100"`, plus `center`, `offset_x/offset_y`, `upside_down`. `plot_style` accepts a CTB path or discovered name; `apply_plot_styles` can enable/disable the selected stored table. Output controls are `transparency`, `lineweights`, `scale_lineweights`, `paperspace_last`, `merge_lines`, and `stamp`. SVG additionally offers `non_scaling_stroke` — constant stroke widths under downstream SVG transforms, useful for web-map layers; it defaults `false` and does not change the CAD plot scale. For SVG, `"text_as_outlines":true` replaces font-dependent text elements with glyph paths; the default retains searchable text. PDF ignores all SVG-only options. `layer_attributes` additionally tags every drawn item with a `data-layer` attribute so web-map consumers can toggle drawing layers dynamically:
 
 ```json
 {"protocol":1,"op":"plot","request_id":"plot-1","document_id":1,"path":"C:/out/pages.pdf","layout":"all","paper":"ISO_A4_(210.00_x_297.00_MM)","fit":true,"center":true}
 ```
 
-Explicitly supplied fields override a layout's stored page setup; unspecified fields keep it. The result reports `{"path":…, "pages":<n>, "page_sizes":[[w,h],…]}` in millimetres.
+Explicitly supplied fields override a layout's stored page setup; unspecified fields keep it. When `plot_style` is supplied, styling defaults to enabled; an explicit `apply_plot_styles:false` disables that table as well. The result reports `{"path":…, "pages":<n>, "page_sizes":[[w,h],…]}` in millimetres.
 
 ### `embed_image` — attach a picture
 
@@ -300,6 +363,8 @@ maps onto these three steps rather than a native op.
 ### Text content and bounds
 
 `query` entities of type `TEXT`/`MTEXT` return the raw stored string in `value` plus a formatting-free rendering in `text` (MTEXT inline codes such as `\A1;` or `\P` are resolved; `%%d`-style TEXT codes become their glyphs). With `detail:"full"`, degenerate-width text bounds are widened with a documented estimate (height × 0.8 × character count) so `bounds`-based region filters stay usable.
+
+Every entity above `summary` detail also carries `constraints` — the constraints referencing it, as `{kind, participants, enabled, conflict, form}` entries, where `conflict` names a constraint the solver flagged (`Redundant` or `Conflicting`) and is `null` otherwise, and `form` is `Dynamic`/`Annotational` for a dimensional constraint's dimension (`null` for a geometric constraint) (see the API spec for the exact shape).
 
 ### Text operations — search, audit and replace
 
@@ -369,13 +434,22 @@ editor, events and plotting.
 resource-oriented REST surface on `http://127.0.0.1:<port>/api/v1`. Any
 HTTP client works — curl, Python, C# `HttpClient`, JS `fetch`; there is no
 SDK and nothing AI-specific. The server keeps one drawing session alive
-across requests, binds loopback only, sends permissive CORS headers, and
-serves its machine-readable description at `GET /api/v1/openapi`
-(OpenAPI 3, embedded from `src/rest_openapi.json`).
+across requests, binds loopback only, and serves its machine-readable
+description at `GET /api/v1/openapi` (OpenAPI 3, embedded from
+`src/rest_openapi.json`).
+
+Every request carries `Authorization: Bearer <token>`; anything else is
+answered `401 {"code":"unauthorized"}`. Loopback is shared by every process
+and user on the machine, so the port alone proves nothing. Set the token
+yourself with `OCS_API_TOKEN` before launching, or read the random one the
+server prints on stderr at startup. No CORS headers are sent, so a web page
+cannot drive or read the session. The same token guards `--serve --port`
+(as a `"token"` field in each JSON line) and the GUI-hosted channel below.
 
 ```sh
+export OCS_API_TOKEN=$(openssl rand -hex 32)
 OpenCADStudio --http 8090            # start the REST server (headless)
-curl http://127.0.0.1:8090/api/v1/ready
+curl -H "Authorization: Bearer $OCS_API_TOKEN" http://127.0.0.1:8090/api/v1/ready
 ```
 
 ### GUI-hosted REST channel (`--http` + file)
@@ -472,28 +546,41 @@ keep working while the client polls.
 | `GET  /api/v1/entities` | Query — `type`, `layer`, `detail`, `offset`, `limit`, `fields`, `handles`, `bounds`, `near`, `contains_point`, `intersections` (comma-separated) and `where` (a JSON-encoded property filter array, e.g. `[{"path":"/radius","op":"gt","value":2}]`). |
 | `GET  /api/v1/entities/{handle}` | One entity, `detail:"full"`. |
 | `POST /api/v1/entities` | Create a typed batch → **201** with `handles`. |
+| `POST /api/v1/entities_set` | Atomically patch common properties over unique handles in one undo step. |
 | `DELETE /api/v1/entities?handles=a,b` | Erase by handle (body `{"handles":[…]}` also accepted). |
 | `POST /api/v1/entities/transform` | move/copy/rotate/scale/mirror/array. |
 | `POST /api/v1/entities/copy-to` | Copy entities into another open document: `{"handles":[…],"document_id":target}` → **201** with the new handles. |
 | `GET  /api/v1/entities/{h}/xdata?app=` · `PUT …/xdata/{app}` · `DELETE …/xdata/{app}` | Read / replace / remove extended data. |
 | `POST /api/v1/blocks` | Define a block from entities (+ Insert); `"replace":true` drops a same-named definition first. |
-| `DELETE /api/v1/blocks/{name}` | Delete a block definition with its children, markers and every Insert referencing it. |
+| `DELETE /api/v1/blocks/{name}` | Delete a block definition and its children/markers; referenced blocks require `?force=true` to erase their INSERTs too. |
 | `POST /api/v1/file-identity` | Stable per-document GUID (`{"renew":true}` mints a fresh one). |
 | `POST /api/v1/groups` | Create a named group from handles → **201**. |
 | `POST /api/v1/selection-sets` · `GET /api/v1/selection-sets/{name}` | Save a named selection set → **201**; recall it (`?select=true` also makes it the current selection). |
 | `POST /api/v1/get_selection` | Read-only snapshot of the current selection (see [the GUI-hosted channel](#gui-hosted-rest-channel---http--file) below). |
 | `GET  /api/v1/sysvars?names=a,b` · `POST /api/v1/sysvars` | Read sysvars (`{"get":[…]}` in the body also works) / set them (`{"set":{"ltscale":2.5}}`). |
-| `POST /api/v1/layouts` | Create a layout with default page setup → **201**. |
-| `PUT  /api/v1/layouts/{name}/page-setup` | Write a layout's plot configuration (paper, orientation, fit/scale, center, window, plot style). |
+| `GET  /api/v1/layouts` | List Model and paper layouts with canonical names, handles, current flags, and tab order. |
+| `POST /api/v1/layouts` | Create a layout with default page setup without activating it → **201**. |
+| `PATCH /api/v1/layouts/{name}` | Rename a paper layout with `{"new_name":…}`. |
+| `DELETE /api/v1/layouts/{name}` | Delete a paper layout (one undo step). |
+| `POST /api/v1/layouts/{name}/activate` | Make Model or a paper layout current (non-undoable view state). |
+| `GET · PUT /api/v1/layouts/{name}/page-setup` | Read / write a layout's plot configuration (paper, orientation, fit/scale, center, offsets, area, window, plot style). |
+| `GET /api/v1/xrefs` · `POST /api/v1/xref_{reload,unload,detach,bind,set_path,set_type}` | Fresh external-reference report · direct-reference lifecycle writes. |
+| `POST /api/v1/dgn_import` | Direct, named-option DGN conversion without positional prompt replay. |
 | `POST /api/v1/plot` · `/api/v1/wblock` · `/api/v1/images` | PDF export (`"layout":"all","per_page":true` writes one PDF per layout) · DWG/DXF export (`"template"` bases the new database on a file, `"normalize":true` shifts the export to the origin) · attach picture. |
 | `POST /api/v1/commands` | Run one command line (`{"cmd":"LINE 0,0 10,10"}`). |
 | `POST /api/v1/undo` · `/redo` · `/save` | Lifecycle (`/save` to a `*.dwt` path writes the template — DWG bytes). |
 | `GET  /api/v1/layers` · `/header` · `/records?collection=…` | Database reads. |
 | `POST /api/v1/{op}` | Generic passthrough for any automation op. |
 
-Status codes: `200`/`201` on success; `400` validation; `404` unknown route
-or handle (`code:"entity_absent"`); `409` stale state or GUI required;
-`503` busy. Every failure body keeps the symbolic `code` and message, so
+Percent-encode every layout `{name}` path segment (for example, `Floor Plan` is
+`Floor%20Plan`). Names resolve case-insensitively and responses return canonical
+spelling; an unknown name returns `layout_missing`.
+
+Status codes: `200`/`201` on success; `400` validation; `404` unknown route,
+handle (`code:"entity_absent"`), layout (`code:"layout_missing"`), or reference
+(`code:"xref_missing"`); `409`
+stale state or GUI required; `503` busy. Every failure body keeps the symbolic
+`code` and message, so
 clients can branch on either. The server-generated `request_id` and the
 retry-on-stale-state dance happen inside the REST layer — callers just do
 HTTP.
@@ -503,7 +590,7 @@ HTTP.
 ```sh
 # 1. Create entities (the missing layer "FRAME" is created automatically;
 #    the whole batch commits as one undoable step or not at all).
-curl -s -X POST http://127.0.0.1:8090/api/v1/entities \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/entities \
   -H "Content-Type: application/json" \
   -d '{"entities":[
         {"type":"Line","start":[0,0],"end":[100,0],"layer":"FRAME"},
@@ -514,76 +601,83 @@ curl -s -X POST http://127.0.0.1:8090/api/v1/entities \
 # → 201 {"ok":true,"status":"completed","result":{"handles":["63","64","65","66"],…}}
 
 # 2. Verify: query it back.
-curl -s "http://127.0.0.1:8090/api/v1/entities?type=Line&detail=full"
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" "http://127.0.0.1:8090/api/v1/entities?type=Line&detail=full"
 # → {"ok":true,"entities":[{"handle":"63","start":[0,0,0],"end":[100,0,0],…},…]
 
 # 3. Move the circle 10 units right.
-curl -s -X POST http://127.0.0.1:8090/api/v1/entities/transform \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/entities/transform \
   -H "Content-Type: application/json" \
   -d '{"handles":["66"],"action":"move","vector":[10,0]}'
 
 # 4. Mark the text with extended data (RegApp "SPM" registered implicitly).
-curl -s -X PUT http://127.0.0.1:8090/api/v1/entities/65/xdata/SPM \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X PUT http://127.0.0.1:8090/api/v1/entities/65/xdata/SPM \
   -H "Content-Type: application/json" \
   -d '[{"code":1000,"value":"PAGE-01"},{"code":1070,"value":3}]'
-curl -s "http://127.0.0.1:8090/api/v1/entities/65/xdata?app=SPM"
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" "http://127.0.0.1:8090/api/v1/entities/65/xdata?app=SPM"
 
 # 5. Turn the two frame lines into a block definition + Insert.
-curl -s -X POST http://127.0.0.1:8090/api/v1/blocks \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/blocks \
   -H "Content-Type: application/json" \
   -d '{"name":"FRAME-MARK","base":[0,0,0],"handles":["63","67"]}'
 # → 201 {"result":{"block":"FRAME-MARK","insert":"6B"}}
 
 # 6. Save and prove persistence.
-curl -s -X POST http://127.0.0.1:8090/api/v1/save \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/save \
   -H "Content-Type: application/json" -d '{"path":"C:/out/session.dwg"}'
 
 # 7. Filter entities by any property (RFC 6901 pointers, SQL-ish operators).
-curl -s "http://127.0.0.1:8090/api/v1/entities?type=Circle&detail=geometry&where=%5B%7B%22path%22%3A%22%2Fradius%22%2C%22op%22%3A%22gt%22%2C%22value%22%3A2%7D%5D"
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" "http://127.0.0.1:8090/api/v1/entities?type=Circle&detail=geometry&where=%5B%7B%22path%22%3A%22%2Fradius%22%2C%22op%22%3A%22gt%22%2C%22value%22%3A2%7D%5D"
 
 # 8. Set and read back drawing sysvars.
-curl -s -X POST http://127.0.0.1:8090/api/v1/sysvars \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/sysvars \
   -H "Content-Type: application/json" -d '{"set":{"ltscale":2.5}}'
-curl -s "http://127.0.0.1:8090/api/v1/sysvars?names=ltscale,mirrtext"
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" "http://127.0.0.1:8090/api/v1/sysvars?names=ltscale,mirrtext"
 
-# 9. Provision a sheet: create the layout, write its page setup, then
-#    plot every layout to its own PDF (one file per entry in result.files).
-curl -s -X POST http://127.0.0.1:8090/api/v1/layouts \
-  -H "Content-Type: application/json" -d '{"name":"PLAN"}'
-curl -s -X PUT http://127.0.0.1:8090/api/v1/layouts/PLAN/page-setup \
+# 9. Provision a sheet with structured ops (no -LAYOUT scripting). Create
+#    does not activate it, so make activation a separate explicit request.
+#    Spaces and other reserved characters in path names are percent-encoded.
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/layouts \
+  -H "Content-Type: application/json" -d '{"name":"Floor Plan"}'
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/layouts/Floor%20Plan/activate \
+  -H "Content-Type: application/json" -d '{}'
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X PUT http://127.0.0.1:8090/api/v1/layouts/Floor%20Plan/page-setup \
   -H "Content-Type: application/json" \
-  -d '{"paper":"ISO_A4_(210.00_x_297.00_MM)","orientation":"landscape","fit":true,"center":true}'
-curl -s -X POST http://127.0.0.1:8090/api/v1/plot \
+  -d '{"paper":"ISO_A4_(210.00_x_297.00_MM)","orientation":"landscape","fit":true,"center":true,"offset_x":5,"offset_y":5,"area":"layout"}'
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" http://127.0.0.1:8090/api/v1/layouts/Floor%20Plan/page-setup
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" http://127.0.0.1:8090/api/v1/layouts
+# Plot every layout to its own PDF (one file per entry in result.files).
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/plot \
   -H "Content-Type: application/json" \
   -d '{"path":"C:/out/plan.pdf","layout":"all","per_page":true}'
 
 # 10. Save the drawing as a template (a .dwt is DWG bytes — same writer,
 #     no lock held on the file) and start a fresh drawing from it.
-curl -s -X POST http://127.0.0.1:8090/api/v1/save \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/save \
   -H "Content-Type: application/json" -d '{"path":"C:/out/session.dwt"}'
-curl -s -X POST http://127.0.0.1:8090/api/v1/documents \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/documents \
   -H "Content-Type: application/json" -d '{"template":"C:/out/session.dwt"}'
 
 # 11. Second document, then copy entities across documents.
-curl -s -X POST http://127.0.0.1:8090/api/v1/documents -d '{}'   # a fresh document
-curl -s -X POST http://127.0.0.1:8090/api/v1/entities/copy-to \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/documents -d '{}'   # a fresh document
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/entities/copy-to \
   -H "Content-Type: application/json" \
   -d '{"handles":["63","67"],"document_id":2}'
 
 # 12. Group the copies, save them as a named selection set, recall it.
-curl -s -X POST http://127.0.0.1:8090/api/v1/groups \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/groups \
   -H "Content-Type: application/json" -d '{"name":"FRAME","handles":["63","67"]}'
-curl -s -X POST http://127.0.0.1:8090/api/v1/selection-sets \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/selection-sets \
   -H "Content-Type: application/json" -d '{"name":"frame-set","handles":["63","67"]}'
-curl -s "http://127.0.0.1:8090/api/v1/selection-sets/frame-set?select=true"
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" "http://127.0.0.1:8090/api/v1/selection-sets/frame-set?select=true"
 
 # 13. Close a document, discarding unsaved changes.
-curl -s -X DELETE "http://127.0.0.1:8090/api/v1/documents/2?discard=true"
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X DELETE "http://127.0.0.1:8090/api/v1/documents/2?discard=true"
 ```
 
 The same lifecycle — create → verify → transform → xdata → block →
 save → reopen → verify persisted → erase → undo, then where filters,
-sysvars, layout + page setup + per-page plotting, a `.dwt` template →
+sysvars, structured layout list/create/read/rename/activate/delete, page setup,
+percent-encoded names and per-page plotting, a `.dwt` template →
 new-from-template round trip, a cross-document copy, groups and selection
 sets, and a close-with-discard — runs as an automated black-box check:
 
@@ -608,11 +702,12 @@ undo step; missing `layer`s are created and reported in `layers_created`.
 | `Line` | `start`, `end`, optional `thickness` |
 | `Circle` | `center`, `radius` (≥ 0) |
 | `Arc` | `center`, `radius` (> 0), `start_angle_deg`, `end_angle_deg` |
+| `Spline` | `control_points` (more than `degree`) or `fit_points` (≥ 2), optional `degree` (1–10, default 3), `knots` (control points + degree + 1, non-decreasing), `weights` (one positive value per control point), `closed`, `periodic`, `rational`, `planar`, `linear` |
 | `LwPolyline` | `vertices` (≥ 2), `closed`, optional `constant_width` |
 | `Point` | `location` |
 | `Text` | `value`, `position`, optional `height` (default 2.5), `rotation_deg`, `style` |
-| `MText` | `value`, `position`, optional `height`, `width`, `rotation_deg` |
-| `Insert` | `block` (must exist), `position`, optional `scale` (number or `[x,y,z]`, nonzero), `rotation_deg` |
+| `MText` | `value`, `position`, optional `height`, `width`, `rotation_deg`, `style` |
+| `Insert` | `block` (must exist), `position`, optional `scale` (number or `[x,y,z]`, nonzero), `rotation_deg`, `attributes` (`{"TAG":"value"}`; tags are case-insensitive, the ones left out keep their default; unknown or constant tags are refused) |
 | `Solid` | `corners` (3 or 4 `[x,y,z]`) |
 | `Hatch` | `boundary` (≥ 3 points, closed), `solid`, or `pattern` (catalog name, default `ANSI31`), `pattern_scale`, `pattern_angle_deg` |
 
@@ -620,6 +715,30 @@ Every definition also accepts `layer` and `color` (ACI index). Response:
 `{"handles":[…], "created":N, "layers_created":[…]}`. An invalid definition
 (`unknown_entity_type`, `invalid_radius`, `invalid_vertices`, …) aborts the
 whole batch with nothing committed.
+
+### `entities_set` — atomic common-property batches
+
+Apply one flat patch to every supplied handle in a single undo step:
+
+```json
+{"protocol":1,"op":"entities_set","request_id":"cleanup-1","document_id":1,
+ "handles":["2E2","32D"],"layer":"Hranice katastru","color":"ByLayer",
+ "linetype":"Continuous","linetype_scale":1.0,"invisible":false,
+ "label":"Cadastral cleanup"}
+```
+
+Fields that are absent stay unchanged; at least one editable field is required.
+`layer` and named `linetype` must already exist and resolve case-insensitively.
+Colors accept `"ByLayer"`/`"ByBlock"`, ACI `0..256`, `{"Index":5}`,
+`{"Rgb":{"r":24,"g":0,"b":0}}`, or `{"rgb":[24,0,0]}`. Handles must be unique
+and every target must exist and be editable. Unknown fields, a bad handle, a
+locked layer, or invalid values reject the entire request before history opens.
+
+The result is `{requested,written,unchanged}`; `written` counts actual changes.
+An identical repeat succeeds with `written:0` and creates no undo entry. One call
+handles thousands of entities without plugin IPC chunking, and `label` names the
+single undo group. Use generic REST `POST /api/v1/entities_set` or MCP
+`ocs_execute`; no `-PROPERTIES`/Python prompt scripting is needed.
 
 ### `entities_delete` — erase entities
 
@@ -674,9 +793,15 @@ definition — its children, markers and inserts — inside the same undo step
 before creating the new one: that is SPM's barcode re-import flow, so
 `block_define` never fails with "already exists" on a re-import.
 `block_delete` removes a definition completely (children, Block/BlockEnd
-markers, every Insert referencing it and the table record) and reports
-`result.erased`; unknown names are `block_missing`, `*`-prefixed layout
-records are `block_protected`. Definitions survive save/open round trips
+markers and the table record). A definition anything still points at — an
+INSERT, a dimension-style arrow block, a multi-leader's block content — is
+refused with `block_referenced` and the shared message text; add
+`"force":true` to erase the referencing INSERTs in the same undo step and get
+`result.references` with the number that were overridden. `result.erased`
+counts every entity the step removed. Unknown names are `block_missing`,
+`*`-prefixed layout records, anonymous and xref definitions are
+`block_protected`, and a block with an open BEDIT session is `block_in_edit`.
+Definitions survive save/open round trips
 and are consumable by `wblock` (by block name) and `INSERT` creation via
 `entities_create`.
 
@@ -704,6 +829,85 @@ seed, hex).
 
 Fits the entities into the view and selects them. Headless servers refuse
 with `code:"gui_required"`; REST clients get HTTP 409.
+
+### `dgn_import` — direct, prompt-free DGN conversion
+
+```json
+{"protocol":1,"op":"dgn_import","request_id":"dgn-1","document_id":1,
+ "path":"draco-dgn-in-7.dgn","model":"Default","units":"Master",
+ "mapping":"Standard","codepage":1250}
+```
+
+This invokes the same synchronous conversion and placement pipeline as
+`-DGNIMPORT`, without positional prompt answers. Model names resolve
+case-insensitively and omitted model selects the first design model. Units are
+`Master`/`Sub`; mapping is `Standard` (the command's `;codepage=N` suffix is
+accepted, with an explicit numeric `codepage` taking precedence). The result
+contains canonical `model`, `path`, and `entities`: the number of top-level
+converted model entities, excluding block-definition members and later
+reference attachments.
+
+Failures include `invalid_dgn`, `model_missing` (with `available_models`),
+`invalid_units`, `invalid_mapping`, `invalid_codepage`, and `empty_dgn_model`.
+Validation finishes before a new tab or undo entry is created. Target-drawing,
+text-node, duplicate-naming, and reference choices follow the same saved DGN
+import settings as the command. The positional command and dialog remain
+available as fallbacks. Use generic REST `POST /api/v1/dgn_import` or MCP
+`ocs_execute`.
+
+### `xrefs` / `xref_*` — structured external-reference lifecycle
+
+```json
+{"op":"xrefs"}
+{"protocol":1,"op":"xref_set_type","request_id":"xr-1","document_id":1,
+ "id":"8F","reference_type":"overlay"}
+{"protocol":1,"op":"xref_set_path","request_id":"xr-2","document_id":1,
+ "id":"8F","path_type":"relative"}
+{"protocol":1,"op":"xref_reload","request_id":"xr-3","document_id":1,"id":"8F"}
+```
+
+`xrefs` is a passive, fresh read returning `{count,xrefs[]}`. Rows expose
+`id`, `name`, `kind`, `format`, `reference_type`, `status`, raw `saved_path`,
+`resolved_path`, `parent_id`, `nested`, `size_bytes`, and `modified_unix_ms`.
+The list includes direct and nested drawing xrefs, linked raster images,
+underlays, and point clouds; embedded images are not external references.
+
+The six envelope mutations operate on one direct `id` in the active document:
+`xref_reload`, `xref_unload`, `xref_detach`, `xref_bind`, `xref_set_path`, and
+`xref_set_type`. Actual changes use one undo step. `xref_set_path` takes
+exactly one of `path` or `path_type` (`full`/`relative`/`none`) and never
+reloads implicitly; its result includes `reload_required`. `xref_set_type`
+takes `reference_type:"attach"` or `"overlay"`. `xref_unload` reports whether
+loadedness is `session_only`; bind reports the local `block` and `unremapped`
+count. Repeating an unchanged path, type, or unload creates no history.
+
+Nested rows are read-only (`xref_nested_read_only`), unknown IDs return
+`xref_missing`, and invalid kind/action pairs return `xref_kind_unsupported`.
+Native protocol and REST requests reject misspelled fields with
+`unknown_xref_field`; MCP preflight reports them as tool validation errors.
+Reload failures preserve existing content and include diagnostics. DWG/DXF
+xrefs support reload, bind, and type changes; raster reload and non-DWG
+bind/type changes are refused explicitly. Structured attach is not exposed
+until INSERT failure can be rolled back atomically; create references with the
+existing `XATTACH` command, then manage them with these operations. REST uses
+`GET /api/v1/xrefs` and `POST /api/v1/{operation}`; MCP uses `ocs_read` and
+`ocs_execute`.
+
+### `action` — the UI toggles and the open dialogs
+
+```json
+{"op":"action","name":"grid","value":"on"}
+```
+
+UI toggles go by name. The open import dialogs are driven field-by-field: the
+DGN Import window answers `dgn_import_dialog` with
+`value="path=<file>"`, `"model=<index>"`, `"target=new|current"`,
+`"conflict=prefix|ignore"`, `"units=master|sub"`, `"explode=on|off"`,
+`"code_page=<windows page>"` (e.g. `1252` default, `1250` Central European,
+`932` Shift-JIS, `65001` UTF-8), `"references=translate|ignore|underlay"`,
+`"existing=prompt|overwrite|keep"`, `"mapping=layer|linetype|lineweight|color"`,
+then `"ok"` to import or `"cancel"`. The window must already be open — run
+`DGNIMPORT` (or open the Import File dialog and pick a DGN) first.
 
 ## Document, sheet and organization operations (protocol ops)
 
@@ -749,27 +953,56 @@ active-document guard — they may address any open document.
 | `osmode` | object-snap bitmask (integer) | ✓ |
 | `pdmode` / `pdsize` | point display mode / size | ✓ |
 | `extmin` / `extmax` | model-space extents `[x,y,z]` | read-only |
+| `constraintstatus` | active space's constraint state: `{scope, constraint_count, enabled_count, dof}` | read-only |
 
-### `layout_create` / `page_setup_set` — layouts and page setups
+### Layouts and page setups
+
+Use the structured layout operations rather than scripting `-LAYOUT`. Creation
+adds a layout with the default page setup, a sheet viewport, and the normal
+initial model viewport when `LAYOUTCREATEVIEWPORT` is enabled, but deliberately
+does **not** activate it; compose `layout_create` with `layout_activate` when
+the new sheet should become current:
 
 ```json
+{"op":"layouts"}
 {"protocol":1,"op":"layout_create","request_id":"lc-1","document_id":1,"name":"PLAN"}
+{"protocol":1,"op":"layout_activate","request_id":"la-1","document_id":1,"name":"plan"}
 {"protocol":1,"op":"page_setup_set","request_id":"ps-1","document_id":1,"layout":"PLAN",
- "paper":"ISO_A4_(210.00_x_297.00_MM)","orientation":"landscape","fit":true,"center":true,
- "scale":"1:100","window":[0,0,210,297],"plot_style":"monochrome.ctb"}
+ "paper":"ISO_A4_(210.00_x_297.00_MM)","orientation":"landscape","scale":"1:100","center":true,
+ "offset_x":12.5,"offset_y":-4.0,"area":"window","window":[0,0,210,297],"plot_style":"monochrome.ctb"}
+{"op":"page_setup_get","layout":"PLAN"}
+{"protocol":1,"op":"layout_rename","request_id":"lr-1","document_id":1,"name":"PLAN","new_name":"Floor Plan"}
+{"protocol":1,"op":"layout_delete","request_id":"ld-1","document_id":1,"name":"floor plan"}
 ```
 
-`layout_create` adds a layout with the default page setup and a sheet
-viewport; duplicates are refused (`layout_exists`). `page_setup_set` writes
-the named layout's plot configuration — explicit fields win, the rest keeps
-the stored setup. `paper` resolves through the paper catalog
-(`invalid_paper` lists nothing — use a canonical catalog name);
-`orientation` is `portrait`/`landscape` (degrees of sheet rotation);
-sizing is `"fit":true` or `"scale":"paper:drawing"` like `"1:100"` (both
-parts positive — `nonsense` is refused with `invalid_scale`, it does not
-silently mean 1:1); `center` centers the plot; `window` sets a plot window;
-`plot_style` names a CTB/STB. Unknown layouts are `layout_missing`. The
-stored setup is what `plot` consumes when the op's own fields are absent.
+The passive `layouts` read returns `current`, `count`, and `layouts[]`; each
+entry contains `name`, `handle`, `current`, `model`, and `tab_order`.
+`page_setup_get` returns the canonical `layout` and a `page_setup` containing
+`initialized`, `paper`, `paper_width_mm`, `paper_height_mm`, `rotation`,
+`orientation`, `scale` (`numerator`, `denominator`, `fit`), `center`,
+`plot_style`, `area`, `view`, `window`, `offset_x`, and `offset_y`.
+
+`page_setup_set` keeps its existing request shape: explicit fields win and all
+others retain their stored values. In particular, `offset_x`/`offset_y` (mm),
+`area`, and `window` are applied, and an orientation-only update preserves the
+rest of the setup. `paper` resolves through the paper catalog; sizing is
+`"fit":true` or a positive `"scale":"paper:drawing"` ratio such as `"1:100"`.
+Orientation accounts for the medium's natural orientation. `area:"window"`
+requires a finite, positive-size `window` on every transport. Any normal initial
+viewport creation belongs to the undoable create/page-setup write, never to
+activation. The stored setup is what `plot` consumes when its own fields are absent.
+
+Layout names resolve case-insensitively and responses return their canonical
+spelling. Unknown names are `layout_missing`, duplicates are `layout_exists`,
+blank create names or `new_name` values are `name_required`, and invalid
+characters or excessive length are `invalid_layout_name`. Model appears in
+`layouts` and can be activated, but renaming or deleting it returns
+`layout_protected`. Rename and delete each create one undo step; activation is
+non-undoable view state, and both reads are passive.
+
+Over MCP, use `ocs_read` with `op:"layouts"` or `op:"page_setup_get"`
+(`parameters.layout`) and `ocs_execute` for the mutations. The operations are
+listed by `capabilities.operations` and in the MCP tool schemas.
 
 ### Templates — start from and save as `.dwt`
 
@@ -796,7 +1029,12 @@ template's tables/styles instead of the source drawing's.
 Copies the entities from the active document into the open document
 addressed by `document_id`. Every handle must exist in the source
 (`entity_absent` otherwise); the target must be open (`document_closed`).
-Referenced (missing) layer definitions travel along. `result.created` lists
+The dependencies the interactive copy carries travel along: layer, linetype
+and style records the copy needs, and the block definition the source holds
+for a copied reference — transitively, with its object graph. A reference
+whose definition the source itself does not hold stays a dangling reference,
+as it does when the drawing is loaded, and the audit reports it.
+`result.created` lists
 the new handles in the target, `result.count` their number. Combined with
 an empty `POST /documents` (REST) this is the multi-document assembly
 workflow.
@@ -858,11 +1096,14 @@ Without `per_page` the result stays `{path, pages, page_sizes}`.
 
 ```json
 {"op":"query","type":"Circle","detail":"geometry",
- "where":[{"path":"/radius","op":"gt","value":2},{"path":"/common/layer","op":"eq","value":"Walls"}]}
+ "where":[{"path":"/radius","op":"gt","value":2},{"path":"/layer","op":"eq","value":"Walls"}]}
 ```
 
-`where` filters query results on serialized entity properties using RFC
-6901 JSON Pointer paths (`/radius`, `/common/layer`, …) and the operators
+`where` filters query results on the returned entity JSON using RFC 6901
+JSON Pointer paths: `/layer` works at every detail, geometry fields such as
+`/radius` use `detail:"geometry"`, and serialized fields such as
+`/properties/common/color/Index` use `detail:"full"`. Legacy raw-property paths
+such as `/common/layer` remain accepted as a fallback. Supported operators are
 `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `contains`, `starts_with`,
 `ends_with`, `in`, `exists`, `not_exists`. Filters combine with
 AND and are validated up front (a bad pointer or unknown operator fails the

@@ -76,6 +76,189 @@ pub fn gpu_guard_active() -> bool {
     !candidate_backends().is_empty()
 }
 
+/// Test hook: make the synthetic probe report a legacy (below-baseline) GPU.
+pub const FORCE_LEGACY_ENV: &str = "OCS_GPU_PROBE_FORCE_LEGACY";
+
+/// The backend the user pinned in Options > Graphics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackendChoice {
+    /// Probe and pick the best backend (the default).
+    #[default]
+    Auto,
+    Dx12,
+    Vulkan,
+    Gl,
+}
+
+impl BackendChoice {
+    /// Choices offered on this OS.
+    pub fn available() -> Vec<BackendChoice> {
+        let mut v = vec![BackendChoice::Auto];
+        if cfg!(target_os = "windows") {
+            v.push(BackendChoice::Dx12);
+            v.push(BackendChoice::Vulkan);
+            v.push(BackendChoice::Gl);
+        } else if cfg!(target_os = "linux") {
+            v.push(BackendChoice::Vulkan);
+            v.push(BackendChoice::Gl);
+        }
+        v
+    }
+
+    /// The `WGPU_BACKEND` value, or `None` for automatic.
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            BackendChoice::Auto => None,
+            BackendChoice::Dx12 => Some("dx12"),
+            BackendChoice::Vulkan => Some("vulkan"),
+            BackendChoice::Gl => Some("gl"),
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "dx12" => BackendChoice::Dx12,
+            "vulkan" => BackendChoice::Vulkan,
+            "gl" => BackendChoice::Gl,
+            _ => BackendChoice::Auto,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BackendChoice::Auto => {
+                if cfg!(target_os = "macos") {
+                    "Automatic (Metal)"
+                } else {
+                    "Automatic (recommended)"
+                }
+            }
+            BackendChoice::Dx12 => "DirectX 12",
+            BackendChoice::Vulkan => "Vulkan",
+            BackendChoice::Gl => "OpenGL",
+        }
+    }
+}
+
+/// Graphics settings that apply at the next launch. They live in their own
+/// file because the backend is chosen before the application (and its
+/// settings) exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphicsPrefs {
+    pub backend: BackendChoice,
+    /// Force the packed renderer that avoids shader storage buffers.
+    pub compat_renderer: bool,
+    /// On Windows, prefer OpenGL when the GPU is below the WebGPU baseline.
+    pub legacy_gl: bool,
+}
+
+impl Default for GraphicsPrefs {
+    fn default() -> Self {
+        Self {
+            backend: BackendChoice::Auto,
+            compat_renderer: false,
+            legacy_gl: true,
+        }
+    }
+}
+
+fn prefs_path() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var(SENTINEL_DIR_ENV) {
+        return Some(PathBuf::from(dir).join("graphics.json"));
+    }
+    crate::config::config_dir().map(|d| d.join("graphics.json"))
+}
+
+/// Saved graphics preferences; defaults when absent or unreadable.
+pub fn load_prefs() -> GraphicsPrefs {
+    let Some(text) = prefs_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return GraphicsPrefs::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return GraphicsPrefs::default();
+    };
+    let d = GraphicsPrefs::default();
+    GraphicsPrefs {
+        backend: v
+            .get("backend")
+            .and_then(|x| x.as_str())
+            .map_or(d.backend, BackendChoice::parse),
+        compat_renderer: v
+            .get("compat_renderer")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(d.compat_renderer),
+        legacy_gl: v
+            .get("legacy_gl")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(d.legacy_gl),
+    }
+}
+
+/// Persist graphics preferences (best effort).
+pub fn save_prefs(prefs: GraphicsPrefs) {
+    let Some(p) = prefs_path() else {
+        return;
+    };
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let json = serde_json::json!({
+        "backend": prefs.backend.as_str().unwrap_or("auto"),
+        "compat_renderer": prefs.compat_renderer,
+        "legacy_gl": prefs.legacy_gl,
+    });
+    let _ = std::fs::write(p, serde_json::to_string_pretty(&json).unwrap_or_default());
+}
+
+/// What this run ended up using, and why.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActiveGpu {
+    /// `WGPU_BACKEND` value in effect (`None` = left to iced's default).
+    pub backend: Option<String>,
+    /// Adapter name when a probe identified it.
+    pub adapter: Option<String>,
+    /// Driver name / version when a probe reported it.
+    pub driver: String,
+    /// How the backend was chosen (`automatic`, `--backend`, ...).
+    pub origin: String,
+    /// The adapter is below the WebGPU baseline.
+    pub legacy: bool,
+}
+
+static ACTIVE: std::sync::OnceLock<ActiveGpu> = std::sync::OnceLock::new();
+
+fn record_active(active: ActiveGpu) {
+    let _ = ACTIVE.set(active);
+}
+
+/// The backend decision for this run (default-empty before `resolve_gpu`).
+pub fn active_gpu() -> ActiveGpu {
+    ACTIVE.get().cloned().unwrap_or_default()
+}
+
+/// Short `Adapter (backend)` text for the About dialog.
+pub fn active_gpu_summary() -> String {
+    let a = active_gpu();
+    let backend = match a.backend.as_deref() {
+        Some("dx12") => "DirectX 12",
+        Some("vulkan") => "Vulkan",
+        Some("gl") => "OpenGL",
+        Some("metal") => "Metal",
+        Some(other) => other,
+        None => {
+            if cfg!(target_os = "macos") {
+                "Metal"
+            } else {
+                "default"
+            }
+        }
+    };
+    match a.adapter {
+        Some(name) => format!("{name} ({backend})"),
+        None => backend.to_string(),
+    }
+}
+
 /// Capabilities reported by a passing probe child (one JSON line on stdout).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeCaps {
@@ -87,6 +270,12 @@ pub struct ProbeCaps {
     pub max_storage: u32,
     /// True when this is a software rasterizer (WARP / llvmpipe / SwiftShader).
     pub software: bool,
+    /// True when the adapter falls below the WebGPU baseline (missing
+    /// downlevel flags or shader model < 5): an older GPU that DX12/Vulkan
+    /// accept but run poorly or unreliably.
+    pub legacy: bool,
+    /// Driver name and version as the adapter reports them (may be empty).
+    pub driver: String,
 }
 
 impl ProbeCaps {
@@ -100,6 +289,8 @@ impl ProbeCaps {
             adapter: "synthetic-test-adapter".to_string(),
             max_storage,
             software: false,
+            legacy: std::env::var_os(FORCE_LEGACY_ENV).is_some_and(|_| backend != "gl"),
+            driver: String::new(),
         }
     }
 
@@ -111,6 +302,12 @@ impl ProbeCaps {
             adapter: v.get("adapter")?.as_str().unwrap_or("unknown").to_string(),
             max_storage: v.get("max_storage")?.as_u64()? as u32,
             software: v.get("software")?.as_bool()?,
+            legacy: v.get("legacy").and_then(|x| x.as_bool()).unwrap_or(false),
+            driver: v
+                .get("driver")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
         })
     }
 
@@ -120,6 +317,8 @@ impl ProbeCaps {
             "adapter": self.adapter,
             "max_storage": self.max_storage,
             "software": self.software,
+            "legacy": self.legacy,
+            "driver": self.driver,
         })
         .to_string()
     }
@@ -246,14 +445,32 @@ pub fn decide_backend(
 }
 
 fn failover_reason(failed: &[&String], excluded: &[String], chosen: &str) -> String {
-    let mut parts: Vec<String> = failed.iter().map(|b| b.to_string()).collect();
-    parts.extend(excluded.iter().cloned());
-    parts.sort();
-    parts.dedup();
-    let what_failed = if parts.is_empty() {
-        "the preferred backend was skipped after the previous crash".to_string()
+    let list = |mut names: Vec<String>| {
+        names.sort();
+        names.dedup();
+        names.join(", ")
+    };
+    let failed: Vec<String> = failed
+        .iter()
+        .map(|b| b.to_string())
+        .filter(|b| !excluded.contains(b))
+        .collect();
+    // A backend skipped for the previous run's crash is not one that fails
+    // here: say which of the two happened.
+    let mut causes = Vec::new();
+    if !failed.is_empty() {
+        causes.push(format!("{} is not usable on this GPU", list(failed)));
+    }
+    if !excluded.is_empty() {
+        causes.push(format!(
+            "the previous session on {} ended unexpectedly",
+            list(excluded.to_vec())
+        ));
+    }
+    let what_failed = if causes.is_empty() {
+        "the preferred backend was skipped".to_string()
     } else {
-        format!("{} {}", parts.join(", "), "is not usable on this GPU")
+        causes.join(" and ")
     };
     let chosen_text = match chosen {
         "gl" => "the GL compatibility backend",
@@ -268,15 +485,15 @@ fn failover_reason(failed: &[&String], excluded: &[String], chosen: &str) -> Str
 pub fn fallback_notice(reason: &str) -> String {
     format!(
         "Graphics compatibility mode: {reason}. \
-         If drawings render slowly, update the GPU driver; \
-         override with --backend <dx12|vulkan|gl>."
+         If drawings render slowly, update the GPU driver, \
+         or choose another backend in Options > Graphics."
     )
 }
 
 /// Notice text when the packed compatibility renderer was auto-enabled.
 pub fn compat_notice() -> String {
     "Older GPU detected: using the packed compatibility renderer \
-     (no shader storage buffers). Override with --compat-renderer / --backend."
+     (no shader storage buffers). Change it in Options > Graphics."
         .to_string()
 }
 
@@ -319,17 +536,51 @@ pub fn crashed_backends() -> Vec<String> {
         return Vec::new();
     };
     let text = std::fs::read_to_string(p).unwrap_or_default();
+    let named = || -> Vec<String> {
+        text.lines()
+            .find_map(|l| l.strip_prefix("backend="))
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
     if text.lines().any(|l| l.trim() == SURVIVED_MARKER) {
-        return Vec::new();
+        // Surviving the proof delay is good evidence, not proof. A backend
+        // can carry the interface for minutes and still be unable to hold a
+        // large drawing: D3D12 on an integrated GPU runs out of room only
+        // once the whole scene uploads, well past the mark, and a run killed
+        // then used to be excused. The crash report says what actually
+        // happened, so ask it before excusing anything.
+        return match crash_report_blames_the_device(&text) {
+            true => named(),
+            false => Vec::new(),
+        };
     }
-    text.lines()
-        .find_map(|l| l.strip_prefix("backend="))
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
+    named()
+}
+
+/// Whether the run this sentinel belongs to died inside the graphics device.
+///
+/// The sentinel records the process id it armed for, and crash reports are
+/// named for the process that wrote them, so the two join exactly: this asks
+/// about that run and not whichever report happens to be newest.
+fn crash_report_blames_the_device(sentinel: &str) -> bool {
+    let Some(pid) = sentinel
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    else {
+        return false;
+    };
+    let armed = sentinel
+        .lines()
+        .find_map(|line| line.strip_prefix("t="))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    crate::sys::crash_log::report_for_pid(pid, armed)
+        .is_some_and(|report| crate::sys::crash_log::is_device_failure(&report))
 }
 
 /// Record that the armed backend has kept the app alive long enough to be
@@ -429,11 +680,41 @@ fn run_probe_for(arg: &str) -> Option<ProbeCaps> {
 
 /// Resolve and apply `WGPU_BACKEND` for this launch.
 ///
-/// Precedence: `--backend` > existing `WGPU_BACKEND` > `--safe-mode` >
+/// Precedence: `--backend` > existing `WGPU_BACKEND` > `--safe-mode` > saved
+/// Graphics option (skipped when that backend died with the previous run) >
 /// per-backend probes (minus crash-implicated backends) > software adapter >
 /// last-resort `gl`. Inactive on macOS/wasm (env untouched).
 pub fn resolve_gpu(cli_backend: Option<&str>, safe_mode: bool) -> GpuResolution {
+    let prefs = load_prefs();
     let env_backend = std::env::var("WGPU_BACKEND").ok();
+    let mut excluded = if previous_run_crashed() {
+        crashed_backends()
+    } else {
+        Vec::new()
+    };
+    // A saved backend choice acts like `--backend`, except when it is the
+    // backend that took down the previous run: the user must never be locked
+    // into a setting that cannot start.
+    let saved = prefs
+        .backend
+        .as_str()
+        .filter(|b| !excluded.iter().any(|e| e == b));
+    let origin = if cli_backend.is_some() {
+        "--backend"
+    } else if env_backend.is_some() {
+        "WGPU_BACKEND"
+    } else if safe_mode {
+        "safe mode"
+    } else if saved.is_some() {
+        "Graphics options"
+    } else {
+        "automatic"
+    };
+    let cli_backend = cli_backend.or(if env_backend.is_none() && !safe_mode {
+        saved
+    } else {
+        None
+    });
     if cli_backend.is_some() || env_backend.is_some() || safe_mode || !gpu_guard_active() {
         let d = decide_backend(
             cli_backend,
@@ -448,18 +729,21 @@ pub fn resolve_gpu(cli_backend: Option<&str>, safe_mode: bool) -> GpuResolution 
         if let Some(v) = &d.backend_value {
             std::env::set_var("WGPU_BACKEND", v);
         }
+        record_active(ActiveGpu {
+            backend: d.backend_value.clone(),
+            adapter: None,
+            driver: String::new(),
+            origin: origin.to_string(),
+            legacy: false,
+        });
         return GpuResolution {
             backend_value: d.backend_value,
             reason: d.reason,
             compat_renderer: false,
         };
     }
-    let candidates = candidate_backends();
-    let excluded = if previous_run_crashed() {
-        crashed_backends()
-    } else {
-        Vec::new()
-    };
+    let mut candidates = candidate_backends();
+    let mut origin = origin.to_string();
     let mut results: Vec<(String, Option<ProbeCaps>)> = Vec::new();
     for backend in &candidates {
         if excluded.iter().any(|e| e == backend) {
@@ -477,11 +761,61 @@ pub fn resolve_gpu(cli_backend: Option<&str>, safe_mode: bool) -> GpuResolution 
             break;
         }
     }
+    // Older GPUs that DX12/Vulkan accept but run poorly: when the winning
+    // probe says the adapter is below the WebGPU baseline, try GL first. GL
+    // only wins if its own probe passes, so this never trades a working
+    // backend for a broken one.
+    if cfg!(target_os = "windows")
+        && prefs.legacy_gl
+        && !excluded.iter().any(|e| e == "gl")
+        && results
+            .iter()
+            .find_map(|(_, c)| c.as_ref())
+            .is_some_and(|c| c.legacy && !c.software && c.backend != "gl")
+    {
+        let gl = run_probe_for("gl");
+        eprintln!(
+            "[gpu] older GPU detected; probe gl: {}",
+            gl.as_ref().map(|c| c.adapter.as_str()).unwrap_or("FAILED")
+        );
+        if gl.is_some() {
+            candidates = prefer_gl(&candidates);
+            origin = "automatic (older GPU, OpenGL preferred)".to_string();
+        }
+        results.push(("gl".to_string(), gl));
+    }
     let sw = if results.iter().all(|(_, c)| c.is_none()) {
         run_probe_for("sw")
     } else {
         None
     };
+    // A run killed before the proof delay leaves a sentinel naming a backend
+    // that may never have failed. When nothing else can draw, the last resort
+    // is a GL that has just failed its own probe, so probe the suspect too
+    // (out of process, like every probe) unless the previous run's crash
+    // report says the graphics device itself failed.
+    if sw.is_none()
+        && results.iter().all(|(_, c)| c.is_none())
+        && !excluded.is_empty()
+        && !sentinel_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .is_some_and(|text| crash_report_blames_the_device(&text))
+    {
+        for backend in std::mem::take(&mut excluded) {
+            let caps = run_probe_for(&backend);
+            eprintln!(
+                "[gpu] nothing else passed; retry {backend} from the previous run: {}",
+                caps.as_ref()
+                    .map(|c| c.adapter.as_str())
+                    .unwrap_or("FAILED")
+            );
+            let passed = caps.is_some();
+            results.push((backend, caps));
+            if passed {
+                break;
+            }
+        }
+    }
     let d = decide_backend(
         None,
         None,
@@ -504,11 +838,36 @@ pub fn resolve_gpu(cli_backend: Option<&str>, safe_mode: bool) -> GpuResolution 
             eprintln!("[gpu] {}", compat_notice());
         }
     }
+    let chosen = results
+        .iter()
+        .filter(|(b, _)| Some(b) == d.backend_value.as_ref())
+        .find_map(|(_, c)| c.clone());
+    record_active(ActiveGpu {
+        backend: d.backend_value.clone(),
+        adapter: d.adapter_name.clone(),
+        driver: chosen
+            .as_ref()
+            .map(|c| c.driver.clone())
+            .unwrap_or_default(),
+        origin: if d.reason.is_some() && origin == "automatic" {
+            "automatic (fallback)".to_string()
+        } else {
+            origin
+        },
+        legacy: chosen.is_some_and(|c| c.legacy),
+    });
     GpuResolution {
         backend_value: d.backend_value,
         reason: d.reason,
         compat_renderer: d.compat_renderer,
     }
+}
+
+/// `candidates` with `gl` moved to the front.
+pub fn prefer_gl(candidates: &[String]) -> Vec<String> {
+    let mut out = vec!["gl".to_string()];
+    out.extend(candidates.iter().filter(|b| *b != "gl").cloned());
+    out
 }
 
 /// Child-process entry point for `--gpu-probe <backend|sw>`: exercise one
@@ -648,6 +1007,17 @@ fn exercise_adapter(adapter: &iced::wgpu::Adapter) -> Option<ProbeCaps> {
         "[gpu-probe] trying {} ({:?}, {:?})",
         info.name, info.backend, info.device_type
     );
+    // iced's quad shader packs colours with `unpack2x16float`; wgpu refuses
+    // it where the adapter lacks F16-in-F32 (llvmpipe without SHADER_F16),
+    // and the first UI frame would panic on it.
+    if !adapter
+        .get_downlevel_capabilities()
+        .flags
+        .contains(wgpu::DownlevelFlags::SHADER_F16_IN_F32)
+    {
+        eprintln!("[gpu-probe] {}: no F16-in-F32 shader support", info.name);
+        return None;
+    }
     // Mirror iced's compositor: full limits first, then the downlevel set.
     let limits = [
         wgpu::Limits::default().using_resolution(adapter.limits()),
@@ -684,6 +1054,10 @@ fn exercise_adapter(adapter: &iced::wgpu::Adapter) -> Option<ProbeCaps> {
             adapter: info.name.clone(),
             max_storage: adapter.limits().max_storage_buffers_per_shader_stage,
             software: is_software_adapter(&info),
+            legacy: !adapter.get_downlevel_capabilities().is_webgpu_compliant(),
+            driver: format!("{} {}", info.driver, info.driver_info)
+                .trim()
+                .to_string(),
         });
     }
     None
@@ -868,6 +1242,8 @@ mod tests {
             adapter: format!("test {backend}"),
             max_storage: storage,
             software: false,
+            legacy: false,
+            driver: String::new(),
         }
     }
 
@@ -945,7 +1321,7 @@ mod tests {
         let reason = d.reason.unwrap();
         assert!(reason.contains("dx12"), "{reason}");
         let notice = fallback_notice(&reason);
-        assert!(notice.contains("--backend"), "{notice}");
+        assert!(notice.contains("Options > Graphics"), "{notice}");
     }
 
     #[test]
@@ -979,6 +1355,8 @@ mod tests {
             adapter: "llvmpipe".to_string(),
             max_storage: 8,
             software: true,
+            legacy: false,
+            driver: String::new(),
         };
         let d = decide_backend(
             None,
@@ -1026,6 +1404,8 @@ mod tests {
             adapter: "Intel HD 405 (Braswell)".to_string(),
             max_storage: 8,
             software: false,
+            legacy: false,
+            driver: String::new(),
         };
         let line = caps.to_json_line();
         assert_eq!(ProbeCaps::from_json_line(&line), Some(caps));
@@ -1068,10 +1448,17 @@ mod tests {
         unsafe { std::env::set_var(SENTINEL_DIR_ENV, &dir) };
 
         arm_sentinel("dx12");
-        assert_eq!(crashed_backends(), vec!["dx12".to_string()], "a young run blames its backend");
+        assert_eq!(
+            crashed_backends(),
+            vec!["dx12".to_string()],
+            "a young run blames its backend"
+        );
 
         mark_sentinel_survived();
-        assert!(previous_run_crashed(), "the sentinel still records that the run ended badly");
+        assert!(
+            previous_run_crashed(),
+            "the sentinel still records that the run ended badly"
+        );
         assert!(
             crashed_backends().is_empty(),
             "a backend that kept the app alive must not be skipped at the next launch"
@@ -1081,6 +1468,84 @@ mod tests {
         mark_sentinel_survived();
         assert!(crashed_backends().is_empty());
 
+        disarm_sentinel();
+        unsafe { std::env::remove_var(SENTINEL_DIR_ENV) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Surviving the proof delay excuses a kill, but not a crash the
+    /// graphics device itself caused. D3D12 on an integrated GPU carries the
+    /// interface for minutes and only fails once a large drawing uploads, so
+    /// a run that died then has to keep costing the backend.
+    #[test]
+    fn a_device_crash_still_blames_the_backend_however_late_it_came() {
+        let _guard = SENTINEL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ocs-gpu-late-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // SAFETY: single-threaded test mutating a process-local test hook.
+        unsafe { std::env::set_var(SENTINEL_DIR_ENV, &dir) };
+
+        let reports = crate::sys::crash_log::directory().expect("a config directory");
+        let _ = std::fs::create_dir_all(&reports);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // A report older than the run, left by another process that once
+        // had this id, blames nobody.
+        let stale = reports.join(format!("crash-1-{}.log", std::process::id()));
+        let report = reports.join(format!("crash-{}-{}.log", now + 1, std::process::id()));
+
+        arm_sentinel("dx12");
+        mark_sentinel_survived();
+        let _ = std::fs::remove_file(&report);
+        assert!(
+            crashed_backends().is_empty(),
+            "with no crash report, a survived run blames nobody"
+        );
+        std::fs::write(
+            &stale,
+            crate::sys::crash_log::report_from("Out of Memory", "wgpu-29.0.4/src/lib.rs:1:1", 1),
+        )
+        .unwrap();
+        assert!(
+            crashed_backends().is_empty(),
+            "a report from before the run belongs to another process"
+        );
+        let _ = std::fs::remove_file(&stale);
+
+        // The run left a report, and it is the device's own failure.
+        std::fs::write(
+            &report,
+            crate::sys::crash_log::report_from(
+                "Error in Buffer::get_mapped_range: Validation Error",
+                "wgpu-29.0.4/src/backend/wgpu_core.rs:2253:18",
+                1,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            crashed_backends(),
+            vec!["dx12".to_string()],
+            "a device failure must cost the backend even past the proof delay"
+        );
+
+        // A crash that has nothing to do with graphics still costs nothing.
+        std::fs::write(
+            &report,
+            crate::sys::crash_log::report_from(
+                "index out of bounds: the len is 3 but the index is 7",
+                "src/app/commands/draw.rs:120:5",
+                1,
+            ),
+        )
+        .unwrap();
+        assert!(
+            crashed_backends().is_empty(),
+            "an unrelated panic must not cost the user a working backend"
+        );
+
+        let _ = std::fs::remove_file(&report);
         disarm_sentinel();
         unsafe { std::env::remove_var(SENTINEL_DIR_ENV) };
         let _ = std::fs::remove_dir_all(&dir);
@@ -1101,5 +1566,115 @@ mod tests {
         assert!(needs_compat_renderer(&bare));
         unsafe { std::env::remove_var(FORCE_OK_ENV) };
         unsafe { std::env::remove_var(FORCE_CAPS_ENV) };
+    }
+
+    #[test]
+    fn legacy_gpu_routes_to_gl_first_but_gl_must_still_pass() {
+        let order = prefer_gl(&cands(&["dx12", "vulkan", "gl"]));
+        assert_eq!(order, cands(&["gl", "dx12", "vulkan"]));
+        // GL probe passed: it wins silently.
+        let results = vec![
+            (
+                "dx12".to_string(),
+                Some(ProbeCaps {
+                    legacy: true,
+                    ..ok_caps("dx12", 8)
+                }),
+            ),
+            ("gl".to_string(), Some(ok_caps("gl", 8))),
+        ];
+        let d = decide_backend(None, None, false, &order, &[], &results, None, true);
+        assert_eq!(d.backend_value.as_deref(), Some("gl"));
+        assert!(d.reason.is_none());
+        // GL probe failed: the working DX12 stays.
+        let results = vec![
+            (
+                "dx12".to_string(),
+                Some(ProbeCaps {
+                    legacy: true,
+                    ..ok_caps("dx12", 8)
+                }),
+            ),
+            ("gl".to_string(), None),
+        ];
+        let d = decide_backend(
+            None,
+            None,
+            false,
+            &cands(&["dx12", "vulkan", "gl"]),
+            &[],
+            &results,
+            None,
+            true,
+        );
+        assert_eq!(d.backend_value.as_deref(), Some("dx12"));
+    }
+
+    #[test]
+    fn probe_json_without_new_fields_still_parses() {
+        let line = r#"{"backend":"dx12","adapter":"x","max_storage":8,"software":false}"#;
+        let caps = ProbeCaps::from_json_line(line).expect("old probe output parses");
+        assert!(!caps.legacy);
+        assert!(caps.driver.is_empty());
+    }
+
+    #[test]
+    fn backend_choice_round_trips() {
+        for c in [
+            BackendChoice::Auto,
+            BackendChoice::Dx12,
+            BackendChoice::Vulkan,
+            BackendChoice::Gl,
+        ] {
+            assert_eq!(BackendChoice::parse(c.as_str().unwrap_or("auto")), c);
+        }
+        assert_eq!(BackendChoice::parse("garbage"), BackendChoice::Auto);
+    }
+
+    #[test]
+    fn backend_choices_match_target_os() {
+        let choices = BackendChoice::available();
+        assert!(choices.contains(&BackendChoice::Auto));
+        if cfg!(target_os = "windows") {
+            assert_eq!(
+                choices,
+                vec![
+                    BackendChoice::Auto,
+                    BackendChoice::Dx12,
+                    BackendChoice::Vulkan,
+                    BackendChoice::Gl,
+                ]
+            );
+        } else if cfg!(target_os = "linux") {
+            assert_eq!(
+                choices,
+                vec![
+                    BackendChoice::Auto,
+                    BackendChoice::Vulkan,
+                    BackendChoice::Gl,
+                ]
+            );
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(choices, vec![BackendChoice::Auto]);
+        }
+    }
+
+    #[test]
+    fn graphics_prefs_persist_and_default_when_missing() {
+        let _guard = SENTINEL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ocs-gpu-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: serialized by SENTINEL_TESTS; process-local test hook.
+        unsafe { std::env::set_var(SENTINEL_DIR_ENV, &dir) };
+        assert_eq!(load_prefs(), GraphicsPrefs::default());
+        let p = GraphicsPrefs {
+            backend: BackendChoice::Vulkan,
+            compat_renderer: true,
+            legacy_gl: false,
+        };
+        save_prefs(p);
+        assert_eq!(load_prefs(), p);
+        unsafe { std::env::remove_var(SENTINEL_DIR_ENV) };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

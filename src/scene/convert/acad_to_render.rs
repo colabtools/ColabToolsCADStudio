@@ -1,4 +1,4 @@
-// opencadcodec entity -> what the renderer draws.
+// document entity -> what the renderer draws.
 //
 // Every entity becomes one of a handful of shapes: a run of points, a run of
 // text strokes, a band of varying width, or a single dot. Curved entities are
@@ -6,7 +6,7 @@
 // defined once — so a circle drawn here and a circle extruded by the Model
 // tab come from the same definition and cannot disagree.
 
-use codec::{CadDocument, EntityType};
+use document::{Document, EntityType};
 
 use crate::entities::traits::EntityTypeOps;
 use crate::scene::model::wire_model::{SnapHint, TangentGeom};
@@ -41,6 +41,32 @@ pub struct TextPlane {
     pub y_axis: [f64; 3],
 }
 
+/// The plane a run lies in when its entity's normal is not the drawing's
+/// Z axis: the run's origin (in the entity's object coordinates, at
+/// elevation `z`) and the object system's X and Y axes, in world space.
+/// `None` for a run in the XY plane, which is drawn as it is.
+pub fn ocs_text_plane(
+    normal: document::types::Vector3,
+    origin: [f64; 2],
+    z: f64,
+) -> Option<TextPlane> {
+    if normal.x.abs() < 1e-12 && normal.y.abs() < 1e-12 && normal.z > 0.0 {
+        return None;
+    }
+    let m = document::types::Matrix3::arbitrary_axis(normal);
+    let world = |v: document::types::Vector3| {
+        let w = m * v;
+        [w.x, w.y, w.z]
+    };
+    let at = world(document::types::Vector3::new(origin[0], origin[1], z));
+    Some(TextPlane {
+        origin: at,
+        scale_origin: at,
+        x_axis: world(document::types::Vector3::new(1.0, 0.0, 0.0)),
+        y_axis: world(document::types::Vector3::new(0.0, 1.0, 0.0)),
+    })
+}
+
 /// Per-run text-layout inputs needed to reproduce a run as SDF glyph quads.
 #[derive(Clone, Debug)]
 pub struct GlyphRun {
@@ -54,6 +80,9 @@ pub struct GlyphRun {
     pub tracking: f32,
     /// Bold run — the SDF glyph bakes with a wider pen (thicker strokes).
     pub bold: bool,
+    /// The run's inline colour when given as an index (`\C`), which the
+    /// stroke colour alone cannot tell from a true colour.
+    pub aci: Option<u8>,
 }
 
 #[allow(dead_code)]
@@ -78,6 +107,11 @@ pub enum RenderObject {
         station_pieces: Vec<crate::scene::model::wire_model::PatternStationPiece>,
         source_length: f32,
         plinegen: bool,
+        /// Each NaN-separated run of `points` is a line of its own: it takes
+        /// the linetype's end alignment by itself, as a single line does.
+        separate_runs: bool,
+        /// NaN-separated lines drawn Continuous beside the patterned ones.
+        solid: Vec<[f64; 3]>,
     },
     /// A wide polyline whose band width VARIES (a taper): a continuous WCS point
     /// list paired index-for-index with a per-point full band width. The wire
@@ -105,7 +139,7 @@ pub struct RenderEntity {
     pub pick_tris: Vec<[f64; 3]>,
 }
 
-pub fn convert(entity: &EntityType, document: &CadDocument) -> Option<RenderEntity> {
+pub fn convert(entity: &EntityType, document: &Document) -> Option<RenderEntity> {
     entity.to_render_entity(document)
 }
 

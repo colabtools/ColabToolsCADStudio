@@ -48,9 +48,39 @@ pub struct HatchGpu {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     backend: HatchBackend,
+    /// Triangulated fills of the resident set, reused by the next upload.
+    fill_meshes: storage::FillMeshCache,
 }
 
 impl HatchGpu {
+    pub(super) fn gpu_bytes<'a>(&'a self, counter: &mut super::gpu_memory::ResourceCounter<'a>) -> u64 {
+        match &self.backend {
+            HatchBackend::Storage { resident, preview } => resident
+                .iter()
+                .chain(preview)
+                .map(|batch| {
+                    [
+                        &batch.vertex_buffer,
+                        &batch.index_buffer,
+                        &batch.placement_buffer,
+                        &batch.instance_buffer,
+                        &batch.family_buffer,
+                        &batch.dash_buffer,
+                        &batch.visibility_buffer,
+                    ]
+                    .into_iter()
+                    .map(|buffer| counter.buffer(buffer))
+                    .sum::<u64>()
+                })
+                .sum(),
+            HatchBackend::Texture { resident, preview } => resident
+                .iter()
+                .chain(preview)
+                .map(|batch| batch.gpu_bytes(counter))
+                .sum(),
+        }
+    }
+
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
@@ -84,9 +114,15 @@ impl HatchGpu {
             })),
         });
         let vertex_layouts = if uses_storage {
-            vec![storage::HatchVertex::layout(), storage::HatchPlacement::layout()]
+            vec![
+                storage::HatchVertex::layout(),
+                storage::HatchPlacement::layout(),
+            ]
         } else {
-            vec![texture::vertex_layout(), texture::TextureHatchPlacement::layout()]
+            vec![
+                texture::vertex_layout(),
+                texture::TextureHatchPlacement::layout(),
+            ]
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(if uses_storage {
@@ -118,7 +154,7 @@ impl HatchGpu {
                 },
             }),
             multisample: wgpu::MultisampleState {
-                count: super::MSAA_SAMPLES,
+                count: super::msaa_samples(),
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
@@ -149,6 +185,7 @@ impl HatchGpu {
             pipeline,
             bind_group_layout,
             backend,
+            fill_meshes: storage::FillMeshCache::default(),
         }
     }
 
@@ -160,6 +197,7 @@ impl HatchGpu {
     }
 
     pub(super) fn clear(&mut self) {
+        self.fill_meshes = storage::FillMeshCache::default();
         match &mut self.backend {
             HatchBackend::Storage { resident, preview } => {
                 resident.clear();
@@ -180,7 +218,14 @@ impl HatchGpu {
                     .filter(|hatch| hatch.boundary.len() >= 3)
                     .cloned()
                     .collect();
-                *resident = StorageHatchBatch::build(device, queue, &self.bind_group_layout, &renderable);
+                *resident = StorageHatchBatch::build(
+                    device,
+                    queue,
+                    &self.bind_group_layout,
+                    &renderable,
+                    &mut self.fill_meshes,
+                );
+                self.fill_meshes.finish();
             }
             HatchBackend::Texture { resident, .. } => {
                 let renderable: Vec<HatchModel> = hatches
@@ -188,12 +233,8 @@ impl HatchGpu {
                     .filter(|hatch| hatch.boundary.len() >= 3)
                     .cloned()
                     .collect();
-                *resident = TextureHatch::from_models(
-                    device,
-                    queue,
-                    &renderable,
-                    &self.bind_group_layout,
-                );
+                *resident =
+                    TextureHatch::from_models(device, queue, &renderable, &self.bind_group_layout);
             }
         }
     }
@@ -211,7 +252,15 @@ impl HatchGpu {
                     .filter(|hatch| hatch.boundary.len() >= 3)
                     .cloned()
                     .collect();
-                *preview = StorageHatchBatch::build(device, queue, &self.bind_group_layout, &renderable);
+                // A throwaway cache: the small preview set must not evict the
+                // resident set's triangles.
+                *preview = StorageHatchBatch::build(
+                    device,
+                    queue,
+                    &self.bind_group_layout,
+                    &renderable,
+                    &mut storage::FillMeshCache::default(),
+                );
             }
             HatchBackend::Texture { preview, .. } => {
                 let renderable: Vec<HatchModel> = hatches
@@ -219,12 +268,8 @@ impl HatchGpu {
                     .filter(|hatch| hatch.boundary.len() >= 3)
                     .cloned()
                     .collect();
-                *preview = TextureHatch::from_models(
-                    device,
-                    queue,
-                    &renderable,
-                    &self.bind_group_layout,
-                );
+                *preview =
+                    TextureHatch::from_models(device, queue, &renderable, &self.bind_group_layout);
             }
         }
     }
@@ -234,10 +279,9 @@ impl HatchGpu {
     pub fn update_visibility(
         &mut self,
         queue: &wgpu::Queue,
-        mut is_visible: impl FnMut([f32; 4]) -> bool,
+        mut is_visible: impl FnMut([f64; 4]) -> bool,
     ) -> usize {
-        let HatchBackend::Storage { resident, .. } = &mut self.backend
-        else {
+        let HatchBackend::Storage { resident, .. } = &mut self.backend else {
             return 0;
         };
         let mut updated = 0;
@@ -287,10 +331,7 @@ impl HatchGpu {
                     pass.set_bind_group(1, &hatch.bind_group, &[]);
                     pass.set_vertex_buffer(0, hatch.vertex_buffer.slice(..));
                     pass.set_vertex_buffer(1, hatch.placement_buffer.slice(..));
-                    pass.set_index_buffer(
-                        hatch.index_buffer.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
+                    pass.set_index_buffer(hatch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..hatch.index_count, 0, 0..hatch.instance_count);
                 }
             }

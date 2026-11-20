@@ -53,10 +53,23 @@ pub fn intrinsic<'a>(
     max: Size,
     extra: Vector,
 ) -> Element<'a, Message> {
+    intrinsic_with_min(measurement, content, max, extra, Size::ZERO)
+}
+
+/// Intrinsic modal measurement with a content minimum. The minimum is still
+/// capped by the actual viewport in `layout`, so small windows remain usable.
+pub fn intrinsic_with_min<'a>(
+    measurement: impl Into<Element<'a, Message>>,
+    content: impl Into<Element<'a, Message>>,
+    max: Size,
+    extra: Vector,
+    min: Size,
+) -> Element<'a, Message> {
     Element::new(Intrinsic {
         children: [measurement.into(), content.into()],
         max,
         extra,
+        min,
     })
 }
 
@@ -64,6 +77,7 @@ struct Intrinsic<'a> {
     children: [Element<'a, Message>; 2],
     max: Size,
     extra: Vector,
+    min: Size,
 }
 
 impl Widget<Message, Theme, Renderer> for Intrinsic<'_> {
@@ -73,8 +87,8 @@ impl Widget<Message, Theme, Renderer> for Intrinsic<'_> {
 
     fn size(&self) -> Size<Length> {
         Size::new(
-            Length::Fit.max(self.max.width + self.extra.x),
-            Length::Fit.max(self.max.height + self.extra.y),
+            Length::Fit.max((self.max.width + self.extra.x).max(self.min.width)),
+            Length::Fit.max((self.max.height + self.extra.y).max(self.min.height)),
         )
     }
 
@@ -89,17 +103,24 @@ impl Widget<Message, Theme, Renderer> for Intrinsic<'_> {
             self.max.height.min(limits.max().height),
         );
         let measure_limits = layout::Limits::new(Size::ZERO, measure_max);
-        let measured = self.children[0]
-            .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, &measure_limits);
+        let measured = self.children[0].as_widget_mut().layout(
+            &mut tree.children[0],
+            renderer,
+            &measure_limits,
+        );
         let size = Size::new(
-            (measured.size().width + self.extra.x).min(limits.max().width),
-            (measured.size().height + self.extra.y).min(limits.max().height),
+            (measured.size().width + self.extra.x)
+                .max(self.min.width)
+                .min(limits.max().width),
+            (measured.size().height + self.extra.y)
+                .max(self.min.height)
+                .min(limits.max().height),
         );
         let final_limits = layout::Limits::new(size, size);
-        let content = self.children[1]
-            .as_widget_mut()
-            .layout(&mut tree.children[1], renderer, &final_limits);
+        let content =
+            self.children[1]
+                .as_widget_mut()
+                .layout(&mut tree.children[1], renderer, &final_limits);
 
         layout::Node::with_children(size, vec![measured, content])
     }
@@ -111,9 +132,12 @@ impl Widget<Message, Theme, Renderer> for Intrinsic<'_> {
         renderer: &Renderer,
         operation: &mut dyn widget::Operation,
     ) {
-        self.children[1]
-            .as_widget_mut()
-            .operate(&mut tree.children[1], layout.child(1), renderer, operation);
+        self.children[1].as_widget_mut().operate(
+            &mut tree.children[1],
+            layout.child(1),
+            renderer,
+            operation,
+        );
     }
 
     fn update(
@@ -145,15 +169,13 @@ impl Widget<Message, Theme, Renderer> for Intrinsic<'_> {
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        self.children[1]
-            .as_widget()
-            .mouse_interaction(
-                &tree.children[1],
-                layout.child(1),
-                cursor,
-                viewport,
-                renderer,
-            )
+        self.children[1].as_widget().mouse_interaction(
+            &tree.children[1],
+            layout.child(1),
+            cursor,
+            viewport,
+            renderer,
+        )
     }
 
     fn draw(
@@ -166,17 +188,15 @@ impl Widget<Message, Theme, Renderer> for Intrinsic<'_> {
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        self.children[1]
-            .as_widget()
-            .draw(
-                &tree.children[1],
-                renderer,
-                theme,
-                style,
-                layout.child(1),
-                cursor,
-                viewport,
-            );
+        self.children[1].as_widget().draw(
+            &tree.children[1],
+            renderer,
+            theme,
+            style,
+            layout.child(1),
+            cursor,
+            viewport,
+        );
     }
 
     fn overlay<'b>(
@@ -187,15 +207,13 @@ impl Widget<Message, Theme, Renderer> for Intrinsic<'_> {
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        self.children[1]
-            .as_widget_mut()
-            .overlay(
-                &mut tree.children[1],
-                layout.child(1),
-                renderer,
-                viewport,
-                translation,
-            )
+        self.children[1].as_widget_mut().overlay(
+            &mut tree.children[1],
+            layout.child(1),
+            renderer,
+            viewport,
+            translation,
+        )
     }
 }
 
@@ -228,12 +246,7 @@ pub fn backdrop<'a>(
             .height(Length::Fill)
             .style(|theme: &Theme| container::Style {
                 background: Some(Background::Color(
-                    theme
-                        .palette()
-                        .background
-                        .strongest
-                        .color
-                        .scale_alpha(0.55),
+                    theme.palette().background.strongest.color.scale_alpha(0.55),
                 )),
                 ..Default::default()
             }),
@@ -259,12 +272,7 @@ pub fn discard_guard<'a>(
             .height(Length::Fill)
             .style(|theme: &Theme| container::Style {
                 background: Some(Background::Color(
-                    theme
-                        .palette()
-                        .background
-                        .strongest
-                        .color
-                        .scale_alpha(0.55),
+                    theme.palette().background.strongest.color.scale_alpha(0.55),
                 )),
                 ..Default::default()
             }),
@@ -272,17 +280,18 @@ pub fn discard_guard<'a>(
     .on_press(on_keep.clone());
     let panel = container(
         column![
-            iced::widget::text(crate::t!("Unsaved changes will be discarded.")).size(13.5),
+            iced::widget::text(crate::t!("Unsaved changes will be discarded."))
+                .size(crate::ui::style::text::UI_LARGE),
             Space::new().height(12),
             row![
-                button(iced::widget::text(crate::t!("Discard && close")).size(12))
+                button(iced::widget::text(crate::t!("Discard & close")).size(12))
                     .on_press(on_discard)
                     .padding([5, 14])
-                    .style(button::danger),
+                    .style(crate::ui::style::form::neutral_button),
                 button(iced::widget::text(crate::t!("Keep editing")).size(12))
                     .on_press(on_keep)
                     .padding([5, 14])
-                    .style(button::secondary),
+                    .style(crate::ui::style::form::accent_button),
             ]
             .spacing(10),
         ]
@@ -293,7 +302,9 @@ pub fn discard_guard<'a>(
     stack![
         main.into(),
         shield,
-        container(panel).center_x(Length::Fill).center_y(Length::Fill)
+        container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
     ]
     .into()
 }
@@ -362,9 +373,7 @@ pub fn modal<'a>(
     .height(Length::Fixed(24.0));
 
     let panel_style = |theme: &Theme| container::Style {
-        background: Some(Background::Color(
-            theme.palette().background.base.color,
-        )),
+        background: Some(Background::Color(theme.palette().background.base.color)),
         border: Border {
             color: theme.palette().background.neutral.color,
             width: 1.0,
@@ -377,19 +386,18 @@ pub fn modal<'a>(
     // room for the title, while the actual title bar and resize grip overlay it
     // without influencing the modal dimensions.
     let measured_content = sensor(content).on_resize(Message::ModalContentResized);
-    let body_base = column![
-        Space::new().height(Length::Fixed(24.0)),
-        measured_content,
-    ]
-    .spacing(6);
+    let body_base = column![Space::new().height(Length::Fixed(24.0)), measured_content,].spacing(6);
     let mut body = stack![body_base, title_bar];
     if options.resizable {
         let resize = mouse_area(
-            container(crate::ui::icons::themed_primary(crate::ui::icons::RESIZE, 15.0))
-                .padding([0, 2]),
+            container(crate::ui::icons::themed_primary(
+                crate::ui::icons::RESIZE,
+                15.0,
+            ))
+            .padding([0, 2]),
         )
         .on_press(Message::ModalResizeGrab)
-        .interaction(iced::mouse::Interaction::Grab);
+        .interaction(iced::mouse::Interaction::ResizingDiagonallyDown);
         body = body.push(
             container(resize)
                 .width(Length::Fill)
@@ -398,8 +406,7 @@ pub fn modal<'a>(
                 .align_y(iced::alignment::Vertical::Bottom),
         );
     }
-    let framed: Element<'a, Message> =
-        container(body).padding(10).style(panel_style).into();
+    let framed: Element<'a, Message> = container(body).padding(10).style(panel_style).into();
 
     // Position via asymmetric padding (padding is non-negative): shifting a
     // centred box by `d` on an axis needs (near − far) padding = 2·d there.
@@ -419,12 +426,7 @@ pub fn modal<'a>(
             .padding(pad)
             .style(|theme: &Theme| container::Style {
                 background: Some(Background::Color(
-                    theme
-                        .palette()
-                        .background
-                        .strongest
-                        .color
-                        .scale_alpha(0.55),
+                    theme.palette().background.strongest.color.scale_alpha(0.55),
                 )),
                 ..Default::default()
             }),
@@ -439,6 +441,124 @@ pub fn modal<'a>(
         opaque(backdrop),
     ]
     .into()
+}
+
+/// The "open in its own window" button of a tool frame or pallet title bar.
+pub const DETACH_BUTTON_ID: &str = "detach-to-window";
+
+/// The messages a tool dialog's frame sends (see [`tool_frame`]).
+pub struct ToolFrameMessages {
+    pub close: Message,
+    pub grab: Message,
+    pub resize: Message,
+    pub raise: Message,
+    /// The content's measured size.
+    pub measured: Box<dyn Fn(Size) -> Message>,
+}
+
+/// A tool dialog: framed like [`modal`], but with no backdrop, so the drawing
+/// and everything else stay usable around it. `offset` shifts it from the
+/// centre of the area it is drawn over; only the frame takes the pointer.
+pub fn tool_frame<'a>(
+    title: impl iced::widget::text::IntoFragment<'a>,
+    content: impl Into<Element<'a, Message>>,
+    offset: Vector,
+    messages: ToolFrameMessages,
+) -> Element<'a, Message> {
+    let ToolFrameMessages {
+        close,
+        grab,
+        resize,
+        raise,
+        measured,
+    } = messages;
+    let close = button(crate::ui::icons::themed_danger(
+        crate::ui::icons::CLOSE,
+        13.0,
+    ))
+    .on_press(close)
+    .padding([1, 7])
+    .style(close_style);
+    let controls = row![close].align_y(iced::Center);
+    // Left-aligned, clear of the buttons: a narrow dialog's title would run
+    // under them centred.
+    let title_surface = mouse_area(
+        container(
+            iced::widget::text(title)
+                .size(15)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .ellipsis(iced::advanced::text::Ellipsis::End),
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(24.0))
+        .padding(Padding {
+            left: 4.0,
+            right: 34.0,
+            ..Padding::ZERO
+        })
+        .align_y(iced::alignment::Vertical::Center),
+    )
+    .on_press(grab)
+    .interaction(iced::mouse::Interaction::Grab);
+    let title_bar = stack![
+        title_surface,
+        container(controls)
+            .width(Length::Fill)
+            .height(Length::Fixed(24.0))
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Center),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fixed(24.0));
+    let measured_content = sensor(content).on_resize(measured);
+    let body_base = column![Space::new().height(Length::Fixed(24.0)), measured_content].spacing(6);
+    let grip = mouse_area(
+        container(crate::ui::icons::themed_primary(
+            crate::ui::icons::RESIZE,
+            15.0,
+        ))
+        .padding([0, 2]),
+    )
+    .on_press(resize)
+    .interaction(iced::mouse::Interaction::ResizingDiagonallyDown);
+    let body = stack![
+        body_base,
+        title_bar,
+        container(grip)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Bottom),
+    ];
+    let framed = container(body)
+        .padding(10)
+        .style(|theme: &Theme| container::Style {
+            background: Some(Background::Color(theme.palette().background.base.color)),
+            border: Border {
+                color: theme.palette().background.neutral.color,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            shadow: iced::Shadow {
+                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.35),
+                offset: Vector::new(0.0, 4.0),
+                blur_radius: 14.0,
+            },
+            ..Default::default()
+        });
+    // The frame is opaque to the pointer; around it the drawing takes it.
+    let framed = opaque(mouse_area(framed).on_press(raise));
+    let pad = Padding {
+        top: offset.y.max(0.0) * 2.0,
+        right: (-offset.x).max(0.0) * 2.0,
+        bottom: (-offset.y).max(0.0) * 2.0,
+        left: offset.x.max(0.0) * 2.0,
+    };
+    container(framed)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .padding(pad)
+        .into()
 }
 
 fn close_style(theme: &Theme, status: button::Status) -> button::Style {

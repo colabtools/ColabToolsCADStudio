@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::settings::UserSettings;
-use crate::ui::ribbon::CollapseMode;
+use crate::ui::ribbon::RibbonLayout;
 use crate::ui::statusbar::statusbar_config::StatusBarConfig;
 use crate::ui::window::plot::PlotDialogState;
 
@@ -30,9 +30,29 @@ pub struct AppConfig {
     /// General edge-stack dock layout (which panels are docked, side, order,
     /// width and auto-collapse) for the Properties panel and block palette.
     pub dock: crate::ui::dock::DockState,
+    /// Whether the optional Graphic Attributes palette is visible.
+    pub show_graphic_attributes: bool,
+    /// Whether the Tool Palettes panel is visible.
+    pub show_tool_palettes: bool,
+    /// Whether the Command History pallet is open.
+    pub show_command_history: bool,
+    /// Whether the Layer Manager pallet is open.
+    pub show_layers: bool,
+    /// Whether the Blocks palette is open.
+    pub show_block_palette: bool,
+    /// Whether the document file tabs are shown (FILETAB).
+    pub show_file_tabs: bool,
+    /// The drawing tabs run across the window above the palettes, instead
+    /// of between them over the drawing (the default).
+    pub file_tabs_above_docks: bool,
+    /// Whether the layout tabs are shown (LAYOUTTAB).
+    pub show_layout_tabs: bool,
+    /// Graphic Attributes creates fills on the current layer instead of the
+    /// layer of the filled object.
+    pub graphic_fills_on_current_layer: bool,
     /// Add a newly selected annotation scale to existing annotative objects.
     pub annotation_auto_scale: i8,
-    /// Ribbon collapse density.
+    /// Ribbon layout.
     pub ribbon: RibbonConfig,
     /// Print dialog preferences (only the persisted fields; runtime state is
     /// skipped by `PlotDialogState`'s serde attributes).
@@ -41,6 +61,10 @@ pub struct AppConfig {
     pub shortcuts: ShortcutConfig,
     /// Model space background, grid, and selection appearance.
     pub model_space: ModelSpaceThemeConfig,
+    /// The user's changes to the right-click menu.
+    pub context_menu: crate::ui::popup::context_menu::MenuCustomization,
+    /// MCP control is on at start (the MCP button's last state).
+    pub mcp_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -52,11 +76,22 @@ impl Default for AppConfig {
             start: StartConfig::default(),
             statusbar: StatusBarConfig::default(),
             dock: crate::ui::dock::DockState::default(),
+            show_graphic_attributes: false,
+            show_tool_palettes: false,
+            show_command_history: false,
+            show_layers: false,
+            show_block_palette: false,
+            show_file_tabs: true,
+            file_tabs_above_docks: false,
+            show_layout_tabs: true,
+            graphic_fills_on_current_layer: false,
             annotation_auto_scale: -4,
             ribbon: RibbonConfig::default(),
             plot: PlotDialogState::default(),
             shortcuts: ShortcutConfig::default(),
             model_space: ModelSpaceThemeConfig::default(),
+            context_menu: Default::default(),
+            mcp_enabled: true,
         }
     }
 }
@@ -65,12 +100,17 @@ impl Default for AppConfig {
 #[serde(default)]
 pub struct ShortcutConfig {
     pub bindings: std::collections::BTreeMap<String, String>,
+    /// The shipped default keys this table has already been offered. A
+    /// default added in a later release is backfilled once; one the user
+    /// removed stays removed.
+    pub known_defaults: std::collections::BTreeSet<String>,
 }
 
 impl Default for ShortcutConfig {
     fn default() -> Self {
         Self {
             bindings: super::shortcuts::default_bindings(),
+            known_defaults: super::shortcuts::default_bindings().into_keys().collect(),
         }
     }
 }
@@ -102,9 +142,74 @@ impl UiThemeConfig {
     pub fn to_iced(&self) -> iced::Theme {
         if self.name == "Custom" {
             iced::Theme::custom("Custom", self.palette.to_iced())
+        } else if self.name.eq_ignore_ascii_case("System") {
+            resolve_system_theme()
         } else {
             builtin_theme(&self.name).unwrap_or(iced::Theme::Oxocarbon)
         }
+    }
+}
+
+/// Resolve the `System` color scheme (COLORSCHEME SYSTEM) to a concrete
+/// theme: the browser `prefers-color-scheme` media query on the web, the
+/// Windows `AppsUseLightTheme` personalization value natively, and the dark
+/// default on the remaining native platforms (no cheap OS query there).
+/// Read at boot (`apply_config`) and re-read whenever COLORSCHEME SYSTEM
+/// runs again — there is no live preference listener by design.
+pub fn resolve_system_theme() -> iced::Theme {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let light = web_sys::window().is_some_and(|window| {
+            window
+                .match_media("(prefers-color-scheme: light)")
+                .ok()
+                .flatten()
+                .is_some_and(|query| query.matches())
+        });
+        if light {
+            iced::Theme::Light
+        } else {
+            iced::Theme::Dark
+        }
+    }
+    #[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+    {
+        use windows_sys::Win32::System::Registry::{
+            RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD,
+        };
+        let sub_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let value: Vec<u16> = "AppsUseLightTheme"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut data: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        // ERROR_SUCCESS (0) with data 1 means the apps theme is Light; a
+        // missing value (older Windows, wiped personalization) is Dark.
+        let light = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                sub_key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                &mut data as *mut u32 as *mut core::ffi::c_void,
+                &mut size,
+            ) == 0
+                && data == 1
+        };
+        if light {
+            iced::Theme::Light
+        } else {
+            iced::Theme::Dark
+        }
+    }
+    #[cfg(not(any(target_arch = "wasm32", target_os = "windows")))]
+    {
+        iced::Theme::Dark
     }
 }
 
@@ -185,11 +290,14 @@ pub fn all_themes() -> Vec<iced::Theme> {
         .iter()
         .cloned()
         .chain(crate::ui::style::fusion_theme::fusion_themes())
+        .chain(crate::ui::style::studio_theme::studio_themes())
         .collect()
 }
 
 pub fn builtin_theme(name: &str) -> Option<iced::Theme> {
-    all_themes().into_iter().find(|theme| theme.to_string() == name)
+    all_themes()
+        .into_iter()
+        .find(|theme| theme.to_string() == name)
 }
 
 fn color_to_rgb(color: iced::Color) -> [u8; 3] {
@@ -210,14 +318,20 @@ pub(crate) fn rgb_to_hex(rgb: [u8; 3]) -> String {
 
 pub(crate) fn parse_hex(value: &str) -> Option<[u8; 3]> {
     let value = value.trim().strip_prefix('#').unwrap_or(value.trim());
-    if value.len() != 6 {
+    // Walk pairs of hex digits as chars: the old byte-length guard let a
+    // 6-byte multibyte string (`aébé`) through to fixed-offset slices that
+    // split a character. Exactly two digits per channel, or it is not a colour.
+    let mut bytes = [0u8; 3];
+    let mut chars = value.chars();
+    for slot in &mut bytes {
+        let high = chars.next()?.to_digit(16)?;
+        let low = chars.next()?.to_digit(16)?;
+        *slot = ((high << 4) | low) as u8;
+    }
+    if chars.next().is_some() {
         return None;
     }
-    Some([
-        u8::from_str_radix(&value[0..2], 16).ok()?,
-        u8::from_str_radix(&value[2..4], 16).ok()?,
-        u8::from_str_radix(&value[4..6], 16).ok()?,
-    ])
+    Some(bytes)
 }
 
 /// Canvas mode for Model space.
@@ -253,6 +367,9 @@ pub const DEFAULT_PAPER_BG: [u8; 3] = [255, 255, 255];
 /// Standard paper space desk surround [138, 138, 138].
 pub const DEFAULT_DESK_BG: [u8; 3] = [138, 138, 138];
 
+/// Default VPHIGHLIGHTOPACITY: a soft outline that does not compete with the drawing.
+pub const DEFAULT_VIEWPORT_HOVER_OPACITY: u8 = 50;
+
 /// Persistent configuration for Model Space appearance and selection visual effects.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -277,10 +394,33 @@ pub struct ModelSpaceThemeConfig {
     pub selection_crossing_color: u8,
     /// SELECTIONEFFECTCOLOR: ACI index for selected entities highlight (0 = Theme Primary, 1..=255 = ACI).
     pub selection_highlight_color: u8,
+    /// VSEDGECOLOR: the edge colour of the shaded-with-edges modes
+    /// (`None`: black).
+    pub edge_color: Option<[u8; 3]>,
+    /// VSEDGESMOOTH: crease angle in degrees; mesh edges whose faces meet
+    /// flatter are not drawn in the shaded-with-edges modes (default 1).
+    pub edge_smooth: f32,
+    /// VSOCCLUDEDEDGES: the Hidden style draws edges behind faces dashed.
+    pub occluded_edges: bool,
+    /// COMPARECOLORADDED / REMOVED / MODIFIED: COMPARE's overlay colours.
+    pub compare_added: [u8; 3],
+    pub compare_removed: [u8; 3],
+    pub compare_modified: [u8; 3],
+    /// COMPARETOLERANCE: points closer than this compare as the same.
+    pub compare_tolerance: f64,
+    /// HPDLGMODE: 0 hides the Hatch panel while HATCH runs, 1 and 2 show it.
+    pub hatch_dialog_mode: u8,
+    /// Selection highlight opacity in percent (10–100); below 100 the
+    /// object's own colour shows through.
+    pub selection_highlight_opacity: u8,
+    /// Extra screen pixels the selection highlight is drawn wider (0–6).
+    pub selection_highlight_widen: u8,
     /// SELECTIONEFFECT: whether selected objects glow with solid highlight (true) or dash (false).
     pub selection_effect: bool,
     /// SELECTIONPREVIEW bitmask: 1 = idle, 2 = during a command, 3 = both.
     pub selection_preview: u8,
+    /// Maximum number of entities highlighted while a selection box is open.
+    pub selection_preview_limit: u32,
     /// GRIPSIZE: grip marker half-size in pixels (1–25, default 5).
     pub grip_size: u8,
     /// GRIPCOLOR: unselected grip ACI color (0 = Theme Primary outline, 1..=255 = ACI).
@@ -289,6 +429,14 @@ pub struct ModelSpaceThemeConfig {
     pub grip_hot: u8,
     /// GRIPHOVER: hovered/warm grip ACI color (0 = Theme Primary Strong, 1..=255 = ACI).
     pub grip_hover: u8,
+    /// SNAPMARKERSIZE: object-snap marker half-size in pixels (1–20, default 5).
+    pub snap_marker_size: u8,
+    /// VPHIGHLIGHT: outline the Model viewport under the cursor when the
+    /// view is split into several.
+    pub viewport_hover_highlight: bool,
+    /// VPHIGHLIGHTOPACITY: strength of that outline in percent (0–100);
+    /// the default keeps it barely visible.
+    pub viewport_hover_opacity: u8,
 }
 
 impl Default for ModelSpaceThemeConfig {
@@ -304,12 +452,26 @@ impl Default for ModelSpaceThemeConfig {
             selection_window_color: 0,
             selection_crossing_color: 0,
             selection_highlight_color: 0,
+            edge_color: None,
+            edge_smooth: 1.0,
+            occluded_edges: false,
+            compare_added: crate::scene::compare::CompareSettings::default().colors[0],
+            compare_removed: crate::scene::compare::CompareSettings::default().colors[1],
+            compare_modified: crate::scene::compare::CompareSettings::default().colors[2],
+            compare_tolerance: crate::scene::compare::CompareSettings::default().tolerance,
+            hatch_dialog_mode: 2,
+            selection_highlight_opacity: 100,
+            selection_highlight_widen: 0,
             selection_effect: true,
             selection_preview: 3,
+            selection_preview_limit: 20_000,
             grip_size: 5,
             grip_color: 0,
             grip_hot: 0,
             grip_hover: 0,
+            snap_marker_size: 5,
+            viewport_hover_highlight: true,
+            viewport_hover_opacity: DEFAULT_VIEWPORT_HOVER_OPACITY,
         }
     }
 }
@@ -354,13 +516,14 @@ impl ModelSpaceThemeConfig {
 
     /// Resolve active selection highlight overlay color as [f32; 4].
     pub fn resolve_selection_color(&self) -> [f32; 4] {
-        if self.selection_highlight_color == 0 {
-            crate::scene::model::wire_model::WireModel::SELECTED
-        } else if let Some((r, g, b)) = codec::types::aci_table::aci_to_rgb(self.selection_highlight_color) {
-            [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
-        } else {
-            crate::scene::model::wire_model::WireModel::SELECTED
-        }
+        let mut color = document::types::aci_table::aci_to_rgb(self.selection_highlight_color)
+            .filter(|_| self.selection_highlight_color != 0)
+            .map_or(
+                crate::scene::model::wire_model::WireModel::SELECTED,
+                |(r, g, b)| [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0],
+            );
+        color[3] = f32::from(self.selection_highlight_opacity.clamp(10, 100)) / 100.0;
+        color
     }
 }
 
@@ -389,7 +552,9 @@ pub fn theme_canvas_background(theme: &iced::Theme) -> [u8; 3] {
         // rule: black chrome is paired with a white canvas, so falling
         // through to the palette below would paint model space black and
         // undo the whole point of the theme.
-        other => match crate::ui::style::fusion_theme::fusion_canvas(other) {
+        other => match crate::ui::style::fusion_theme::fusion_canvas(other)
+            .or_else(|| crate::ui::style::studio_theme::studio_canvas(other))
+        {
             Some(rgb) => rgb,
             None => color_to_rgb(other.palette().background.base.color),
         },
@@ -425,6 +590,7 @@ pub fn parse_theme_name(s: &str) -> Option<iced::Theme> {
         "FERRA" => Some(iced::Theme::Ferra),
         "FUSIONBLACK" => Some(crate::ui::style::fusion_theme::fusion_black()),
         "FUSIONWHITE" => Some(crate::ui::style::fusion_theme::fusion_white()),
+        "STUDIODARK" => Some(crate::ui::style::studio_theme::studio_dark()),
         _ => None,
     }
 }
@@ -436,6 +602,8 @@ pub struct RecentConfig {
     pub files: Vec<String>,
     /// How many recent files to keep.
     pub limit: usize,
+    /// List, icons or large previews.
+    pub view: super::RecentView,
 }
 
 impl Default for RecentConfig {
@@ -443,6 +611,7 @@ impl Default for RecentConfig {
         Self {
             files: Vec::new(),
             limit: super::recent::RECENT_DEFAULT,
+            view: super::RecentView::default(),
         }
     }
 }
@@ -456,7 +625,10 @@ pub struct StartConfig {
 #[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct RibbonConfig {
-    pub collapse: CollapseMode,
+    /// Hidden tabs and panels, panel order, panel titles, minimize state and
+    /// pinned slide-outs, stored as fields of this section.
+    #[serde(flatten)]
+    pub layout: RibbonLayout,
 }
 
 impl AppConfig {
@@ -520,6 +692,25 @@ fn config_path() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_scheme_resolves_to_a_concrete_theme_and_keeps_its_name() {
+        // Fresh configs keep the existing default; SYSTEM is opt-in.
+        assert_ne!(UiThemeConfig::default().name, "System");
+        let mut cfg = UiThemeConfig::default();
+        cfg.name = "System".to_string();
+        let resolved = cfg.to_iced();
+        // Case-insensitive like the other stored names.
+        cfg.name = "system".to_string();
+        assert_eq!(cfg.to_iced(), resolved);
+        assert!(
+            matches!(resolved, iced::Theme::Light | iced::Theme::Dark),
+            "SYSTEM must resolve through the platform preference"
+        );
+        // The stored name survives resolution; re-runs re-resolve.
+        assert_eq!(cfg.name, "system");
+        assert_eq!(resolve_system_theme(), resolved);
+    }
 
     #[test]
     fn test_model_space_defaults() {
@@ -592,7 +783,8 @@ mod tests {
         original.model_space.selection_window_color = 5;
 
         let serialized = serde_json::to_string(&original).expect("serialize config");
-        let deserialized: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        let deserialized: AppConfig =
+            serde_json::from_str(&serialized).expect("deserialize config");
 
         assert_eq!(deserialized.model_space.mode, ModelSpaceMode::Custom);
         assert_eq!(deserialized.model_space.custom_bg, Some([12, 34, 56]));
@@ -602,14 +794,257 @@ mod tests {
     }
 
     #[test]
+    fn graphic_attributes_visibility_defaults_off_and_round_trips() {
+        let missing: AppConfig = serde_json::from_str("{}").expect("deserialize old config");
+        assert!(!missing.show_graphic_attributes);
+
+        let mut original = AppConfig::default();
+        original.show_graphic_attributes = true;
+        let serialized = serde_json::to_string(&original).expect("serialize config");
+        let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        assert!(restored.show_graphic_attributes);
+    }
+
+    #[test]
+    fn svg_text_as_outlines_defaults_off_and_round_trips() {
+        let old: AppConfig = serde_json::from_str(r#"{"plot":{}}"#).expect("old config");
+        assert!(!old.plot.text_as_outlines);
+
+        let mut original = AppConfig::default();
+        original.plot.text_as_outlines = true;
+        let serialized = serde_json::to_string(&original).expect("serialize config");
+        let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        assert!(restored.plot.text_as_outlines);
+    }
+
+    #[test]
+    fn non_scaling_stroke_config_default_and_round_trip() {
+        let old: AppConfig = serde_json::from_str(r#"{"plot":{}}"#).expect("old config");
+        assert!(!old.plot.non_scaling_stroke);
+
+        let mut original = AppConfig::default();
+        original.plot.non_scaling_stroke = true;
+        let serialized = serde_json::to_string(&original).expect("serialize config");
+        let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        assert!(restored.plot.non_scaling_stroke);
+    }
+
+    #[test]
+    fn layer_attributes_config_default_and_round_trip() {
+        let old: AppConfig = serde_json::from_str(r#"{"plot":{}}"#).expect("old config");
+        assert!(!old.plot.layer_attributes);
+
+        let mut original = AppConfig::default();
+        original.plot.layer_attributes = true;
+        let serialized = serde_json::to_string(&original).expect("serialize config");
+        let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        assert!(restored.plot.layer_attributes);
+    }
+
+    #[test]
+    fn geopdf_config_defaults_off_and_round_trips() {
+        let old: AppConfig = serde_json::from_str(r#"{"plot":{}}"#).expect("old config");
+        assert!(!old.plot.geopdf);
+
+        let mut original = AppConfig::default();
+        original.plot.geopdf = true;
+        let serialized = serde_json::to_string(&original).expect("serialize config");
+        let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        assert!(restored.plot.geopdf);
+    }
+
+    #[test]
+    fn ribbon_layout_defaults_and_round_trips() {
+        use crate::ui::ribbon::{MinimizePref, RibbonMinimize};
+
+        // A config from before the layout settings keeps loading, with the
+        // default layout; the panel density it may still hold is ignored.
+        let old: AppConfig =
+            serde_json::from_str(r#"{"ribbon":{"collapse":"Compact"}}"#).expect("old config");
+        assert!(old.ribbon.layout == RibbonLayout::default());
+        assert!(old.ribbon.layout.show_panel_titles);
+        assert!(old.ribbon.layout.search_expanded);
+
+        let mut original = AppConfig::default();
+        let layout = &mut original.ribbon.layout;
+        layout.hidden_tabs.insert("manage".into());
+        layout.hidden_panels.insert("draw/Groups".into());
+        layout.panel_order.insert(
+            "draw".into(),
+            vec!["draw/Modify".into(), "draw/Draw".into()],
+        );
+        layout.show_panel_titles = false;
+        layout.minimize = RibbonMinimize::PanelTitles;
+        layout.minimize_pref = MinimizePref::Tabs;
+        layout.pinned_slideouts.insert("draw/Draw".into());
+        layout.search_expanded = false;
+
+        let serialized = serde_json::to_string(&original).expect("serialize config");
+        // The fields sit directly in the ribbon section.
+        let value: serde_json::Value = serde_json::from_str(&serialized).expect("json");
+        assert_eq!(value["ribbon"]["hidden_tabs"][0], "manage");
+        assert_eq!(value["ribbon"]["minimize"], "PanelTitles");
+        assert_eq!(value["ribbon"]["search_expanded"], false);
+        let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        assert!(restored.ribbon == original.ribbon);
+    }
+
+    #[test]
+    fn quick_access_toolbar_defaults_and_round_trips() {
+        use crate::ui::ribbon::{QatBuiltin, QatItem};
+
+        // A config saved before the toolbar was customizable shows today's
+        // toolbar.
+        let old: AppConfig =
+            serde_json::from_str(r#"{"ribbon":{"search_expanded":false}}"#).expect("old config");
+        assert_eq!(old.ribbon.layout.qat, crate::ui::ribbon::default_qat());
+        assert!(!old.ribbon.layout.qat_below);
+        assert!(old.ribbon.layout.qat_faces.is_empty());
+
+        let mut original = AppConfig::default();
+        let layout = &mut original.ribbon.layout;
+        layout.qat = vec![
+            QatItem::Command("QSAVE".into()),
+            QatItem::Separator,
+            QatItem::Builtin(QatBuiltin::LayerCombo),
+            QatItem::Command("ZOOM E".into()),
+            QatItem::Builtin(QatBuiltin::DimStyle),
+        ];
+        layout.qat_below = true;
+        layout
+            .qat_faces
+            .insert("MEASURE_MENU".into(), "AREA".into());
+        let serialized = serde_json::to_string(&original).expect("serialize config");
+        let value: serde_json::Value = serde_json::from_str(&serialized).expect("json");
+        assert_eq!(value["ribbon"]["qat"][0]["Command"], "QSAVE");
+        assert_eq!(value["ribbon"]["qat"][1], "Separator");
+        assert_eq!(value["ribbon"]["qat"][2]["Builtin"], "LayerCombo");
+        assert_eq!(value["ribbon"]["qat"][4]["Builtin"], "DimStyle");
+        assert_eq!(value["ribbon"]["qat_below"], true);
+        let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        assert!(restored.ribbon == original.ribbon);
+    }
+
+    #[test]
+    fn ribbon_centering_and_wheel_default_and_round_trip() {
+        // A config saved before these options keeps the ribbon at its left
+        // edge and lets the wheel step through the tabs.
+        let old: AppConfig =
+            serde_json::from_str(r#"{"ribbon":{"qat_below":true}}"#).expect("old config");
+        assert!(!old.ribbon.layout.centered);
+        assert!(old.ribbon.layout.wheel_switches_tabs);
+
+        let mut original = AppConfig::default();
+        original.ribbon.layout.centered = true;
+        original.ribbon.layout.wheel_switches_tabs = false;
+        let serialized = serde_json::to_string(&original).expect("serialize config");
+        let value: serde_json::Value = serde_json::from_str(&serialized).expect("json");
+        assert_eq!(value["ribbon"]["centered"], true);
+        assert_eq!(value["ribbon"]["wheel_switches_tabs"], false);
+        let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        assert!(restored.ribbon == original.ribbon);
+    }
+
+    #[test]
+    fn the_ribbon_options_reach_the_ribbon_and_the_saved_config() {
+        use crate::app::{Message, OpenCADStudio};
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.update(Message::RibbonCenteredChanged(true));
+        let _ = app.update(Message::RibbonWheelTabsChanged(false));
+        assert!(app.ribbon.layout().centered);
+        assert!(!app.ribbon.layout().wheel_switches_tabs);
+        let saved = app.current_config();
+        assert!(saved.ribbon.layout.centered);
+        assert!(!saved.ribbon.layout.wheel_switches_tabs);
+    }
+
+    #[test]
+    fn floating_panels_default_and_round_trip() {
+        use crate::ui::ribbon::FloatingPanel;
+
+        // A config from before floating panels has none, and a saved panel
+        // missing newer fields loads with their defaults.
+        let old: AppConfig =
+            serde_json::from_str(r#"{"ribbon":{"minimize":"Off"}}"#).expect("old config");
+        assert!(old.ribbon.layout.floating.is_empty());
+        let partial: AppConfig = serde_json::from_str(
+            r#"{"ribbon":{"floating":[{"key":"draw/Draw","module_id":"draw","x":10,"y":20}]}}"#,
+        )
+        .expect("partial panel");
+        let panel = &partial.ribbon.layout.floating[0];
+        assert_eq!((panel.x, panel.y, panel.z), (10.0, 20.0, 0));
+        assert!(!panel.extras_right && !panel.pinned);
+
+        let mut original = AppConfig::default();
+        original.ribbon.layout.floating = vec![
+            FloatingPanel {
+                key: "draw/Draw".into(),
+                module_id: "draw".into(),
+                x: 120.5,
+                y: 300.0,
+                extras_right: true,
+                pinned: true,
+                z: 2,
+            },
+            FloatingPanel {
+                key: "draw/Modify".into(),
+                module_id: "draw".into(),
+                x: 400.0,
+                y: 300.0,
+                z: 1,
+                ..FloatingPanel::default()
+            },
+        ];
+        let serialized = serde_json::to_string(&original).expect("serialize config");
+        let value: serde_json::Value = serde_json::from_str(&serialized).expect("json");
+        assert_eq!(value["ribbon"]["floating"][0]["key"], "draw/Draw");
+        assert_eq!(value["ribbon"]["floating"][0]["extras_right"], true);
+        let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        assert!(restored.ribbon == original.ribbon);
+    }
+
+    #[test]
     fn test_parse_theme_name() {
         assert_eq!(parse_theme_name("light"), Some(iced::Theme::Light));
         assert_eq!(parse_theme_name("DARK"), Some(iced::Theme::Dark));
-        assert_eq!(parse_theme_name("solarized light"), Some(iced::Theme::SolarizedLight));
-        assert_eq!(parse_theme_name("tokyo-night-storm"), Some(iced::Theme::TokyoNightStorm));
-        assert_eq!(parse_theme_name("Kanagawa_Lotus"), Some(iced::Theme::KanagawaLotus));
+        assert_eq!(
+            parse_theme_name("solarized light"),
+            Some(iced::Theme::SolarizedLight)
+        );
+        assert_eq!(
+            parse_theme_name("tokyo-night-storm"),
+            Some(iced::Theme::TokyoNightStorm)
+        );
+        assert_eq!(
+            parse_theme_name("Kanagawa_Lotus"),
+            Some(iced::Theme::KanagawaLotus)
+        );
+        assert_eq!(
+            parse_theme_name("studio dark"),
+            Some(crate::ui::style::studio_theme::studio_dark())
+        );
         assert_eq!(parse_theme_name("1"), None);
         assert_eq!(parse_theme_name("0"), None);
         assert_eq!(parse_theme_name("nonexistent_theme"), None);
+    }
+
+    /// The old guard checked the BYTE length (`value.len() != 6`) but sliced
+    /// at fixed byte offsets — a 6-byte multibyte string like `aébé` passed
+    /// the guard and then split a character:
+    /// `byte index 2 is not a char boundary; it is inside 'é'`. Pasting it
+    /// into any Options colour field killed the process on the keystroke.
+    #[test]
+    fn test_parse_hex_rejects_multibyte_input_without_panicking() {
+        for value in ["aébé", "#aébé", "éééééé", "#ébé#"] {
+            assert_eq!(parse_hex(value), None, "{value} should not parse");
+        }
+        // Non-hex garbage and wrong lengths stay None.
+        for value in ["gggggg", "a1b2c", "a1b2c34", "#GGHHII"] {
+            assert_eq!(parse_hex(value), None, "{value} should not parse");
+        }
+        // Valid input keeps working, with and without '#', with whitespace.
+        assert_eq!(parse_hex("a1b2c3"), Some([0xa1, 0xb2, 0xc3]));
+        assert_eq!(parse_hex("#A1B2C3"), Some([0xa1, 0xb2, 0xc3]));
+        assert_eq!(parse_hex("  000000  "), Some([0, 0, 0]));
     }
 }

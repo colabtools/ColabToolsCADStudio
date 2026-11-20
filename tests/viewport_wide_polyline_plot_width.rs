@@ -6,9 +6,9 @@
 //! 0.15 mm): every single-line diagram plotted as black blobs.
 #![cfg(not(target_arch = "wasm32"))]
 
-use codec::entities::{LwPolyline, LwVertex, Viewport};
-use codec::types::{Vector2, Vector3};
-use codec::EntityType;
+use document::entities::{LwPolyline, LwVertex, Viewport};
+use document::types::{Vector2, Vector3};
+use document::EntityType;
 use OpenCADStudio::scene::Scene;
 
 #[test]
@@ -43,7 +43,7 @@ fn viewport_projection_scales_wide_polyline_band_width() {
     viewport.view_center = Vector3::new(50.0, 0.0, 0.0);
     viewport.id = 2;
     viewport.status.is_on = true;
-    scene.add_entity(EntityType::Viewport(viewport));
+    scene.add_entity(EntityType::Viewport(Box::new(viewport)));
 
     let (_paper, model) = scene.plot_wire_groups(None);
     let band = model

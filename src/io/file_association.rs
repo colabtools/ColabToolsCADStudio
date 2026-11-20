@@ -230,8 +230,27 @@ mod windows_impl {
             if owns_com {
                 CoUninitialize();
             }
-            result
+            // Windows 10/11 retired the advanced-association dialog (it fails
+            // with 0x80070490, #725); its Settings page takes over.
+            result.or_else(|error| open_default_apps_settings().ok_or(error))
         }
+    }
+
+    /// Open Settings → Default apps on this app's page (Windows 11; Windows
+    /// 10 shows the general page).
+    fn open_default_apps_settings() -> Option<String> {
+        let uri = format!(
+            "ms-settings:defaultapps?registeredAppUser={}",
+            APP_REGISTRY_NAME.replace(' ', "%20")
+        );
+        std::process::Command::new("explorer.exe")
+            .arg(uri)
+            .spawn()
+            .ok()?;
+        Some(
+            "Opened Settings → Default apps — choose Open CAD Studio for .dwg / .dxf there."
+                .to_string(),
+        )
     }
 
     use windows_sys::Win32::System::Registry::{
@@ -269,7 +288,10 @@ mod windows_impl {
     }
 
     fn wide(s: &str) -> Vec<u16> {
-        std::ffi::OsStr::new(s).encode_wide().chain(Some(0)).collect()
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(Some(0))
+            .collect()
     }
 
     // Create `subkey` under HKCU and write `data` into `value` (None = the key's
@@ -298,9 +320,8 @@ mod windows_impl {
         let data_w = wide(data);
         // cbData counts bytes including the trailing NUL that `wide` appended.
         let cb = (data_w.len() * std::mem::size_of::<u16>()) as u32;
-        let rc = unsafe {
-            RegSetValueExW(hkey, name_ptr, 0, REG_SZ, data_w.as_ptr() as *const u8, cb)
-        };
+        let rc =
+            unsafe { RegSetValueExW(hkey, name_ptr, 0, REG_SZ, data_w.as_ptr() as *const u8, cb) };
         unsafe { RegCloseKey(hkey) };
         if rc != 0 {
             return Err(format!("RegSetValueExW failed ({rc}) for {subkey}"));
@@ -348,7 +369,11 @@ mod windows_impl {
     fn register_progid(exe: &str, progid: &str, description: &str) -> Result<(), String> {
         let base = format!(r"Software\Classes\{progid}");
         set_string(&base, None, description)?;
-        set_string(&format!(r"{base}\DefaultIcon"), None, &format!("\"{exe}\",0"))?;
+        set_string(
+            &format!(r"{base}\DefaultIcon"),
+            None,
+            &format!("\"{exe}\",0"),
+        )?;
         set_string(
             &format!(r"{base}\shell\open\command"),
             None,
@@ -377,7 +402,11 @@ mod windows_impl {
         set_string(APP_BASE, Some("FriendlyAppName"), "Open CAD Studio")?;
         // DefaultIcon is what Windows uses to show the app icon in the
         // "Open with" context-menu list and the "Choose another app" picker.
-        set_string(&format!(r"{APP_BASE}\DefaultIcon"), None, &format!("\"{exe}\",0"))?;
+        set_string(
+            &format!(r"{APP_BASE}\DefaultIcon"),
+            None,
+            &format!("\"{exe}\",0"),
+        )?;
         // Listing the extensions under SupportedTypes is what makes the app
         // appear in the "Open with → Choose another app" picker for them.
         set_string(&format!(r"{APP_BASE}\SupportedTypes"), Some(".dwg"), "")?;
@@ -391,6 +420,12 @@ mod windows_impl {
         register_progid(&exe, "OpenCADStudio.DWG", "DWG Drawing")?;
         register_progid(&exe, "OpenCADStudio.DXF", "DXF Drawing")?;
         register_progid(&exe, "OpenCADStudio.BAK", "CAD Backup")?;
+        // Backups keep the system's generic icon so they stand apart from the
+        // drawings next to them (#2875).
+        let bak_icon = wide(r"Software\Classes\OpenCADStudio.BAK\DefaultIcon");
+        unsafe {
+            RegDeleteTreeW(HKEY_CURRENT_USER, bak_icon.as_ptr());
+        }
         // Also offer the ProgIDs in each extension's Open-with list.
         set_string(
             r"Software\Classes\.dwg\OpenWithProgids",
@@ -420,9 +455,21 @@ mod windows_impl {
             Some("ApplicationDescription"),
             "2D/3D CAD application for DWG and DXF drawings.",
         )?;
-        set_string(&format!(r"{CAP}\FileAssociations"), Some(".dwg"), "OpenCADStudio.DWG")?;
-        set_string(&format!(r"{CAP}\FileAssociations"), Some(".dxf"), "OpenCADStudio.DXF")?;
-        set_string(&format!(r"{CAP}\FileAssociations"), Some(".bak"), "OpenCADStudio.BAK")?;
+        set_string(
+            &format!(r"{CAP}\FileAssociations"),
+            Some(".dwg"),
+            "OpenCADStudio.DWG",
+        )?;
+        set_string(
+            &format!(r"{CAP}\FileAssociations"),
+            Some(".dxf"),
+            "OpenCADStudio.DXF",
+        )?;
+        set_string(
+            &format!(r"{CAP}\FileAssociations"),
+            Some(".bak"),
+            "OpenCADStudio.BAK",
+        )?;
         set_string(
             r"Software\RegisteredApplications",
             Some("Open CAD Studio"),
@@ -466,6 +513,29 @@ mod linux_impl {
         Ok(())
     }
 
+    /// The .desktop entry the AppImage and the snap ship. The entry written
+    /// below is built from it, so the two cannot drift apart: it keeps the
+    /// translated Comment/Keywords that scripts/export-locales.py maintains,
+    /// and a StartupWMClass equal to APP_ID, which is the X11 WM_CLASS iced
+    /// gives the window (see `boot` in app/mod.rs).
+    const PACKAGED_DESKTOP_ENTRY: &str = include_str!("../../packaging/OpenCADStudio.desktop");
+
+    /// The packaged .desktop entry with `Exec=` pointed at `exec`. The
+    /// packaged `Exec=OpenCADStudio` relies on PATH, which a portable binary
+    /// or an AppImage is not on.
+    fn desktop_entry(exec: &str) -> String {
+        let mut entry = String::with_capacity(PACKAGED_DESKTOP_ENTRY.len() + exec.len());
+        for line in PACKAGED_DESKTOP_ENTRY.lines() {
+            if line.starts_with("Exec=") {
+                entry.push_str(&format!("Exec={exec} %F"));
+            } else {
+                entry.push_str(line);
+            }
+            entry.push('\n');
+        }
+        entry
+    }
+
     /// Write a user-level .desktop file pointing at the running binary, then
     /// refresh the MIME cache so file managers list us under "Open with".
     /// Skipped when a system package already registered the app, so we don't
@@ -500,19 +570,7 @@ mod linux_impl {
         let apps = data_home()?.join("applications");
         let desktop_path = apps.join(format!("{APP_ID}.desktop"));
 
-        let contents = format!(
-            "[Desktop Entry]\n\
-             Name=Open CAD Studio\n\
-             Comment=A CAD application for 2D/3D drawing and design\n\
-             Exec={exec} %F\n\
-             Icon={APP_ID}\n\
-             Terminal=false\n\
-             Type=Application\n\
-             Categories=Graphics;Engineering;\n\
-             MimeType=image/vnd.dwg;image/vnd.dxf;\n\
-             Keywords=CAD;DWG;DXF;drawing;design;\n\
-             StartupWMClass=OpenCADStudio\n"
-        );
+        let contents = desktop_entry(&exec);
 
         // The icon is checked first and on its own. It and the .desktop entry
         // change for different reasons — the entry only when this text does,
@@ -653,6 +711,7 @@ mod linux_impl {
         let mut changed = false;
         for (name, bytes) in [
             ("image-vnd.dwg.svg", DWG_ICON),
+            ("application-x-dwg.svg", DWG_ICON),
             ("image-vnd.dxf.svg", DXF_ICON),
         ] {
             let path = dir.join(name);
@@ -671,7 +730,38 @@ mod linux_impl {
                 .args(["--force", "--quiet", &hicolor.to_string_lossy()])
                 .status();
         }
+        install_mime_icon_names();
         Ok(())
+    }
+
+    fn install_mime_icon_names() {
+        let Ok(home) = data_home() else { return };
+        let pkgs = home.join("mime/packages");
+        let xml_path = pkgs.join(format!("{APP_ID}-icons.xml"));
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="image/vnd.dwg">
+    <icon name="image-vnd.dwg"/>
+    <generic-icon name="image-vnd.dwg"/>
+  </mime-type>
+  <mime-type type="application/x-dwg">
+    <icon name="application-x-dwg"/>
+    <generic-icon name="application-x-dwg"/>
+  </mime-type>
+  <mime-type type="image/vnd.dxf">
+    <icon name="image-vnd.dxf"/>
+    <generic-icon name="image-vnd.dxf"/>
+  </mime-type>
+</mime-info>
+"#;
+        if std::fs::read_to_string(&xml_path).ok().as_deref() == Some(xml) {
+            return;
+        }
+        if std::fs::create_dir_all(&pkgs).is_ok() && std::fs::write(&xml_path, xml).is_ok() {
+            let _ = std::process::Command::new("update-mime-database")
+                .arg(home.join("mime"))
+                .status();
+        }
     }
 
     fn data_home() -> Result<PathBuf, String> {
@@ -691,6 +781,37 @@ mod linux_impl {
             Ok("Open CAD Studio is now the default for .dwg and .dxf files.".to_string())
         } else {
             Err(format!("xdg-mime exited with {status}"))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{desktop_entry, PACKAGED_DESKTOP_ENTRY};
+        use crate::io::file_association::APP_ID;
+
+        #[test]
+        fn written_desktop_entry_is_the_packaged_one_with_an_absolute_exec() {
+            let entry = desktop_entry("/home/user/Apps/OpenCADStudio.AppImage");
+            let lines: Vec<&str> = entry.lines().collect();
+
+            let exec: Vec<&&str> = lines.iter().filter(|l| l.starts_with("Exec=")).collect();
+            assert_eq!(exec, [&"Exec=/home/user/Apps/OpenCADStudio.AppImage %F"]);
+
+            // On X11 the taskbar ties the window to this entry through
+            // StartupWMClass, which must equal the WM_CLASS iced sets: APP_ID.
+            assert!(lines.contains(&format!("Icon={APP_ID}").as_str()));
+            assert!(lines.contains(&format!("StartupWMClass={APP_ID}").as_str()));
+            assert!(lines.contains(&"MimeType=image/vnd.dwg;image/vnd.dxf;"));
+
+            // Everything else, translations included, is the packaged file.
+            let packaged: Vec<&str> = PACKAGED_DESKTOP_ENTRY.lines().collect();
+            assert_eq!(lines.len(), packaged.len());
+            for (written, shipped) in lines.iter().zip(&packaged) {
+                if !shipped.starts_with("Exec=") {
+                    assert_eq!(written, shipped);
+                }
+            }
+            assert!(lines.iter().any(|l| l.starts_with("Comment[")));
         }
     }
 }

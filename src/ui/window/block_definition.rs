@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use codec::Handle;
+use document::Handle;
 use iced::widget::{
     button, checkbox, column, combo_box, container, mouse_area, pick_list, row, stack, text,
     text_editor, text_input, Space,
@@ -11,28 +11,25 @@ use iced::widget::{
 use iced::{Background, Border, Element, Fill, Length, Theme};
 
 use crate::app::Message;
+use crate::entities::common::{coordinate_text, parse_length};
 use crate::modules::draw::units;
+use crate::scene::WireModel;
 use crate::t;
 use crate::ui::style::common::muted_style;
 use crate::ui::style::form::{button_style, dialog_button, field_style, form_radio};
 
-static ICON_PICK_POINT: &[u8] = include_bytes!("../../../assets/icons/blocks/pick_point.svg");
+static ICON_PICK_POINT: &[u8] = include_bytes!("../../../assets/icons/point.svg");
 static ICON_SELECT_OBJECTS: &[u8] =
     include_bytes!("../../../assets/icons/blocks/select_objects.svg");
 static ICON_QUICK_SELECT: &[u8] = include_bytes!("../../../assets/icons/blocks/quick_select.svg");
 static ICON_WARN: &[u8] = include_bytes!("../../../assets/icons/ui/warning_triangle.svg");
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum BlockObjectMode {
     Retain,
+    #[default]
     Convert,
     Delete,
-}
-
-impl Default for BlockObjectMode {
-    fn default() -> Self {
-        BlockObjectMode::Convert
-    }
 }
 
 /// Dropdown entry for the Block Unit picker.
@@ -66,6 +63,10 @@ pub struct BlockDefinitionState {
     pub scale_uniformly: bool,
     pub allow_exploding: bool,
     pub unit: i16,
+    /// LUPREC — how many decimals the base point fields show. The fields are
+    /// typed back, so they always print plain decimals rather than the
+    /// drawing's formatted length style.
+    pub precision: i16,
     pub description: String,
     pub description_content: text_editor::Content,
     pub hyperlink_url: String,
@@ -73,6 +74,14 @@ pub struct BlockDefinitionState {
     pub error_message: Option<String>,
     pub confirm_redefine: Option<String>,
     pub desc_placeholder: String,
+    /// The selected objects, or the chosen existing definition, as drawn in
+    /// the name card.
+    pub preview: Vec<WireModel>,
+    /// OK was pressed with no objects: the band offers to select some or to
+    /// define an empty block.
+    pub empty_prompt: bool,
+    /// Open the new block in the block editor once it is defined.
+    pub open_in_editor: bool,
 }
 
 impl Clone for BlockDefinitionState {
@@ -93,6 +102,7 @@ impl Clone for BlockDefinitionState {
             scale_uniformly: self.scale_uniformly,
             allow_exploding: self.allow_exploding,
             unit: self.unit,
+            precision: self.precision,
             description: self.description.clone(),
             description_content: text_editor::Content::with_text(&self.description),
             hyperlink_url: self.hyperlink_url.clone(),
@@ -100,28 +110,41 @@ impl Clone for BlockDefinitionState {
             error_message: self.error_message.clone(),
             confirm_redefine: self.confirm_redefine.clone(),
             desc_placeholder: self.desc_placeholder.clone(),
+            preview: self.preview.clone(),
+            empty_prompt: self.empty_prompt,
+            open_in_editor: self.open_in_editor,
         }
     }
 }
 
 impl BlockDefinitionState {
-    pub fn new(existing_names: Vec<String>, pre_selected: Vec<Handle>, default_unit: i16) -> Self {
+    pub fn new(
+        existing_names: Vec<String>,
+        pre_selected: Vec<Handle>,
+        default_unit: i16,
+        precision: i16,
+    ) -> Self {
+        // The on-screen switches, the conversion and Allow exploding start
+        // where the dialog was last confirmed.
+        let remembered = *crate::modules::insert::block_cmdline::defaults();
+        let zero = coordinate_text(0.0, precision);
         Self {
             name: String::new(),
             name_combo: combo_box::State::new(existing_names.clone()),
             existing_names,
-            base_point_specify_onscreen: false,
-            base_point_x: "0.0000".to_string(),
-            base_point_y: "0.0000".to_string(),
-            base_point_z: "0.0000".to_string(),
-            objects_specify_onscreen: false,
+            base_point_specify_onscreen: remembered.base_on_screen,
+            base_point_x: zero.clone(),
+            base_point_y: zero.clone(),
+            base_point_z: zero,
+            objects_specify_onscreen: remembered.objects_on_screen,
             selected_handles: pre_selected,
-            object_mode: BlockObjectMode::Convert,
+            object_mode: remembered.mode,
             annotative: false,
             match_orientation: false,
             scale_uniformly: false,
-            allow_exploding: true,
+            allow_exploding: remembered.allow_exploding,
             unit: default_unit,
+            precision,
             description: String::new(),
             description_content: text_editor::Content::new(),
             hyperlink_url: String::new(),
@@ -129,14 +152,26 @@ impl BlockDefinitionState {
             error_message: None,
             confirm_redefine: None,
             desc_placeholder: crate::t!("Enter block description...").into_owned(),
+            preview: Vec::new(),
+            empty_prompt: false,
+            open_in_editor: remembered.open_in_editor,
         }
     }
 
     pub fn parse_base_point(&self) -> glam::DVec3 {
-        let x = self.base_point_x.trim().parse::<f64>().unwrap_or(0.0);
-        let y = self.base_point_y.trim().parse::<f64>().unwrap_or(0.0);
-        let z = self.base_point_z.trim().parse::<f64>().unwrap_or(0.0);
+        let x = parse_length(&self.base_point_x).unwrap_or(0.0);
+        let y = parse_length(&self.base_point_y).unwrap_or(0.0);
+        let z = parse_length(&self.base_point_z).unwrap_or(0.0);
         glam::DVec3::new(x, y, z)
+    }
+
+    /// Show a base point in the fields — a definition's existing base when
+    /// redefining, or a point picked from the drawing — printed at the
+    /// drawing's precision.
+    pub fn set_base_point(&mut self, base: glam::DVec3) {
+        self.base_point_x = coordinate_text(base.x, self.precision);
+        self.base_point_y = coordinate_text(base.y, self.precision);
+        self.base_point_z = coordinate_text(base.z, self.precision);
     }
 
     pub fn is_existing_name(&self) -> bool {
@@ -149,13 +184,18 @@ impl BlockDefinitionState {
     }
 
     pub fn invalid_name_char(&self) -> Option<char> {
-        self.name.chars().find(|&c| {
-            matches!(
-                c,
-                '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '=' | '`'
-            )
-        })
+        invalid_block_name_char(&self.name)
     }
+}
+
+/// The first character a block name may not hold: \ < > / ? " : ; * | , = `
+pub fn invalid_block_name_char(name: &str) -> Option<char> {
+    name.chars().find(|&c| {
+        matches!(
+            c,
+            '\\' | '<' | '>' | '/' | '?' | '"' | ':' | ';' | '*' | '|' | ',' | '=' | '`'
+        )
+    })
 }
 
 pub(crate) fn group<'a>(
@@ -168,7 +208,7 @@ pub(crate) fn group<'a>(
             text(title.into())
                 .size(11)
                 .style(|theme: &Theme| text::Style {
-                    color: Some(theme.palette().background.strongest.text.scale_alpha(0.85)),
+                    color: Some(crate::ui::style::readable::muted_text(theme)),
                 }),
             body.into(),
         ]
@@ -202,6 +242,45 @@ pub(crate) fn labeled_checkbox<'a>(
     .into()
 }
 
+/// The in-window warning shown when OK is pressed with no objects: select
+/// some, or define an empty block.
+fn empty_band<'a>() -> Element<'a, Message> {
+    container(
+        row![
+            crate::ui::icons::semantic(ICON_WARN, 15.0),
+            text(t!("No objects are selected for the block."))
+                .size(11)
+                .width(Fill),
+            button(text(t!("Select objects")).size(11))
+                .on_press(Message::BlockDefSelectObjects)
+                .style(button_style(false))
+                .padding([4, 12]),
+            button(text(t!("Create empty block")).size(11))
+                .on_press(Message::BlockDefCreateEmpty)
+                .style(button_style(false))
+                .padding([4, 12]),
+        ]
+        .spacing(10)
+        .align_y(iced::Center),
+    )
+    .padding([7, 10])
+    .width(Fill)
+    .style(|_: &Theme| {
+        // Amber: the theme's warning colour is not a caution tone in every theme.
+        let warn = iced::Color::from_rgb8(0xD9, 0xA4, 0x00);
+        container::Style {
+            background: Some(Background::Color(warn.scale_alpha(0.16))),
+            border: Border {
+                width: 1.0,
+                radius: 6.0.into(),
+                color: warn,
+            },
+            ..Default::default()
+        }
+    })
+    .into()
+}
+
 pub fn view_window<'a>(
     state: &'a BlockDefinitionState,
     sizing: crate::ui::modal::ModalSizing,
@@ -226,7 +305,7 @@ pub fn view_window<'a>(
         state.invalid_name_char()
     {
         Some(
-            text(crate::tf!("Invalid character '{invalid_char}' in block name (\\ / : * ? \" < > | = ` are not allowed)"))
+            text(crate::tf!("Invalid character '{invalid_char}' in block name (\\ < > / ? \" : ; * | , = ` are not allowed)"))
                 .size(10)
                 .style(|theme: &Theme| text::Style {
                     color: Some(theme.palette().danger.base.color),
@@ -257,7 +336,17 @@ pub fn view_window<'a>(
         name_column = name_column.push(hint);
     }
 
-    let name_section = name_column;
+    // The name card carries a live preview of the selected objects, or of
+    // the existing definition the name picks.
+    let preview = container(super::block_palette::preview_canvas(&state.preview, 86.0))
+        .padding(3)
+        .width(Length::Fixed(150.0))
+        .height(Length::Fixed(92.0))
+        .style(crate::ui::window::pdf_dialogs::well_style);
+    let name_section = container(row![name_column, preview].spacing(12).align_y(iced::Center))
+        .padding([8, 10])
+        .width(Fill)
+        .style(crate::ui::window::pdf_dialogs::card_style);
 
     // ── Group: Base Point ─────────────────────────────────────────────────────
     let base_onscreen = labeled_checkbox(
@@ -381,7 +470,7 @@ pub fn view_window<'a>(
             text(t!("No objects selected"))
                 .size(10)
                 .style(|theme: &Theme| text::Style {
-                    color: Some(theme.palette().background.strongest.text.scale_alpha(0.75)),
+                    color: Some(crate::ui::style::readable::muted_text(theme)),
                 }),
         ]
         .spacing(5)
@@ -543,7 +632,7 @@ pub fn view_window<'a>(
                     width: 1.0,
                     radius: 3.0.into(),
                 },
-                placeholder: palette.background.base.text.scale_alpha(0.48),
+                placeholder: crate::ui::style::readable::hint_text(theme),
                 value: palette.background.base.text,
                 selection: palette.primary.base.color.scale_alpha(0.5),
             }
@@ -570,16 +659,49 @@ pub fn view_window<'a>(
 
     // ── Footer Bar ────────────────────────────────────────────────────────────
     let actions = row![
+        button(text("?").size(12))
+            .on_press(Message::BlockDefHelp)
+            .style(button_style(false))
+            .padding([3, 10]),
         Space::new().width(Fill),
-        dialog_button(t!("OK"), Message::BlockDefApply, true),
         dialog_button(t!("Cancel"), Message::CloseModal, false),
-        dialog_button(t!("Help"), Message::BlockDefHelp, false),
+        dialog_button(t!("OK"), Message::BlockDefApply, true),
     ]
     .spacing(8)
     .align_y(iced::Center);
 
+    // ── Open in the block editor ─────────────────────────────────────────────
+    let editor_card = container(
+        column![
+            row![
+                iced::widget::toggler(state.open_in_editor)
+                    .on_toggle(Message::BlockDefOpenInEditor)
+                    .size(16.0),
+                text(t!("Open in block editor after creating")).size(11),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+            text(t!(
+                "Specify On-screen, the object option, Allow exploding and this switch are remembered for the next time."
+            ))
+            .size(10)
+            .style(muted_style),
+        ]
+        .spacing(4),
+    )
+    .padding([8, 10])
+    .width(Fill)
+    .style(crate::ui::window::pdf_dialogs::card_style);
+
     // ── Error Banner ──────────────────────────────────────────────────────────
-    let mut main_column = column![name_section, main_body, actions,]
+    let mut main_column = column![name_section];
+    if state.empty_prompt {
+        main_column = main_column.push(empty_band());
+    }
+    let mut main_column = main_column
+        .push(main_body)
+        .push(editor_card)
+        .push(actions)
         .spacing(6)
         .padding([8, 10])
         .width(sizing.width);
@@ -625,7 +747,8 @@ pub fn view_window<'a>(
 
     // ── Confirm Redefinition Guard ────────────────────────────────────────────
     if let Some(name) = &state.confirm_redefine {
-        let question = crate::tf!("Block \"{name}\" already exists.\nDo you want to redefine it?");
+        let _ = name;
+        let question = t!("The block definition has changed. Do you want to redefine it ?");
         let shield = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -646,7 +769,11 @@ pub fn view_window<'a>(
                     .align_x(iced::alignment::Horizontal::Center),
                 Space::new().height(16),
                 row![
-                    dialog_button(t!("Yes"), Message::BlockDefConfirmRedefine(true), false),
+                    dialog_button(
+                        t!("Redefine"),
+                        Message::BlockDefConfirmRedefine(true),
+                        false
+                    ),
                     // Default / safe focus on "No"
                     dialog_button(t!("No"), Message::BlockDefConfirmRedefine(false), true),
                 ]

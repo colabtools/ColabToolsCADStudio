@@ -125,7 +125,7 @@ struct InstanceIn {
 };
 
 struct VertexOut {
-    @builtin(position) clip_pos:  vec4<f32>,
+    @invariant @builtin(position) clip_pos:  vec4<f32>,
     @location(0)       normal:    vec3<f32>,
     @location(1)       world_pos: vec3<f32>,
     @location(2)       uv_diffuse: vec2<f32>,
@@ -144,7 +144,7 @@ struct EdgeVertexIn {
 };
 
 struct EdgeVertexOut {
-    @builtin(position) clip_pos: vec4<f32>,
+    @invariant @builtin(position) clip_pos: vec4<f32>,
     @location(0) color: vec4<f32>,
 };
 
@@ -153,17 +153,27 @@ fn relative_position(
     position_low: vec3<f32>,
     instance: MeshInstance,
 ) -> vec3<f32> {
-    let world_high = vec3<f32>(
-        dot(instance.model_row_0.xyz, position) + instance.model_row_0.w,
-        dot(instance.model_row_1.xyz, position) + instance.model_row_1.w,
-        dot(instance.model_row_2.xyz, position) + instance.model_row_2.w,
+    // Large terms cancel before small ones join: the translation against the
+    // eye first, then the rotated point, so neither a survey-placed instance
+    // nor a block drawn at survey coordinates loses its low bits to an f32
+    // sum (it cost up to half a metre).
+    let translation_high = vec3<f32>(
+        instance.model_row_0.w,
+        instance.model_row_1.w,
+        instance.model_row_2.w,
     );
-    let world_low = vec3<f32>(
+    let rotated_high = vec3<f32>(
+        dot(instance.model_row_0.xyz, position),
+        dot(instance.model_row_1.xyz, position),
+        dot(instance.model_row_2.xyz, position),
+    );
+    let rotated_low = vec3<f32>(
         dot(instance.model_row_0.xyz, position_low),
         dot(instance.model_row_1.xyz, position_low),
         dot(instance.model_row_2.xyz, position_low),
-    ) + instance.translation_low.xyz;
-    return (world_high - u.eye_high) + (world_low - u.eye_low);
+    );
+    return ((translation_high - u.eye_high) + rotated_high)
+        + (rotated_low + instance.translation_low.xyz - u.eye_low);
 }
 
 fn mesh_instance(input: InstanceIn) -> MeshInstance {
@@ -238,6 +248,30 @@ fn vs_edge(
     let rel = relative_position(v.position, v.position_low, instance);
     out.clip_pos = u.view_rot * vec4<f32>(rel, 1.0);
     out.color = v.color;
+    return out;
+}
+
+struct OccludedEdgeOut {
+    @invariant @builtin(position) clip_pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) here: vec4<f32>,
+    // One end of the line (the same for the whole line): the dash is
+    // measured from it.
+    @location(2) @interpolate(flat) start: vec4<f32>,
+};
+
+@vertex
+fn vs_edge_occluded(
+    v: EdgeVertexIn,
+    i: InstanceIn,
+) -> OccludedEdgeOut {
+    var out: OccludedEdgeOut;
+    let instance = mesh_instance(i);
+    let rel = relative_position(v.position, v.position_low, instance);
+    out.clip_pos = u.view_rot * vec4<f32>(rel, 1.0);
+    out.color = v.color;
+    out.here = out.clip_pos;
+    out.start = out.clip_pos;
     return out;
 }
 
@@ -594,7 +628,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 // wireframe and hidden-line edge passes so lines read at their true colour.
 @fragment
 fn fs_edge(in: EdgeVertexOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(surface.face_color.rgb, 1.0);
+    // The edge buffers carry their own colour (keyed by it, so instances
+    // share a buffer only with the same colour): a visual style's edge
+    // colour, or colour 7 turned against the background (#1446).
+    return vec4<f32>(in.color.rgb, 1.0);
 }
 
 // Edge fragment for filled render modes: force black so edges frame the shaded
@@ -602,6 +639,22 @@ fn fs_edge(in: EdgeVertexOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_edge_black(_in: EdgeVertexOut) -> @location(0) vec4<f32> {
     return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+}
+
+// HiddenLine's occluded edges: dashes of 6 px with 4 px gaps along the line.
+// ponytail: an end behind the eye (w <= 0) gives no sensible distance, so
+// such a line draws solid; clip it in the vertex shader if that shows.
+@fragment
+fn fs_edge_occluded(in: OccludedEdgeOut) -> @location(0) vec4<f32> {
+    if (in.start.w > 0.0) {
+        let half_size = u.viewport_size * 0.5;
+        let here = in.here.xy / in.here.w * half_size;
+        let start = in.start.xy / in.start.w * half_size;
+        if (fract(length(here - start) / 10.0) > 0.6) {
+            discard;
+        }
+    }
+    return vec4<f32>(in.color.rgb, 1.0);
 }
 
 @fragment

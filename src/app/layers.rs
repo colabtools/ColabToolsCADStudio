@@ -62,14 +62,49 @@ impl OpenCADStudio {
         let i = self.active_tab;
         let doc_layers = self.tabs[i].scene.document.layers.clone();
         let vp_info = self.tabs[i].scene.viewport_list();
+        let names_before: Vec<String> = self.tabs[i]
+            .layers
+            .layers
+            .iter()
+            .map(|l| l.name.clone())
+            .collect();
         self.tabs[i]
             .layers
             .sync_with_viewports(&doc_layers, vp_info);
+        let groups = self.layer_group_names(i);
+        self.tabs[i].layers.set_groups(groups);
         self.sync_ribbon_layers();
+        // A walk in flight reads the same table: a layer added, renamed or
+        // erased by any other command has to reach its rows, or the override
+        // would go on hiding (or showing) what no longer exists.
+        self.walk_rebuild();
+        // The Properties palette lists layer names it read when it was built;
+        // a layer added, removed or renamed must reach that list too (#1664).
+        // Only then: the rebuild is costly for a large selection.
+        let names_changed = self.tabs[i].layers.layers.len() != names_before.len()
+            || self.tabs[i]
+                .layers
+                .layers
+                .iter()
+                .zip(&names_before)
+                .any(|(layer, before)| layer.name != *before);
+        if names_changed {
+            self.refresh_properties();
+        }
+    }
+
+    /// Pick up layers an entity edit registered on the fly (`ensure_layer`).
+    pub(super) fn sync_registered_layers(&mut self, tab: usize) {
+        if !std::mem::take(&mut self.tabs[tab].scene.layer_table_dirty) {
+            return;
+        }
+        self.tabs[tab].dirty = true;
+        self.refresh_layer_panel();
     }
 
     pub(super) fn sync_ribbon_layers(&mut self) {
         let i = self.active_tab;
+        self.ribbon.group_selection = self.tabs[i].scene.document.header.pick_style & 1 != 0;
         // The Start (welcome) tab has no document — leave the layer and
         // linetype dropdowns empty instead of showing a placeholder "0".
         if self.tabs[i].is_start {
@@ -79,18 +114,39 @@ impl OpenCADStudio {
             return;
         }
         let active = self.tabs[i].active_layer.clone();
+        let vp_column = self.tabs[i].scene.active_viewport.and_then(|vp| {
+            (self.tabs[i].scene.current_layout != "Model")
+                .then(|| {
+                    self.tabs[i]
+                        .layers
+                        .vp_cols
+                        .iter()
+                        .position(|c| c.handle == vp)
+                })
+                .flatten()
+        });
         let infos: Vec<crate::ui::ribbon::LayerInfo> = self.tabs[i]
             .layers
             .layers
             .iter()
             // The reference's hidden system layers (`*ADSK_CONSTRAINTS`) stay out.
             .filter(|l| !l.name.starts_with('*'))
+            // With the option on, only the Layer manager's chosen node's
+            // layers, and always the current one (#2610 LM-25).
+            .filter(|l| {
+                !self.ribbon_layers_follow_filter
+                    || l.name.eq_ignore_ascii_case(&active)
+                    || self.tabs[i].layers.in_chosen_node(l)
+            })
             .map(|l| crate::ui::ribbon::LayerInfo {
+                stored_color: l.color,
                 name: l.name.clone(),
                 color: crate::ui::window::layers::iced_color_from_acad(&l.color),
                 visible: l.visible,
                 frozen: l.frozen,
                 locked: l.locked,
+                vp_frozen: vp_column
+                    .map(|column| (column, l.vp_frozen.get(column).copied().unwrap_or(false))),
             })
             .collect();
         let names: Vec<String> = infos.iter().map(|l| l.name.clone()).collect();
@@ -102,6 +158,15 @@ impl OpenCADStudio {
         self.tabs[i].active_layer = active.clone();
         self.tabs[i].layers.current_layer = active.clone();
         self.ribbon.set_layers(infos, &active);
+        let mut states: Vec<String> = self.tabs[i]
+            .scene
+            .document
+            .layer_states()
+            .into_iter()
+            .map(|state| state.name)
+            .collect();
+        states.sort_by_key(|name| name.to_lowercase());
+        self.ribbon.layer_states = states;
         let lt_items: Vec<ui::properties::LinetypeItem> = self.tabs[i]
             .scene
             .document
@@ -116,6 +181,7 @@ impl OpenCADStudio {
                 let art = crate::io::linetypes::extract_pattern(&lt.description);
                 ui::properties::LinetypeItem { name, art }
             })
+            .chain(catalog_linetype_items(&self.tabs[i].scene.document))
             .collect();
         self.tabs[i].layers.sync_linetypes(lt_items.clone());
         self.ribbon.set_available_linetypes(lt_items);
@@ -133,15 +199,17 @@ impl OpenCADStudio {
         }
         let doc = &self.tabs[i].scene.document;
 
-        let text_names: Vec<String> = doc.text_styles.iter().map(|s| s.name.clone()).collect();
+        let text_names: Vec<String> = doc
+            .text_styles
+            .iter()
+            .filter(|s| !s.is_shape_file)
+            .map(|s| s.name.clone())
+            .collect();
         let active_text = doc.header.current_text_style_name.clone();
         let active_text = if text_names.contains(&active_text) {
             active_text
         } else {
-            text_names
-                .first()
-                .cloned()
-                .unwrap_or_default()
+            text_names.first().cloned().unwrap_or_default()
         };
 
         let dim_names: Vec<String> = doc.dim_styles.iter().map(|s| s.name.clone()).collect();
@@ -149,59 +217,45 @@ impl OpenCADStudio {
         let active_dim = if dim_names.contains(&active_dim) {
             active_dim
         } else {
-            dim_names
-                .first()
-                .cloned()
-                .unwrap_or_default()
+            dim_names.first().cloned().unwrap_or_default()
         };
 
         let mleader_names: Vec<String> = doc
             .objects
             .values()
             .filter_map(|o| {
-                if let codec::objects::ObjectType::MultiLeaderStyle(mls) = o {
+                if let document::objects::ObjectType::MultiLeaderStyle(mls) = o {
                     Some(mls.name.clone())
                 } else {
                     None
                 }
             })
             .collect();
-        let current_mleader =
-            doc.header.current_mleader_style_name.clone();
+        let current_mleader = doc.header.current_mleader_style_name.clone();
 
-        let active_mleader =
-            mleader_names
-                .iter()
-                .find(|name| {
-                    name.eq_ignore_ascii_case(
-                        &current_mleader
-                    )
-                })
-                .cloned()
-                .or_else(|| {
-                    mleader_names.first().cloned()
-                })
-                .unwrap_or_default();
+        let active_mleader = mleader_names
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(&current_mleader))
+            .cloned()
+            .or_else(|| mleader_names.first().cloned())
+            .unwrap_or_default();
 
         let table_names: Vec<String> = doc
             .objects
             .values()
             .filter_map(|o| {
-                if let codec::objects::ObjectType::TableStyle(ts) = o {
+                if let document::objects::ObjectType::TableStyle(ts) = o {
                     Some(ts.name.clone())
                 } else {
                     None
                 }
             })
             .collect();
-        let active_table = self.ribbon.active_table_style.clone();
+        let active_table = doc.header.current_table_style_name.clone();
         let active_table = if table_names.contains(&active_table) {
             active_table
         } else {
-            table_names
-                .first()
-                .cloned()
-                .unwrap_or_default()
+            table_names.first().cloned().unwrap_or_default()
         };
 
         let active_mleader2 = active_mleader.clone();
@@ -217,4 +271,17 @@ impl OpenCADStudio {
             &active_table2,
         );
     }
+}
+
+/// The catalog linetypes the drawing lacks, offered after its own; a pick
+/// loads the one chosen (`ensure_catalog_linetype`).
+pub(super) fn catalog_linetype_items(
+    document: &document::Document,
+) -> impl Iterator<Item = ui::properties::LinetypeItem> {
+    crate::io::linetypes::catalog_missing_from(document)
+        .into_iter()
+        .map(|(name, description)| ui::properties::LinetypeItem {
+            name,
+            art: crate::io::linetypes::extract_pattern(&description),
+        })
 }

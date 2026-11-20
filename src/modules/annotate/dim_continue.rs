@@ -1,16 +1,17 @@
-use codec::entities::{
+use document::entities::{
     Dimension, DimensionAngular2Ln, DimensionAngular3Pt, DimensionBase, DimensionLinear,
     DimensionOrdinate,
 };
-use codec::types::Vector3;
-use codec::{EntityType, Handle};
-use kernel::geom2d::{
+use document::types::Vector3;
+use document::{EntityType, Handle};
+use glam::DVec3;
+use ocs_geom::geom2d::{
     arc_span, closest_point, intersect, nearest_of, Arc, Curve, Ray, Tolerance, Transform, Vec2,
     XLine,
 };
-use kernel::space::Plane;
-use glam::DVec3;
+use ocs_geom::space::Plane;
 
+use super::dim_baseline::{OriginPicks, SourceStyle};
 use crate::command::{
     CadCommand, CmdOption, CmdResult, DimensionAssociationInput, DimensionPreview,
 };
@@ -25,35 +26,6 @@ pub fn tool() -> ToolDef {
         label: "Continue",
         icon: ICON,
         event: ModuleEvent::Command("DIMCONTINUE".to_string()),
-    }
-}
-
-#[derive(Clone)]
-struct SourceStyle {
-    layer: String,
-    style_name: String,
-    normal: Vector3,
-    text_rotation: f64,
-    horizontal_direction: f64,
-}
-
-impl SourceStyle {
-    fn from_base(base: &DimensionBase) -> Self {
-        Self {
-            layer: base.common.layer.clone(),
-            style_name: base.style_name.clone(),
-            normal: base.normal,
-            text_rotation: base.text_rotation,
-            horizontal_direction: base.horizontal_direction,
-        }
-    }
-
-    fn apply(&self, base: &mut DimensionBase) {
-        base.common.layer = self.layer.clone();
-        base.style_name = self.style_name.clone();
-        base.normal = self.normal;
-        base.text_rotation = self.text_rotation;
-        base.horizontal_direction = self.horizontal_direction;
     }
 }
 
@@ -94,6 +66,12 @@ pub struct DimContinueCommand {
     injected: Option<EntityType>,
     history: Vec<ContinueState>,
     preserve_base_style: bool,
+    /// Run from DIM's Continue option: its own wording.
+    in_dim: bool,
+    /// Each dimension style's DIMTMOVE (name, value).
+    style_text_move: Vec<(String, i16)>,
+    /// DIM's Continue: dimensions a typed extension line origin picks.
+    origin_picks: OriginPicks,
 }
 
 impl DimContinueCommand {
@@ -103,11 +81,33 @@ impl DimContinueCommand {
             injected: None,
             history: Vec::new(),
             preserve_base_style,
+            in_dim: false,
+            style_text_move: Vec::new(),
+            origin_picks: OriginPicks::default(),
         };
         if let Some(entity) = recent {
             let _ = command.install_base(&entity, None);
         }
         command
+    }
+
+    /// The drawing's dimension styles' DIMTMOVE, read when a continued
+    /// dimension decides whether it needs its own text movement override.
+    pub fn with_style_text_move(mut self, style_text_move: Vec<(String, i16)>) -> Self {
+        self.style_text_move = style_text_move;
+        self
+    }
+
+    /// The dimensions a typed point on an extension line origin picks as
+    /// the dimension to continue (DIM's Continue).
+    pub fn with_origin_picks(mut self, origin_picks: OriginPicks) -> Self {
+        self.origin_picks = origin_picks;
+        self
+    }
+
+    /// DIM's Continue: the dimension to continue is picked.
+    pub fn run_from_dim(&mut self) {
+        self.in_dim = true;
     }
 
     fn install_base(&mut self, entity: &EntityType, pick_world: Option<DVec3>) -> bool {
@@ -117,7 +117,7 @@ impl DimContinueCommand {
         let style = SourceStyle::from_base(dimension.base());
         let plane = plane_from_normal(dimension.base().definition_point, style.normal);
         let pick = pick_world.and_then(|point| plane.project(point.to_array()).map(Vec2::from));
-        let kind = match dimension {
+        let kind = match &**dimension {
             Dimension::Linear(source) => {
                 let rotation = source.rotation;
                 let perpendicular = Vec2::new(-rotation.sin(), rotation.cos());
@@ -199,7 +199,10 @@ impl DimContinueCommand {
 
     fn build_dimension(&self, point_world: DVec3) -> Option<Dimension> {
         let state = self.base.as_ref()?;
-        let point = state.plane.project(point_world.to_array()).map(Vec2::from)?;
+        let point = state
+            .plane
+            .project(point_world.to_array())
+            .map(Vec2::from)?;
         let mut dimension = match &state.kind {
             ContinueKind::Linear {
                 current,
@@ -281,7 +284,12 @@ impl DimContinueCommand {
                 Dimension::Ordinate(result)
             }
         };
-        state.style.apply(dimension.base_mut());
+        state
+            .style
+            .apply(dimension.base_mut(), self.preserve_base_style);
+        if !matches!(dimension, Dimension::Ordinate(_)) {
+            text_moves_with_leader(dimension.base_mut(), &self.style_text_move);
+        }
         refresh_measurement(&mut dimension, state.plane);
         dimension.base_mut().common.handle = Handle::NULL;
         dimension.base_mut().block_name.clear();
@@ -323,6 +331,15 @@ impl CadCommand for DimContinueCommand {
     }
 
     fn prompt(&self) -> String {
+        if self.in_dim {
+            return match &self.base {
+                None => crate::tr!("dim-cmd", "continue-first"),
+                Some(base) if matches!(&base.kind, ContinueKind::Ordinate { .. }) => {
+                    crate::tr!("dim-cmd", "continue-ordinate")
+                }
+                Some(_) => crate::tr!("dim-cmd", "continue-second"),
+            };
+        }
         if self.base.is_none() {
             crate::t!("DIMCONTINUE  Select continued dimension:").into_owned()
         } else if self
@@ -332,7 +349,8 @@ impl CadCommand for DimContinueCommand {
         {
             crate::t!("DIMCONTINUE  Specify feature location [Undo/Select] <Select>:").into_owned()
         } else {
-            crate::t!("DIMCONTINUE  Specify second extension line origin [Select/Undo] <Select>:").into_owned()
+            crate::t!("DIMCONTINUE  Specify second extension line origin [Select/Undo] <Select>:")
+                .into_owned()
         }
     }
 
@@ -370,7 +388,19 @@ impl CadCommand for DimContinueCommand {
         CmdResult::NeedPoint
     }
 
+    fn entity_pick_accepts_points(&self) -> bool {
+        self.in_dim
+    }
+
     fn on_point(&mut self, point: DVec3) -> CmdResult {
+        // DIM's Continue: a typed extension line origin picks its dimension;
+        // any other point asks again.
+        if self.base.is_none() {
+            if let Some(entity) = self.origin_picks.at(point).cloned() {
+                let _ = self.install_base(&entity, Some(point));
+            }
+            return CmdResult::NeedPoint;
+        }
         let Some(dimension) = self.build_dimension(point) else {
             return CmdResult::NeedPoint;
         };
@@ -379,7 +409,7 @@ impl CadCommand for DimContinueCommand {
         }
         self.advance(point);
         CmdResult::CommitDimension {
-            entity: EntityType::Dimension(dimension),
+            entity: EntityType::Dimension(Box::new(dimension)),
             association: DimensionAssociationInput::Infer(None),
             preserve_base_style: self.preserve_base_style,
             continue_command: true,
@@ -427,13 +457,41 @@ impl CadCommand for DimContinueCommand {
     }
 
     fn dimension_preview(&self, cursor: DVec3) -> Option<Vec<DimensionPreview>> {
-        self.build_dimension(cursor)
-            .map(|dimension| {
-                vec![DimensionPreview {
-                    entity: EntityType::Dimension(dimension),
-                    preserve_base_style: self.preserve_base_style,
-                }]
-            })
+        self.build_dimension(cursor).map(|dimension| {
+            vec![DimensionPreview {
+                entity: EntityType::Dimension(Box::new(dimension)),
+                preserve_base_style: self.preserve_base_style,
+            }]
+        })
+    }
+}
+
+/// A continued (not ordinate) dimension whose text would keep the
+/// dimension line with it when moved (DIMTMOVE 0) gets DIMTMOVE 1, a leader
+/// to moved text, as its first override; a style or base override that
+/// already moves the text otherwise is left alone.
+fn text_moves_with_leader(base: &mut DimensionBase, style_text_move: &[(String, i16)]) {
+    use crate::entities::dim_override::{self as ov, DIMTMOVE};
+    let current = ov::int(&base.common.extended_data, DIMTMOVE).unwrap_or_else(|| {
+        style_text_move
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&base.style_name))
+            .map_or(0, |(_, value)| *value)
+    });
+    if current != 0 {
+        return;
+    }
+    let rest = ov::pairs(&base.common.extended_data);
+    for (code, _) in &rest {
+        ov::set_on_common(&mut base.common, *code, None);
+    }
+    ov::set_on_common(
+        &mut base.common,
+        DIMTMOVE,
+        Some(document::xdata::XDataValue::Integer16(1)),
+    );
+    for (code, value) in rest.into_iter().filter(|(code, _)| *code != DIMTMOVE) {
+        ov::set_on_common(&mut base.common, code, Some(value));
     }
 }
 
@@ -521,12 +579,11 @@ fn angular_arc(vertex: Vec2, first: Vec2, second: Vec2, radius: f64) -> Option<C
     }
     let first_angle = first.angle();
     let second_angle = second.angle();
-    let (start_angle, end_angle) =
-        if arc_span(first_angle, second_angle) <= std::f64::consts::PI {
-            (first_angle, second_angle)
-        } else {
-            (second_angle, first_angle)
-        };
+    let (start_angle, end_angle) = if arc_span(first_angle, second_angle) <= std::f64::consts::PI {
+        (first_angle, second_angle)
+    } else {
+        (second_angle, first_angle)
+    };
     Some(Curve::Arc(Arc {
         centre: vertex.into(),
         radius,
@@ -543,12 +600,8 @@ fn refresh_measurement(dimension: &mut Dimension, plane: Plane) {
             let axis = Vec2::new(value.rotation.cos(), value.rotation.sin());
             value.base.actual_measurement = (second - first).dot(axis).abs();
         }
-        Dimension::Angular2Ln(value) => {
-            value.base.actual_measurement = value.measurement_degrees()
-        }
-        Dimension::Angular3Pt(value) => {
-            value.base.actual_measurement = value.measurement_degrees()
-        }
+        Dimension::Angular2Ln(value) => value.base.actual_measurement = value.measurement_radians(),
+        Dimension::Angular3Pt(value) => value.base.actual_measurement = value.measurement_radians(),
         Dimension::Ordinate(value) => value.refresh_measurement(),
         _ => {}
     }
@@ -592,7 +645,7 @@ fn preview_for_dimension(dimension: &Dimension) -> WireModel {
                 lines[1][1] - vertex,
                 project(&plane, value.dimension_arc),
                 project(&plane, value.base.text_middle_point),
-                value.base.actual_measurement,
+                value.measurement_degrees(),
             );
         }
         Dimension::Angular3Pt(value) => {
@@ -606,7 +659,7 @@ fn preview_for_dimension(dimension: &Dimension) -> WireModel {
                 project(&plane, value.second_point) - vertex,
                 project(&plane, value.definition_point),
                 project(&plane, value.base.text_middle_point),
-                value.base.actual_measurement,
+                value.measurement_degrees(),
             );
         }
         Dimension::Ordinate(value) => {
@@ -710,7 +763,9 @@ fn angular_preview(
         points,
         plane,
         end,
-        (end_previous - end).normalize().unwrap_or(-second_direction),
+        (end_previous - end)
+            .normalize()
+            .unwrap_or(-second_direction),
         second_direction,
         radius,
     );
@@ -749,14 +804,7 @@ fn ordinate_preview(
         perpendicular,
         feature.distance(leader),
     );
-    text_box(
-        points,
-        plane,
-        leader,
-        perpendicular,
-        axis,
-        measurement,
-    );
+    text_box(points, plane, leader, perpendicular, axis, measurement);
 }
 
 fn arrow(
@@ -768,23 +816,11 @@ fn arrow(
     span: f64,
 ) {
     let inward = inward.normalize().unwrap_or(Vec2::new(1.0, 0.0));
-    let perpendicular = perpendicular
-        .normalize()
-        .unwrap_or(Vec2::new(0.0, 1.0));
+    let perpendicular = perpendicular.normalize().unwrap_or(Vec2::new(0.0, 1.0));
     let size = span.clamp(1.0, 100.0) * 0.035;
     let back = tip + inward * size;
-    segment(
-        points,
-        plane,
-        tip,
-        back + perpendicular * size * 0.4,
-    );
-    segment(
-        points,
-        plane,
-        tip,
-        back - perpendicular * size * 0.4,
-    );
+    segment(points, plane, tip, back + perpendicular * size * 0.4);
+    segment(points, plane, tip, back - perpendicular * size * 0.4);
 }
 
 fn text_box(
@@ -821,8 +857,7 @@ fn project_to_line(point: Vec2, perpendicular: Vec2, coordinate: f64) -> Vec2 {
 }
 
 fn plane_from_normal(origin: Vector3, normal: Vector3) -> Plane {
-    let (x_axis, y_axis) =
-        crate::scene::view::transform::ocs_axes((normal.x, normal.y, normal.z));
+    let (x_axis, y_axis) = crate::scene::view::transform::ocs_axes((normal.x, normal.y, normal.z));
     Plane::from_axes(
         point(origin),
         [x_axis.0, x_axis.1, x_axis.2],
@@ -853,4 +888,6 @@ fn push_local(points: &mut Vec<[f64; 3]>, plane: Plane, point: Vec2) {
     points.push(plane.point_at(point.into()));
 }
 
-inventory::submit!(crate::command::CommandRegistration { names: &["DIMCONTINUE"] });
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["DIMCONTINUE"]
+});

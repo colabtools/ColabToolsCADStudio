@@ -7,16 +7,24 @@
 //!
 //! Co-located so adding a new variant only requires updating one file.
 
-use codec::EntityType;
+use document::EntityType;
 
 /// Mixed-case display name shown to the user in panels, tooltips, etc.
 pub fn ui_name(e: &EntityType) -> &'static str {
     match e {
         EntityType::Point(_) => "Point",
         EntityType::Line(line)
-            if codec::entities::CenterMarkAssociation::read(&line.common.extended_data).is_some() => "Center Mark",
+            if document::entities::CenterMarkAssociation::read(&line.common.extended_data)
+                .is_some() =>
+        {
+            "Center Mark"
+        }
         EntityType::Line(line)
-            if codec::entities::CenterLineAssociation::read(&line.common.extended_data).is_some() => "Center Line",
+            if document::entities::CenterLineAssociation::read(&line.common.extended_data)
+                .is_some() =>
+        {
+            "Centerline"
+        }
         EntityType::Line(_) => "Line",
         EntityType::Circle(_) => "Circle",
         EntityType::Arc(_) => "Arc",
@@ -69,8 +77,11 @@ pub fn ui_name(e: &EntityType) -> &'static str {
         EntityType::Extended(extended)
             if matches!(
                 extended.data,
-                codec::entities::ExtendedEntityData::SectionObject(_)
-            ) => "Section Plane",
+                document::entities::ExtendedEntityData::SectionObject(_)
+            ) =>
+        {
+            "Section Plane"
+        }
         EntityType::Extended(_) => "Extended Entity",
         EntityType::Seqend(_) => "Seqend",
         EntityType::Unknown(_) => "Unknown",
@@ -86,9 +97,15 @@ pub fn ui_name_or_class(e: &EntityType) -> String {
     if let EntityType::Extended(entity) = e {
         if matches!(
             entity.data,
-            codec::entities::ExtendedEntityData::SectionObject(_)
+            document::entities::ExtendedEntityData::SectionObject(_)
         ) {
             return "Section Plane".to_string();
+        }
+        if matches!(
+            entity.data,
+            document::entities::ExtendedEntityData::PointCloudEx(_)
+        ) {
+            return "Point Cloud".to_string();
         }
         return entity.class_name().to_string();
     }
@@ -163,8 +180,11 @@ pub fn dxf_name(e: &EntityType) -> &'static str {
         EntityType::Extended(extended)
             if matches!(
                 extended.data,
-                codec::entities::ExtendedEntityData::SectionObject(_)
-            ) => "SECTIONOBJECT",
+                document::entities::ExtendedEntityData::SectionObject(_)
+            ) =>
+        {
+            "SECTIONOBJECT"
+        }
         _ => "ENTITY",
     }
 }

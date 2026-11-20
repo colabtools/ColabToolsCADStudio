@@ -8,7 +8,7 @@
 // command at all). Naming each style once, next to the command that applies it,
 // is what keeps the three in step. (#621)
 
-use codec::entities::ViewportRenderMode as Mode;
+use document::entities::ViewportRenderMode as Mode;
 
 use crate::modules::IconKind;
 
@@ -85,6 +85,19 @@ impl VisualStyle {
     }
 }
 
+/// One-key answers to the style prompt (#2173): the digit or letter of the
+/// common style names, each mapped to the mode that draws it.
+pub const SHORT_KEYS: &[(&str, &str)] = &[
+    ("2", "WIREFRAME2D"),
+    ("3", "WIREFRAME3D"),
+    ("W", "WIREFRAME3D"),
+    ("H", "HIDDENLINE"),
+    ("S", "GOURAUDSHADED"),
+    ("R", "GOURAUDSHADED"),
+    ("C", "GOURAUDSHADED"),
+    ("E", "GOURAUDSHADEDWITHEDGES"),
+];
+
 /// The choices an interactive style prompt offers, in table order.
 pub fn keyword_choices() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
     VISUAL_STYLES
@@ -106,10 +119,46 @@ pub fn label_for(mode: Mode) -> &'static str {
         .unwrap_or("Wireframe 2D")
 }
 
+/// The render mode a named visual style draws as, and whether the name is a
+/// style of its own (Realistic, Conceptual, …) rather than one of the modes.
+pub fn mode_for_style_name(name: &str) -> Option<(Mode, bool)> {
+    Some(match name {
+        "2dWireframe" => (Mode::Wireframe2D, false),
+        "Wireframe" => (Mode::Wireframe3D, false),
+        "Hidden" => (Mode::HiddenLine, false),
+        "Flat" => (Mode::FlatShaded, false),
+        "FlatWithEdges" => (Mode::FlatShadedWithEdges, false),
+        "Gouraud" => (Mode::GouraudShaded, false),
+        "GouraudWithEdges" => (Mode::GouraudShadedWithEdges, false),
+        "Shaded with edges" => (Mode::GouraudShadedWithEdges, true),
+        "Realistic" | "Shaded" | "Conceptual" | "Shades of Gray" | "Sketchy" | "X-Ray" => {
+            (Mode::GouraudShaded, true)
+        }
+        _ => return None,
+    })
+}
+
+/// The name of the visual style a render mode is saved as.
+pub fn style_name_for(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Wireframe2D => "2dWireframe",
+        Mode::Wireframe3D => "Wireframe",
+        Mode::HiddenLine => "Hidden",
+        Mode::FlatShaded => "Flat",
+        Mode::FlatShadedWithEdges => "FlatWithEdges",
+        Mode::GouraudShaded => "Gouraud",
+        Mode::GouraudShadedWithEdges => "GouraudWithEdges",
+    }
+}
+
 /// The style a style keyword names. Only the seven exist; nothing maps onto a
 /// nearest neighbour, because there is no longer anything else to map from.
 pub fn mode_for_keyword(keyword: &str) -> Option<Mode> {
     let keyword = keyword.trim().to_uppercase();
+    let keyword = SHORT_KEYS
+        .iter()
+        .find(|(key, _)| *key == keyword)
+        .map_or(keyword.as_str(), |(_, keyword)| keyword);
     VISUAL_STYLES
         .iter()
         .find(|style| style.keyword() == keyword)

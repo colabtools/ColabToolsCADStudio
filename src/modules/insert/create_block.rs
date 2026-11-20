@@ -1,10 +1,8 @@
-use crate::t;
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
-use crate::scene::model::wire_model::WireModel;
 
 pub fn tool() -> ToolDef {
     ToolDef {
@@ -12,84 +10,6 @@ pub fn tool() -> ToolDef {
         label: "Create Block",
         icon: IconKind::Svg(include_bytes!("../../../assets/icons/blocks/block.svg")),
         event: ModuleEvent::Command("BLOCK".to_string()),
-    }
-}
-
-enum Step {
-    Name,
-    Base { name: String },
-}
-
-pub struct CreateBlockCommand {
-    handles: Vec<Handle>,
-    step: Step,
-}
-
-impl CreateBlockCommand {
-    pub fn new(handles: Vec<Handle>) -> Self {
-        Self {
-            handles,
-            step: Step::Name,
-        }
-    }
-}
-
-impl CadCommand for CreateBlockCommand {
-    fn name(&self) -> &'static str {
-        "BLOCK"
-    }
-
-    fn prompt(&self) -> String {
-        match &self.step {
-            Step::Name => t!(
-                "BLOCK  Enter block name  [%{count} objects selected]:",
-                count = self.handles.len()
-            )
-            .into_owned(),
-            Step::Base { name } => t!(
-                "BLOCK  Specify base point for \"%{name}\"  [%{count} objects]:",
-                name = name,
-                count = self.handles.len()
-            )
-            .into_owned(),
-        }
-    }
-
-    fn on_point(&mut self, pt: DVec3) -> CmdResult {
-        match &self.step {
-            Step::Name => CmdResult::NeedPoint,
-            Step::Base { name } => CmdResult::CreateBlock {
-                handles: self.handles.clone(),
-                name: name.clone(),
-                base: pt,
-            },
-        }
-    }
-
-    fn on_enter(&mut self) -> CmdResult {
-        CmdResult::Cancel
-    }
-
-    fn wants_text_input(&self) -> bool {
-        matches!(self.step, Step::Name)
-    }
-
-    fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
-        if !matches!(self.step, Step::Name) {
-            return None;
-        }
-        let name = text.trim();
-        if name.is_empty() {
-            return None;
-        }
-        self.step = Step::Base {
-            name: name.to_string(),
-        };
-        Some(CmdResult::NeedPoint)
-    }
-
-    fn on_preview_wires(&mut self, _pt: DVec3) -> Vec<WireModel> {
-        vec![]
     }
 }
 
@@ -102,7 +22,7 @@ impl CadCommand for BlockPickBasePointCommand {
     }
 
     fn prompt(&self) -> String {
-        crate::t!("BLOCK  Specify insertion base point:").into_owned()
+        "Specify insertion base point:".to_string()
     }
 
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
@@ -122,7 +42,7 @@ impl CadCommand for BlockPickBasePointCommand {
 /// Enforces standard command ordering: Base point is ALWAYS prompted before object selection.
 pub struct BlockOnScreenCommand {
     options: crate::scene::CreateBlockOptions,
-    ucs: crate::app::helpers::UcsXform,
+    ucs: crate::entities::ucs_xform::UcsXform,
     need_base: bool,
     need_objects: bool,
 }
@@ -130,7 +50,7 @@ pub struct BlockOnScreenCommand {
 impl BlockOnScreenCommand {
     pub fn new(
         options: crate::scene::CreateBlockOptions,
-        ucs: crate::app::helpers::UcsXform,
+        ucs: crate::entities::ucs_xform::UcsXform,
         need_base: bool,
         need_objects: bool,
     ) -> Self {
@@ -150,9 +70,9 @@ impl CadCommand for BlockOnScreenCommand {
 
     fn prompt(&self) -> String {
         if self.need_base {
-            crate::t!("BLOCK  Specify insertion base point:").into_owned()
+            "Specify insertion base point:".to_string()
         } else {
-            crate::t!("BLOCK  Select objects:").into_owned()
+            "Select objects:".to_string()
         }
     }
 
@@ -205,15 +125,15 @@ mod tests {
     use super::*;
     use crate::scene::{CreateBlockOptions, Scene};
     use crate::ui::window::block_definition::BlockObjectMode;
-    use codec::entities::Line;
-    use codec::types::{Transform, Vector3};
+    use document::entities::Line;
+    use document::types::{Transform, Vector3};
 
     fn make_test_scene() -> (Scene, Handle) {
         let mut scene = Scene::new();
         let mut line = Line::new();
         line.start = Vector3::new(0.0, 0.0, 0.0);
         line.end = Vector3::new(10.0, 10.0, 0.0);
-        let h = scene.add_entity(codec::EntityType::Line(line));
+        let h = scene.add_entity(document::EntityType::Line(line));
         (scene, h)
     }
 
@@ -279,7 +199,7 @@ mod tests {
         // Insert entity exists in drawing
         let insert_entity = scene.document.get_entity(insert_h);
         assert!(insert_entity.is_some());
-        if let Some(codec::EntityType::Insert(ins)) = insert_entity {
+        if let Some(document::EntityType::Insert(ins)) = insert_entity {
             assert_eq!(ins.block_name, "BLK_CONVERT");
         } else {
             panic!("Expected Insert entity");
@@ -291,6 +211,106 @@ mod tests {
         assert!(br.scale_uniformly);
         assert!(br.explodable);
         assert_eq!(br.description, "Convert test");
+    }
+
+    /// An attribute definition converted into a block belongs to the reference
+    /// that replaces it: one attribute per definition, holding the default the
+    /// definition carries, placed where the definition draws it. The written
+    /// file has to show the same shape, so it is read back from bytes.
+    #[test]
+    fn convert_mode_gives_the_reference_an_attribute_per_definition() {
+        use document::entities::AttributeDefinition;
+        use document::EntityType;
+        let (mut scene, line_h) = make_test_scene();
+        let mut attdef =
+            AttributeDefinition::new("WIDTH".to_string(), "Width:".to_string(), "100".to_string());
+        attdef.insertion_point = Vector3::new(2.0, 3.0, 0.0);
+        attdef.height = 1.0;
+        let attdef_h = scene.add_entity(EntityType::AttributeDefinition(attdef));
+        let options = CreateBlockOptions {
+            name: "BLK_ATTRIB".to_string(),
+            handles: vec![line_h, attdef_h],
+            // A base point away from the attribute, so an attribute that does
+            // not follow the reference's own transform shows up as wrong.
+            base_point: DVec3::new(10.0, 10.0, 0.0),
+            world_to_block: Transform::from_translation(Vector3::new(-10.0, -10.0, 0.0)),
+            block_to_world: Transform::from_translation(Vector3::new(10.0, 10.0, 0.0)),
+            mode: BlockObjectMode::Convert,
+            annotative: false,
+            match_orientation: false,
+            scale_uniformly: false,
+            allow_exploding: true,
+            unit: 0,
+            description: "".to_string(),
+            hyperlink_url: "".to_string(),
+            hyperlink_desc: "".to_string(),
+            redefine: false,
+        };
+        let insert_h = scene.create_block_with_options(options).unwrap();
+
+        let definition_h = scene
+            .document
+            .entities_in_block("BLK_ATTRIB")
+            .find_map(|entity| match entity {
+                EntityType::AttributeDefinition(definition) => Some(definition.common.handle),
+                _ => None,
+            })
+            .expect("the attribute definition belongs to the new definition");
+        let record = scene.document.block_records.get("BLK_ATTRIB").unwrap();
+        assert!(
+            record.flags.has_attributes,
+            "a definition holding an attribute definition is an attributed block"
+        );
+        let insert = match scene.document.get_entity(insert_h) {
+            Some(EntityType::Insert(insert)) => insert.clone(),
+            other => panic!("expected the converted insert, got {other:?}"),
+        };
+        assert_eq!(
+            insert.attributes.len(),
+            1,
+            "the reference carries no attribute, so nothing of the definition shows on it"
+        );
+        let attribute = &insert.attributes[0];
+        assert_eq!(insert.insert_point, Vector3::new(10.0, 10.0, 0.0));
+        assert_eq!(attribute.tag, "WIDTH");
+        assert_eq!(
+            attribute.value, "100",
+            "the attribute starts at the default"
+        );
+        assert_eq!(attribute.attdef_handle, definition_h);
+        assert_eq!(
+            attribute.insertion_point,
+            Vector3::new(2.0, 3.0, 0.0),
+            "the attribute stays on the object it was converted from"
+        );
+        assert!(!attribute.common.handle.is_null());
+        assert_eq!(attribute.common.owner_handle, insert_h);
+        assert!(
+            insert.seqend_handle.is_some(),
+            "the attributes need a terminator"
+        );
+
+        for ext in ["dxf", "dwg"] {
+            let bytes = crate::io::save_to_bytes(&scene.document, ext, scene.document.version)
+                .unwrap_or_else(|error| panic!("save {ext}: {error}"));
+            let read = crate::io::load_bytes(&format!("attrib.{ext}"), bytes)
+                .unwrap_or_else(|error| panic!("load {ext}: {error}"));
+            let reloaded = read
+                .entities()
+                .find_map(|entity| match entity {
+                    EntityType::Insert(candidate) if candidate.block_name == "BLK_ATTRIB" => {
+                        Some(candidate.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{ext}: the converted block was not written"));
+            assert_eq!(
+                reloaded.attributes.len(),
+                1,
+                "{ext}: the reference was written without its attribute"
+            );
+            assert_eq!(reloaded.attributes[0].value, "100", "{ext}: the value");
+        }
     }
 
     #[test]
@@ -352,7 +372,7 @@ mod tests {
             let mut line2 = Line::new();
             line2.start = Vector3::new(5.0, 5.0, 0.0);
             line2.end = Vector3::new(15.0, 15.0, 0.0);
-            scene.add_entity(codec::EntityType::Line(line2))
+            scene.add_entity(document::EntityType::Line(line2))
         };
 
         let options2 = CreateBlockOptions {
@@ -450,7 +470,8 @@ mod tests {
             hyperlink_desc: "".to_string(),
             redefine: false,
         };
-        assert!(scene.create_block_with_options(opt_no_handles).is_err());
+        // No objects define an empty block.
+        assert!(scene.create_block_with_options(opt_no_handles).is_ok());
     }
 
     #[test]
@@ -474,7 +495,7 @@ mod tests {
         };
 
         // When both base point and objects are to be specified on-screen:
-        let ucs = crate::app::helpers::UcsXform::identity();
+        let ucs = crate::entities::ucs_xform::UcsXform::identity();
         let mut cmd = BlockOnScreenCommand::new(dummy_options, ucs, true, true);
 
         // 1. Initial step must be insertion base point
@@ -530,7 +551,7 @@ mod tests {
         };
 
         // User picked objects upfront in dialog, but checked "Specify base point on screen"
-        let ucs = crate::app::helpers::UcsXform::identity();
+        let ucs = crate::entities::ucs_xform::UcsXform::identity();
         let mut cmd = BlockOnScreenCommand::new(initial_options, ucs, true, false);
 
         // Pick base point at (10, 10, 0) (end of the line in make_test_scene)
@@ -560,7 +581,7 @@ mod tests {
 
         // In Convert mode, the insert entity must be placed at the picked base point
         let insert_entity = scene.document.get_entity(insert_h).unwrap();
-        if let codec::EntityType::Insert(ins) = insert_entity {
+        if let document::EntityType::Insert(ins) = insert_entity {
             assert_eq!(ins.block_name, "ON_SCREEN_BASE_TEST");
             assert!((ins.insert_point.x - 10.0).abs() < 1e-6);
             assert!((ins.insert_point.y - 10.0).abs() < 1e-6);
@@ -580,10 +601,10 @@ mod tests {
             .document
             .entities()
             .find(|e| {
-                e.common().owner_handle == br.handle && matches!(e, codec::EntityType::Line(_))
+                e.common().owner_handle == br.handle && matches!(e, document::EntityType::Line(_))
             })
             .unwrap();
-        if let codec::EntityType::Line(l) = block_line {
+        if let document::EntityType::Line(l) = block_line {
             assert!((l.start.x - (-10.0)).abs() < 1e-6);
             assert!((l.start.y - (-10.0)).abs() < 1e-6);
             assert!((l.end.x - 0.0).abs() < 1e-6);

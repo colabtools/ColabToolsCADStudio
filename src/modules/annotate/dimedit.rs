@@ -1,11 +1,9 @@
 // DIMEDIT — edit dimension text, rotation, extension-line obliquing or home position.
 
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
-use crate::command::{
-    CadCommand, CmdOption, CmdResult, DimensionEditOperation, InputKind,
-};
+use crate::command::{CadCommand, CmdOption, CmdResult, DimensionEditOperation, InputKind};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
 use crate::t;
 
@@ -24,12 +22,20 @@ enum Step {
     Choose,
     NewText,
     Rotate,
-    Oblique,
+    /// Oblique asks its angle after the dimensions are picked.
+    Oblique(Vec<Handle>),
     Select(DimensionEditOperation),
+    SelectOblique,
 }
 
 pub struct DimEditCommand {
     step: Step,
+}
+
+impl Default for DimEditCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DimEditCommand {
@@ -56,10 +62,10 @@ impl CadCommand for DimEditCommand {
             }
             Step::NewText => t!("DIMEDIT  Enter new dimension text <measured value>:").into_owned(),
             Step::Rotate => t!("DIMEDIT  Specify angle for dimension text:").into_owned(),
-            Step::Oblique => {
-                t!("DIMEDIT  Enter obliquing angle (press Enter for none):").into_owned()
+            Step::Oblique(_) => {
+                t!("DIMEDIT  Enter obliquing angle (press ENTER for none):").into_owned()
             }
-            Step::Select(_) => t!("DIMEDIT  Select objects:").into_owned(),
+            Step::Select(_) | Step::SelectOblique => t!("DIMEDIT  Select objects:").into_owned(),
         }
     }
 
@@ -78,16 +84,23 @@ impl CadCommand for DimEditCommand {
     fn input_kind(&self) -> InputKind {
         match self.step {
             Step::NewText => InputKind::FreeText,
-            Step::Select(_) => InputKind::Point,
-            Step::Choose | Step::Rotate | Step::Oblique => InputKind::SingleToken,
+            Step::Select(_) | Step::SelectOblique => InputKind::Point,
+            Step::Choose | Step::Rotate | Step::Oblique(_) => InputKind::SingleToken,
         }
     }
 
     fn is_selection_gathering(&self) -> bool {
-        matches!(self.step, Step::Select(_))
+        matches!(self.step, Step::Select(_) | Step::SelectOblique)
     }
 
     fn on_selection_complete(&mut self, handles: Vec<Handle>) -> CmdResult {
+        if matches!(self.step, Step::SelectOblique) {
+            if handles.is_empty() {
+                return CmdResult::Cancel;
+            }
+            self.step = Step::Oblique(handles);
+            return CmdResult::NeedPoint;
+        }
         let Step::Select(operation) = &self.step else {
             return CmdResult::Cancel;
         };
@@ -104,6 +117,16 @@ impl CadCommand for DimEditCommand {
     fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
         let value = text.trim();
         let keyword = value.to_ascii_uppercase();
+        if let Step::Oblique(handles) = &mut self.step {
+            return value
+                .parse::<f64>()
+                .ok()
+                .filter(|degrees| (-85.0..=85.0).contains(degrees))
+                .map(|degrees| CmdResult::EditDimensions {
+                    handles: std::mem::take(handles),
+                    operation: DimensionEditOperation::Oblique(degrees),
+                });
+        }
         match self.step {
             Step::Choose => match keyword.as_str() {
                 "H" | "HOME" => Some(self.select(DimensionEditOperation::Home)),
@@ -116,24 +139,23 @@ impl CadCommand for DimEditCommand {
                     Some(CmdResult::NeedPoint)
                 }
                 "O" | "OBLIQUE" => {
-                    self.step = Step::Oblique;
+                    self.step = Step::SelectOblique;
                     Some(CmdResult::NeedPoint)
                 }
                 _ => None,
             },
-            Step::NewText => Some(self.select(DimensionEditOperation::NewText(
-                if value == "<>" { String::new() } else { text.to_string() },
-            ))),
+            Step::NewText => Some(
+                self.select(DimensionEditOperation::NewText(if value == "<>" {
+                    String::new()
+                } else {
+                    text.to_string()
+                })),
+            ),
             Step::Rotate => value
                 .parse::<f64>()
                 .ok()
                 .map(|degrees| self.select(DimensionEditOperation::Rotate(degrees))),
-            Step::Oblique => value
-                .parse::<f64>()
-                .ok()
-                .filter(|degrees| (-85.0..=85.0).contains(degrees))
-                .map(|degrees| self.select(DimensionEditOperation::Oblique(degrees))),
-            Step::Select(_) => None,
+            Step::Oblique(_) | Step::Select(_) | Step::SelectOblique => None,
         }
     }
 
@@ -145,10 +167,15 @@ impl CadCommand for DimEditCommand {
         match self.step {
             Step::Choose => self.select(DimensionEditOperation::Home),
             Step::NewText => self.select(DimensionEditOperation::NewText(String::new())),
-            Step::Oblique => self.select(DimensionEditOperation::Oblique(0.0)),
-            Step::Rotate | Step::Select(_) => CmdResult::Cancel,
+            Step::Oblique(ref mut handles) => CmdResult::EditDimensions {
+                handles: std::mem::take(handles),
+                operation: DimensionEditOperation::Oblique(0.0),
+            },
+            Step::Rotate | Step::Select(_) | Step::SelectOblique => CmdResult::Cancel,
         }
     }
 }
 
-inventory::submit!(crate::command::CommandRegistration { names: &["DIMEDIT"] });
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["DIMEDIT"]
+});

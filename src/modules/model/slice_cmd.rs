@@ -1,6 +1,6 @@
-use codec::{EntityType, Handle};
-use kernel::space::Plane;
+use document::{EntityType, Handle};
 use glam::DVec3;
+use ocs_geom::space::Plane;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, SelectionEntity, WorkingPlane};
 use crate::scene::model::wire_model::WireModel;
@@ -38,7 +38,7 @@ pub struct SliceCommand {
     preview_center: DVec3,
     preview_radius: f64,
     picked: Option<EntityType>,
-    surface_tool: Option<kernel::brep::Body>,
+    surface_tool: Option<ocs_solid::model::Brep>,
     notice: Option<&'static str>,
 }
 
@@ -49,7 +49,11 @@ impl SliceCommand {
         preview_center: DVec3,
         preview_radius: f64,
     ) -> Self {
-        let step = if targets.is_empty() { Step::Targets } else { Step::FirstPoint };
+        let step = if targets.is_empty() {
+            Step::Targets
+        } else {
+            Step::FirstPoint
+        };
         Self {
             step,
             targets,
@@ -98,8 +102,7 @@ impl SliceCommand {
         ) {
             return None;
         }
-        crate::scene::model::presspull_model::profile_geometry(entity)
-            .map(|(plane, _, _)| plane)
+        crate::scene::model::presspull_model::profile_geometry(entity).map(|(plane, _, _)| plane)
     }
 
     fn finish_surface(&mut self, keep_point: Option<DVec3>) -> CmdResult {
@@ -314,7 +317,10 @@ impl CadCommand for SliceCommand {
     }
 
     fn point_step_accepts_keywords(&self) -> bool {
-        matches!(self.step, Step::FirstPoint | Step::Side(_) | Step::SurfaceSide)
+        matches!(
+            self.step,
+            Step::FirstPoint | Step::Side(_) | Step::SurfaceSide
+        )
     }
 
     fn is_selection_gathering(&self) -> bool {
@@ -329,8 +335,15 @@ impl CadCommand for SliceCommand {
         self.selected = entities
             .into_iter()
             .filter_map(|item| {
-                matches!(item.entity, EntityType::Solid3D(_) | EntityType::Surface(_))
-                    .then_some(item.handle)
+                matches!(
+                    item.entity,
+                    EntityType::Solid3D(_)
+                        | EntityType::Surface(_)
+                        | EntityType::Mesh(_)
+                        | EntityType::PolygonMesh(_)
+                        | EntityType::PolyfaceMesh(_)
+                )
+                .then_some(item.handle)
             })
             .collect();
     }
@@ -370,7 +383,7 @@ impl CadCommand for SliceCommand {
         if surface_only {
             let body = self.picked.as_ref().and_then(|entity| match entity {
                 EntityType::Surface(surface) => {
-                    crate::scene::convert::solid3d_tess::kernel_surface_body(surface)
+                    crate::scene::convert::solid3d_tess::surface_record(surface)
                 }
                 _ => None,
             });
@@ -378,7 +391,7 @@ impl CadCommand for SliceCommand {
                 if let Some(plane) = planar_body_plane(&body) {
                     return self.enter_side(plane);
                 }
-                if body.face_keys().count() == 1 {
+                if (0..body.faces.len() as u32).count() == 1 {
                     self.surface_tool = Some(body);
                     self.notice = None;
                     self.step = Step::SurfaceSide;
@@ -438,24 +451,20 @@ impl CadCommand for SliceCommand {
             _ => None,
         };
         if let Some(plane) = plane {
-            wires.extend(plane_grid(
-                plane,
-                self.preview_center,
-                self.preview_radius,
-            ));
+            wires.extend(plane_grid(plane, self.preview_center, self.preview_radius));
         }
         wires
     }
 }
 
-fn planar_body_plane(body: &kernel::brep::Body) -> Option<Plane> {
-    let mut faces = body.face_keys();
-    let first = kernel::brep::planar_face_profile(body, faces.next()?)?.plane;
+fn planar_body_plane(body: &ocs_solid::model::Brep) -> Option<Plane> {
+    let mut faces = 0..body.faces.len() as u32;
+    let first = ocs_solid::model::planar_face_profile(body, faces.next()?)?.plane;
     let normal = DVec3::from_array(first.normal()?);
-    let tolerance = kernel::brep::operation_tolerance(&[body]);
+    let tolerance = ocs_solid::model::size(body).max(1.0) * 1e-9;
     faces
         .all(|face| {
-            let Some(profile) = kernel::brep::planar_face_profile(body, face) else {
+            let Some(profile) = ocs_solid::model::planar_face_profile(body, face) else {
                 return false;
             };
             profile.plane.normal().is_some_and(|other| {
@@ -470,11 +479,7 @@ fn planar_body_plane(body: &kernel::brep::Body) -> Option<Plane> {
 
 fn plane_grid(plane: Plane, centre: DVec3, radius: f64) -> Vec<WireModel> {
     let normal = DVec3::from_array(plane.normal().unwrap_or([0.0, 0.0, 1.0]));
-    let projected = centre
-        - normal
-            * plane
-                .distance_to(centre.to_array())
-                .unwrap_or_default();
+    let projected = centre - normal * plane.distance_to(centre.to_array()).unwrap_or_default();
     let x = DVec3::from_array(plane.x_axis);
     let y = DVec3::from_array(plane.y_axis);
     let color = [0.2, 0.55, 1.0, 1.0];

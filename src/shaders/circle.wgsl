@@ -20,7 +20,7 @@ struct Uniforms {
     // Relative-to-eye (double-single)
     view_rot:            mat4x4<f32>,
     eye_high:            vec3<f32>,
-    _pad_eh:             f32,
+    highlight_widen:             f32,
     eye_low:             vec3<f32>,
     _pad_el:             f32,
 }
@@ -42,7 +42,7 @@ struct InstanceIn {
 }
 
 struct VertexOut {
-    @builtin(position) clip_pos:       vec4<f32>,
+    @invariant @builtin(position) clip_pos:       vec4<f32>,
     @location(0)       local_pos:      vec2<f32>,
     @location(1)       radius:         f32,
     @location(2) @interpolate(flat) hw_ends: vec2<f32>,
@@ -56,7 +56,13 @@ struct VertexOut {
     @location(10) @interpolate(flat) is_world:     f32,
 }
 
+// The selection pass widens highlighted lines by `highlight_widen` pixels;
+// every other pass uploads zero.
 fn resolve_px_hw(px_hw: f32) -> f32 {
+    return resolve_px_hw_base(px_hw) + u.highlight_widen * 0.5;
+}
+
+fn resolve_px_hw_base(px_hw: f32) -> f32 {
     var display_hw = max(px_hw * u.lineweight_scale, 0.5);
     if u.lineweight_scale < 0.0 {
         let scale = -u.lineweight_scale;
@@ -208,12 +214,12 @@ fn in_dash(dist: f32, pat_len: f32, p0: vec4<f32>, p1: vec4<f32>) -> bool {
     if in.is_world > 0.5 {
         let is_full = sweep >= TAU - 1e-5;
         if is_full {
-            let eff_hw = max(in.hw_ends.x, 0.5 * fw);
+            let eff_hw = in.hw_ends.x + 0.5 * fw;
             let d_world = abs(r - in.radius);
             let delta_px = (eff_hw - d_world) / fw;
-            let cov = clamp(0.5 + delta_px, 0.0, 1.0);
-            let subpixel_fade = min(1.0, (2.0 * in.hw_ends.x) / fw);
-            alpha_cov = cov * subpixel_fade;
+            // A band is drawn one pixel wider than its width (a zero width
+            // still shows as a full pixel), as the reference draws it.
+            alpha_cov = clamp(0.5 + delta_px, 0.0, 1.0);
             arc_dist = in.radius * d_theta;
         } else {
             // Flat (radial) end caps perpendicular to arc tangent at start_angle and end_angle.
@@ -241,12 +247,11 @@ fn in_dash(dist: f32, pat_len: f32, p0: vec4<f32>, p1: vec4<f32>) -> bool {
             }
 
             if cov_angular > 0.0 {
-                let eff_hw = max(world_hw, 0.5 * fw);
+                let eff_hw = world_hw + 0.5 * fw;
                 let d_world = abs(r - in.radius);
                 let delta_px = (eff_hw - d_world) / fw;
                 let cov_radial = clamp(0.5 + delta_px, 0.0, 1.0);
-                let subpixel_fade = min(1.0, (2.0 * world_hw) / fw);
-                alpha_cov = cov_radial * cov_angular * subpixel_fade;
+                alpha_cov = cov_radial * cov_angular;
             }
         }
     } else {
@@ -278,7 +283,10 @@ fn in_dash(dist: f32, pat_len: f32, p0: vec4<f32>, p1: vec4<f32>) -> bool {
     if in.pattern_length > 0.0 {
         let pat_len = in.pattern_length * u.linetype_scale;
         if in.min_elem * u.linetype_scale >= u.world_per_pixel && pat_len > 0.0 {
-            if !in_dash(arc_dist, pat_len, in.pat0, in.pat1) {
+            // The elements scale with the pattern length (PSLTSCALE,
+            // annotation scale), or the dashes fall out of step with it.
+            let lt = u.linetype_scale;
+            if !in_dash(arc_dist, pat_len, in.pat0 * lt, in.pat1 * lt) {
                 discard;
             }
         }

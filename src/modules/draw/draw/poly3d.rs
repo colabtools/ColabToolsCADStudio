@@ -1,9 +1,9 @@
 // 3DPOLY creates open or closed non-planar paths.
 
-use codec::entities::Polyline3D;
-use codec::types::Vector3;
-use codec::EntityType;
 use crate::t;
+use document::entities::Polyline3D;
+use document::types::Vector3;
+use document::EntityType;
 
 use crate::command::{CadCommand, CmdResult};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
@@ -28,6 +28,12 @@ pub struct Poly3dCommand {
     /// Every point picked so far, in world space. `points[0]` is the start
     /// (needed by Close); each retains its own Z.
     points: Vec<DVec3>,
+}
+
+impl Default for Poly3dCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Poly3dCommand {
@@ -103,9 +109,9 @@ impl CadCommand for Poly3dCommand {
 
     fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
         match text.trim().to_uppercase().as_str() {
-            "C" | "CLOSE" if self.points.len() >= 3 => self
-                .build(true)
-                .map(CmdResult::CommitAndExit),
+            "C" | "CLOSE" if self.points.len() >= 3 => {
+                self.build(true).map(CmdResult::CommitAndExit)
+            }
             "C" | "CLOSE" => Some(CmdResult::NeedPoint),
             "U" | "UNDO" => {
                 self.points.pop();
@@ -133,4 +139,4 @@ impl CadCommand for Poly3dCommand {
 }
 
 // ── Autocomplete registry ─────────────────────────────────
-inventory::submit!(crate::command::CommandRegistration { names: &["3DPOLY"] });  // Poly3dCommand
+inventory::submit!(crate::command::CommandRegistration { names: &["3DPOLY"] }); // Poly3dCommand

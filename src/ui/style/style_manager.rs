@@ -8,10 +8,10 @@
 //! toolbar, list, inline-rename wiring and chrome live here once.
 
 use crate::app::{Message, StyleKind};
-use iced::widget::button::{Status, Style};
-use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Background, Border, Element, Length, Theme};
 use crate::t;
+use iced::widget::button::{Status, Style};
+use iced::widget::{button, checkbox, column, container, row, scrollable, text, Space};
+use iced::{Background, Border, Element, Length, Theme};
 use std::borrow::Cow;
 
 /// Everything the shared frame needs. The per-manager `editor` element is the
@@ -38,6 +38,8 @@ pub struct Scaffold<'a, 'b> {
     pub on_new: Message,
     pub on_copy: Message,
     pub on_delete: Message,
+    /// Present only for styles that can be imported from another drawing.
+    pub on_import: Option<Message>,
     /// Tuple-variant constructor for the per-row select message
     /// (e.g. `Message::TextStyleDialogSelect`).
     pub on_select: fn(String) -> Message,
@@ -48,41 +50,166 @@ pub struct Scaffold<'a, 'b> {
     /// Referenced styles may be copied but not changed, renamed, deleted, or
     /// made current.
     pub read_only: bool,
+    /// A locked entry can still be made current and Apply stays on: ByLayer
+    /// and the like are read only but are ordinary choices of current.
+    pub locked_keeps_actions: bool,
+    /// Told where the list has scrolled, for a manager whose arrow keys
+    /// keep the selection in view.
+    pub on_list_scroll: Option<fn(iced::widget::scrollable::Viewport) -> Message>,
+    /// "Styles in use" list filter: whether it is on and the message that
+    /// sets it. `None` for managers without one.
+    pub in_use_filter: Option<(bool, fn(bool) -> Message)>,
+    /// Why Apply is off while the editor holds values it cannot apply, shown
+    /// beside the button; New, Copy, Delete and Import are off with it.
+    /// `None` keeps them on.
+    pub apply_blocked: Option<Cow<'static, str>>,
+    /// What each list row shows beside the name, in `styles` order. `None`
+    /// for managers that do not count their users.
+    pub rows: Option<&'b [StyleRow]>,
+    /// A narrow window: the toolbar shows its icons only, each name as a
+    /// hint.
+    pub compact: bool,
+    /// Apply has something to write; off, the button waits for a change.
+    pub apply_pending: bool,
+    /// Delete stays on for a style objects use; the manager answers why it
+    /// stays instead.
+    pub delete_in_use: bool,
+    /// A right click on a style (the text style list's actions).
+    pub on_context: Option<fn(String) -> Message>,
+    /// The style whose actions show under it, and those actions.
+    pub context_menu: Option<(&'b str, Vec<(Cow<'static, str>, Option<Message>)>)>,
+    /// A manager whose list nests entries (family members, overrides)
+    /// draws its own; it replaces the plain rows and the in-use filter.
+    pub list: Option<Element<'a, Message>>,
+    /// Manager-specific actions after New / Copy / Delete (Override…,
+    /// Compare…); `None` leaves one off.
+    pub extra_actions: Vec<(Cow<'static, str>, Option<Message>)>,
+    /// Card layout: the list as a titled card with its count beside the
+    /// editor's own cards, the toolbar on a raised strip. `None` keeps the
+    /// plain frame.
+    pub list_title: Option<Cow<'static, str>>,
     pub editor: Element<'a, Message>,
+}
+
+/// A list row's extras: how many objects use the style, and whether it is a
+/// referenced (read-only) style.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StyleRow {
+    pub count: usize,
+    pub locked: bool,
+    /// An annotative style, marked in the list.
+    pub annotative: bool,
+}
+
+const NEW: &[u8] = include_bytes!("../../../assets/icons/ui/doc_new.svg");
+const COPY: &[u8] = include_bytes!("../../../assets/icons/ui/copy.svg");
+const DELETE: &[u8] = include_bytes!("../../../assets/icons/ui/trash.svg");
+const IMPORT: &[u8] = include_bytes!("../../../assets/icons/ui/import.svg");
+const SET_CURRENT: &[u8] = include_bytes!("../../../assets/icons/ui/set_current.svg");
+const APPLY: &[u8] = include_bytes!("../../../assets/icons/ui/check.svg");
+
+/// The Linetype Manager's list, scrolled to follow its arrow keys.
+pub fn linetype_list_id() -> iced::widget::Id {
+    iced::widget::Id::new("linetype-manager-list")
 }
 
 pub fn view<'a, 'b>(s: Scaffold<'a, 'b>) -> Element<'a, Message> {
     let width = s.sizing.width;
     let height = s.sizing.height;
+    let compact = s.compact;
+    // A value the editor cannot apply would be lost by leaving the style, so
+    // the list operations wait with Apply.
+    let editable = s.apply_blocked.is_none();
+    // Standard, the current style and a style texts use cannot be deleted.
+    let in_use = s
+        .styles
+        .iter()
+        .position(|name| name == s.selected)
+        .and_then(|index| s.rows?.get(index))
+        .is_some_and(|row| row.count > 0);
+    let can_delete = editable
+        && !s.read_only
+        && (s.delete_in_use || !in_use)
+        && !s.selected.eq_ignore_ascii_case("Standard")
+        && s.current != Some(s.selected);
     // ── Toolbar: New / Copy / Delete | … | Set Current / Apply ────────────
-    let bar = row![
-        tb_button(t!("New"), s.on_new, false),
-        tb_button(t!("Copy"), s.on_copy, false),
-        tb_button_enabled(t!("Delete"), s.on_delete, false, !s.read_only),
-        Space::new().width(width),
-        tb_button_enabled(t!("Set Current"), s.on_set_current, false, !s.read_only),
-        tb_button_enabled(t!("Apply"), s.on_apply, true, !s.read_only),
-    ]
-    .spacing(4)
-    .align_y(iced::Center);
+    let mut bar = row![
+        tool_button(NEW, t!("New"), editable.then_some(s.on_new), false, compact),
+        tool_button(
+            COPY,
+            t!("Copy"),
+            editable.then_some(s.on_copy),
+            false,
+            compact
+        ),
+        tool_button(
+            DELETE,
+            t!("Delete"),
+            can_delete.then_some(s.on_delete),
+            false,
+            compact
+        ),
+    ];
+    if let Some(message) = s.on_import {
+        bar = bar.push(tool_button(
+            IMPORT,
+            t!("Import"),
+            editable.then_some(message),
+            false,
+            compact,
+        ));
+    }
+    for (caption, message) in s.extra_actions {
+        bar = bar.push(tb_button_maybe(caption, message.filter(|_| editable), false));
+    }
+    let mut bar = bar.push(Space::new().width(width));
+    if let Some(reason) = s.apply_blocked {
+        bar = bar.push(
+            text(reason)
+                .size(11)
+                .style(crate::ui::style::editor_table::danger_text_style),
+        );
+    }
+    let bar = bar
+        .push(tool_button(
+            SET_CURRENT,
+            t!("Set Current"),
+            (!s.read_only || s.locked_keeps_actions).then_some(s.on_set_current),
+            false,
+            compact,
+        ))
+        .push(tool_button(
+            APPLY,
+            t!("Apply"),
+            ((!s.read_only || s.locked_keeps_actions) && editable && s.apply_pending)
+                .then_some(s.on_apply),
+            true,
+            compact,
+        ))
+        .spacing(4)
+        .align_y(iced::Center);
+    let card_mode = s.list_title.is_some();
     let toolbar = container(bar)
-        .style(|theme: &Theme| container::Style {
-            background: Some(Background::Color(
-                theme.palette().background.weak.color
-            )),
+        .style(move |theme: &Theme| container::Style {
+            background: Some(Background::Color(theme.palette().background.weak.color)),
+            border: Border {
+                radius: if card_mode { 6.0 } else { 0.0 }.into(),
+                ..Default::default()
+            },
             ..Default::default()
         })
         .width(width)
-        .padding([5, 8]);
+        .padding(if card_mode { [7, 8] } else { [5, 8] });
 
     // ── Left: style list (single click selects, double click renames) ─────
     let rows: Vec<Element<'_, Message>> = s
         .styles
         .iter()
-        .map(|name| {
+        .enumerate()
+        .map(|(index, name)| {
             let is_sel = name.as_str() == s.selected;
             let is_current = s.current == Some(name.as_str());
-            crate::ui::style::style_list::item(
+            let entry = crate::ui::style::style_list::item(
                 name,
                 is_current,
                 is_sel,
@@ -91,34 +218,102 @@ pub fn view<'a, 'b>(s: Scaffold<'a, 'b>) -> Element<'a, Message> {
                 s.rename_active,
                 s.rename_buf,
                 !(s.read_only && is_sel),
-            )
+                s.rows.and_then(|rows| rows.get(index).copied()),
+                s.on_context.map(|on_context| on_context(name.clone())),
+            );
+            match &s.context_menu {
+                Some((target, actions)) if *target == name.as_str() => {
+                    let buttons: Vec<Element<'_, Message>> = actions
+                        .iter()
+                        .map(|(caption, message)| {
+                            crate::ui::style::form::dialog_button_styled_opt(
+                                caption.to_string(),
+                                message.clone(),
+                                iced::widget::button::secondary,
+                            )
+                            .into()
+                        })
+                        .collect();
+                    iced::widget::column![
+                        entry,
+                        container(iced::widget::row(buttons).spacing(4).wrap())
+                            .padding([4, 20])
+                    ]
+                    .into()
+                }
+                _ => entry,
+            }
         })
         .collect();
 
-    let list_panel = container(
-        column![
-            text(t!("Styles")).size(10).style(muted_text_style),
-            container(scrollable(column(rows).spacing(1)).height(height))
+    let filter: Element<'_, Message> = match s.in_use_filter {
+        Some((on, message)) => checkbox(on)
+            .label(t!("Styles in use"))
+            .on_toggle(message)
+            .size(12)
+            .text_size(11)
+            .into(),
+        None => Space::new().height(0).into(),
+    };
+    if let Some(title) = s.list_title {
+        return card_frame(
+            width,
+            height,
+            title,
+            rows,
+            s.in_use_filter,
+            toolbar.into(),
+            s.editor,
+        );
+    }
+    let custom_list = s.list.is_some();
+    let list_panel = if let Some(list) = s.list {
+        container(
+            column![text(t!("Styles")).size(10).style(muted_text_style), list]
+                .spacing(4)
+                .height(height),
+        )
+    } else {
+        container(
+            column![
+                text(t!("Styles")).size(10).style(muted_text_style),
+                filter,
+                // The scrollbar gets its own gutter instead of covering the counts.
+                container({
+                    let list = scrollable(column(rows).spacing(1))
+                        .spacing(2)
+                        .height(height);
+                    match s.on_list_scroll {
+                        Some(on_scroll) => list.id(linetype_list_id()).on_scroll(on_scroll),
+                        None => list,
+                    }
+                })
                 .style(|theme: &Theme| {
                     let palette = theme.palette();
                     container::Style {
-                    background: Some(Background::Color(palette.background.weak.color)),
-                    border: Border {
-                        color: palette.background.neutral.color,
-                        width: 1.0,
-                        radius: 3.0.into()
-                    },
-                    ..Default::default()
+                        background: Some(Background::Color(palette.background.weak.color)),
+                        border: Border {
+                            color: palette.background.neutral.color,
+                            width: 1.0,
+                            radius: 3.0.into(),
+                        },
+                        ..Default::default()
                     }
                 })
                 .width(width)
                 .height(height)
                 .padding(2),
-        ]
-        .spacing(4)
-        .height(height),
-    )
-    .width(170)
+                text(t!("Double-click a name to rename it."))
+                    .size(10)
+                    .style(muted_text_style),
+            ]
+            .spacing(4)
+            .height(height),
+        )
+    }
+    // A list with counts, or a manager's own list, needs room for a name and
+    // what it shows beside it.
+    .width(if s.rows.is_some() || custom_list { 240 } else { 170 })
     .height(height)
     .padding(iced::Padding {
         top: 12.0,
@@ -131,13 +326,147 @@ pub fn view<'a, 'b>(s: Scaffold<'a, 'b>) -> Element<'a, Message> {
 
     container(column![toolbar, hdivider(width), body])
         .style(|theme: &Theme| container::Style {
-            background: Some(Background::Color(
-                theme.palette().background.base.color
-            )),
+            background: Some(Background::Color(theme.palette().background.base.color)),
             ..Default::default()
         })
         .width(width)
         .height(height)
+        .into()
+}
+
+/// The card layout: the toolbar on a raised strip, the list as a titled
+/// card with its count, the editor's cards beside it.
+fn card_frame<'a>(
+    width: Length,
+    height: Length,
+    title: Cow<'static, str>,
+    rows: Vec<Element<'a, Message>>,
+    in_use_filter: Option<(bool, fn(bool) -> Message)>,
+    toolbar: Element<'a, Message>,
+    editor: Element<'a, Message>,
+) -> Element<'a, Message> {
+    use crate::ui::window::pdf_dialogs::{accent_text, card_style, well_style};
+    let count = rows.len();
+    let mut list = column![row![
+        text(title.to_uppercase()).size(10).style(accent_text),
+        Space::new().width(Length::Fill),
+        container(text(count.to_string()).size(10).style(accent_text))
+            .padding([0, 7])
+            .style(well_style),
+    ]
+    .align_y(iced::Center)]
+    .spacing(8);
+    if let Some((on, message)) = in_use_filter {
+        list = list.push(
+            checkbox(on)
+                .label(crate::tr!("style-manager", "only-used"))
+                .on_toggle(message)
+                .size(13)
+                .text_size(11),
+        );
+    }
+    let list = list.push(
+        container(scrollable(column(rows).spacing(2)).spacing(2).height(height))
+            .padding(4)
+            .width(Length::Fill)
+            .height(height)
+            .style(well_style),
+    );
+    let list = container(list)
+        .padding(10)
+        .width(Length::Fixed(200.0))
+        .height(height)
+        .style(card_style);
+    container(
+        column![
+            container(toolbar).padding(iced::Padding {
+                top: 12.0,
+                right: 16.0,
+                bottom: 0.0,
+                left: 16.0,
+            }),
+            row![list, editor]
+                .spacing(14)
+                .height(height)
+                .padding(iced::Padding {
+                    top: 14.0,
+                    right: 16.0,
+                    bottom: 16.0,
+                    left: 16.0,
+                }),
+        ]
+        .height(height),
+    )
+    .style(|theme: &Theme| container::Style {
+        background: Some(Background::Color(theme.palette().background.base.color)),
+        ..Default::default()
+    })
+    .width(width)
+    .height(height)
+    .into()
+}
+
+/// Choose source styles, then confirm each name collision individually.
+pub(crate) fn import_view<'a>(
+    draft: &'a crate::app::StyleImportDraft,
+    target: &document::Document,
+    sizing: crate::ui::modal::ModalSizing,
+) -> Element<'a, Message> {
+    let mut content = column![
+        text(draft.file.clone()).size(12),
+        text(t!("Select the styles to import")).size(11),
+    ]
+    .spacing(8);
+    if let Some(name) = &draft.conflict {
+        content = content
+            .push(text(name.clone()).size(14))
+            .push(text(t!(
+                "A style with this name already exists. Overwrite it?"
+            )))
+            .push(
+                row![
+                    button(text(t!("Overwrite"))).on_press(Message::StyleImportConfirm(true)),
+                    button(text(t!("Skip"))).on_press(Message::StyleImportConfirm(false)),
+                    button(text(t!("Cancel"))).on_press(Message::StyleImportCancel),
+                ]
+                .spacing(8),
+            );
+    } else {
+        let mut rows = column![].spacing(4);
+        for (name, on) in &draft.selected {
+            let label = if crate::app::style_import_exists(target, draft.kind, name) {
+                format!("{} ({})", name, t!("Existing"))
+            } else {
+                name.clone()
+            };
+            let key = name.clone();
+            rows = rows.push(
+                checkbox(*on)
+                    .label(label)
+                    .on_toggle(move |_| Message::StyleImportToggle(key.clone())),
+            );
+        }
+        if draft.selected.is_empty() {
+            rows = rows.push(text(t!("No styles found in this drawing.")));
+        }
+        content = content.push(scrollable(rows).height(sizing.height)).push(
+            row![
+                button(text(t!("Import"))).on_press_maybe(
+                    draft
+                        .selected
+                        .iter()
+                        .any(|(_, on)| *on)
+                        .then_some(Message::StyleImportApply)
+                ),
+                button(text(t!("Cancel"))).on_press(Message::StyleImportCancel),
+            ]
+            .spacing(8),
+        );
+    }
+    container(content)
+        .padding(16)
+        .width(sizing.width)
+        .height(sizing.height)
         .into()
 }
 
@@ -166,22 +495,12 @@ pub struct EditorShell<'a> {
     pub content: Element<'a, Message>,
 }
 
-pub fn editor_shell<'a>(shell: EditorShell<'a>) -> Element<'a, Message> {
-    let tabs: Vec<Element<'a, Message>> = shell
-        .tabs
-        .into_iter()
-        .map(|tab| {
-            button(text(tab.label).size(11))
-                .on_press(tab.on_press)
-                .style(tab_button_style(tab.active))
-                .padding([4, 10])
-                .into()
-        })
-        .collect();
-    let comparison: Element<'a, Message> = match shell.comparison {
+/// "Compare with <style>" and what differs; nothing without another style.
+pub fn comparison_row<'a>(comparison: Option<EditorComparison>) -> Element<'a, Message> {
+    match comparison {
         Some(comparison) if !comparison.options.is_empty() => row![
             text(t!("Compare with")).size(10).style(muted_text_style),
-            iced::widget::pick_list(
+            crate::ui::dropdown_list::pick_list(
                 Some(comparison.selected),
                 comparison.options,
                 |value| value.to_string(),
@@ -195,7 +514,22 @@ pub fn editor_shell<'a>(shell: EditorShell<'a>) -> Element<'a, Message> {
         .align_y(iced::Center)
         .into(),
         _ => Space::new().height(0).into(),
-    };
+    }
+}
+
+pub fn editor_shell<'a>(shell: EditorShell<'a>) -> Element<'a, Message> {
+    let tabs: Vec<Element<'a, Message>> = shell
+        .tabs
+        .into_iter()
+        .map(|tab| {
+            button(text(tab.label).size(11))
+                .on_press(tab.on_press)
+                .style(tab_button_style(tab.active))
+                .padding([4, 10])
+                .into()
+        })
+        .collect();
+    let comparison = comparison_row(shell.comparison);
     let preview = container(shell.preview)
         .width(Length::Fill)
         .style(|theme: &Theme| container::Style {
@@ -219,9 +553,13 @@ pub fn editor_shell<'a>(shell: EditorShell<'a>) -> Element<'a, Message> {
             comparison,
             row(tabs).spacing(2),
             hdivider(Length::Fill),
-            scrollable(container(shell.content).padding([12, 12]).width(Length::Fill))
-                .width(Length::Fill)
-                .height(Length::Fill),
+            scrollable(
+                container(shell.content)
+                    .padding([12, 12])
+                    .width(Length::Fill)
+            )
+            .width(Length::Fill)
+            .height(Length::Fill),
         ]
         .spacing(6)
         .height(shell.sizing.height),
@@ -252,18 +590,68 @@ pub(crate) fn tb_button(
         .into()
 }
 
-pub(crate) fn tb_button_enabled(
+/// `tb_button` that is greyed out without a message.
+pub(crate) fn tb_button_maybe(
     label: impl Into<Cow<'static, str>>,
-    msg: Message,
+    msg: Option<Message>,
     accent: bool,
-    enabled: bool,
 ) -> Element<'static, Message> {
     let pad = if accent { [4, 14] } else { [4, 10] };
-    let button = button(text(label.into()).size(11))
+    button(text(label.into()).size(11))
+        .on_press_maybe(msg)
         .style(btn_s(accent))
-        .padding(pad);
-    if enabled {
-        button.on_press(msg).into()
+        .padding(pad)
+        .into()
+}
+
+/// A toolbar button: icon and name, or (`compact`) the icon with its name as
+/// a hint. `None` leaves it off.
+fn tool_button(
+    icon: &'static [u8],
+    label: Cow<'static, str>,
+    message: Option<Message>,
+    accent: bool,
+    compact: bool,
+) -> Element<'static, Message> {
+    let enabled = message.is_some();
+    let glyph: Element<'static, Message> = crate::ui::icons::tinted_faded(
+        icon,
+        14.0,
+        if enabled { 1.0 } else { 0.42 },
+        move |theme: &Theme| {
+            if accent && enabled {
+                theme.palette().primary.base.text
+            } else {
+                theme.palette().background.base.text
+            }
+        },
+    );
+    let content: Element<'static, Message> = if compact {
+        glyph
+    } else {
+        row![glyph, text(label.clone()).size(11)]
+            .spacing(5)
+            .align_y(iced::Center)
+            .into()
+    };
+    let pad = match (compact, accent) {
+        (true, _) => [4, 7],
+        (false, true) => [4, 14],
+        (false, false) => [4, 10],
+    };
+    let button = button(content)
+        .style(btn_s(accent))
+        .padding(pad)
+        .on_press_maybe(message);
+    if compact {
+        iced::widget::tooltip(
+            button,
+            container(text(label).size(11))
+                .padding(6)
+                .style(container::rounded_box),
+            iced::widget::tooltip::Position::Bottom,
+        )
+        .into()
     } else {
         button.into()
     }
@@ -307,18 +695,18 @@ fn btn_s(accent: bool) -> impl Fn(&Theme, Status) -> Style {
             _ => palette.background.weak,
         };
         Style {
-        background: Some(Background::Color(pair.color)),
-        text_color: if st == Status::Disabled {
-            pair.text.scale_alpha(0.45)
-        } else {
-            pair.text
-        },
-        border: Border {
-            color: palette.background.neutral.color,
-            width: 1.0,
-            radius: 4.0.into(),
-        },
-        ..Default::default()
+            background: Some(Background::Color(pair.color)),
+            text_color: if st == Status::Disabled {
+                pair.text.scale_alpha(0.45)
+            } else {
+                pair.text
+            },
+            border: Border {
+                color: palette.background.neutral.color,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
         }
     }
 }

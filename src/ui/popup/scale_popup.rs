@@ -1,8 +1,7 @@
 //! Annotation / viewport scale status menu.
 
-use iced::widget::{button, row, text};
-use iced::{Element, Fill};
 use crate::t;
+use iced::Element;
 
 use crate::app::Message;
 use crate::ui::statusbar::status_menu::Entry;
@@ -29,9 +28,7 @@ pub fn menu_entries(
                 label.eq_ignore_ascii_case(current_scale_name)
                     || (current_scale_name.is_empty()
                         && viewport_scale
-                            .map(|vs| {
-                                (vs - vp_scale).abs() < 0.001 * vp_scale.max(0.001)
-                            })
+                            .map(|vs| (vs - vp_scale).abs() < 0.001 * vp_scale.max(0.001))
                             .unwrap_or(false))
             };
             let msg = if is_model {
@@ -49,26 +46,19 @@ pub fn menu_entries(
     entries
 }
 
+/// A scale, the current one checked: a kit menu item.
 fn scale_row(label: String, active: bool, msg: Message) -> Element<'static, Message> {
-    let check = crate::ui::icons::themed_check_cell(active);
-
-    let lbl = text(label).size(11);
-
-    let content = row![check, lbl].spacing(6).align_y(iced::Center);
-
-    button(content)
-        .on_press(msg)
-        .style(button::subtle)
-        .width(Fill)
-        .padding([4, 10])
-        .into()
+    crate::ui::kit::menu::entry(
+        crate::ui::kit::menu::Item::new(label, msg).mark(crate::ui::kit::menu::Mark::Check(active)),
+    )
 }
 
+/// Manage..., after a separator.
 fn manage_row() -> Element<'static, Message> {
-    button(text(t!("Manage...")).size(11))
-        .on_press(Message::ScaleManagerOpen)
-        .style(button::primary)
-        .width(Fill)
-        .padding([5, 10])
-        .into()
+    use crate::ui::kit::menu::{entry, Item};
+    iced::widget::column![
+        entry(Item::Separator),
+        entry(Item::new(t!("Manage..."), Message::ScaleManagerOpen)),
+    ]
+    .into()
 }

@@ -4,13 +4,21 @@
 // attached so eprintln! / panics stay visible while developing.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use OpenCADStudio::app;
+// The system heap is slow for the millions of small allocations a large
+// drawing makes (wire models, index entries), above all when freeing.
 #[cfg(not(target_arch = "wasm32"))]
-use OpenCADStudio::{cli, io, mcp, rest};
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use OpenCADStudio::app;
 #[cfg(target_arch = "wasm32")]
 use OpenCADStudio::sys;
+#[cfg(not(target_arch = "wasm32"))]
+use OpenCADStudio::{cli, io, mcp, rest};
 
 fn main() -> iced::Result {
+    #[cfg(not(target_arch = "wasm32"))]
+    OpenCADStudio::sys::startup_times::mark("main entry");
     // Web (wasm) uses the single-window entry; native uses the multi-window
     // daemon. Trunk calls `main` from its generated JS bootstrap. The web build
     // takes no CLI args, so it skips parsing entirely.
@@ -27,12 +35,21 @@ fn main() -> iced::Result {
     #[cfg(not(target_arch = "wasm32"))]
     {
         use clap::Parser;
-        let args = cli::Cli::parse();
+        // `/b script.scr`, the startup switch shortcuts carry, is `--script`.
+        let args = cli::Cli::parse_from(std::env::args_os().map(|arg| {
+            if arg == "/b" || arg == "/B" {
+                "--script".into()
+            } else {
+                arg
+            }
+        }));
 
         // GPU probe child: exercise one backend offscreen, print one JSON
         // line on success and exit 0/1. This must run before any logging/GUI
         // setup; the parent interprets any non-zero exit (including a driver
         // abort) as "this backend is unusable".
+        #[cfg(not(target_arch = "wasm32"))]
+        OpenCADStudio::sys::startup_times::mark("cli parsed");
         if let Some(which) = &args.gpu_probe {
             OpenCADStudio::gpu_backend::run_probe_child(which);
         }
@@ -67,6 +84,18 @@ fn main() -> iced::Result {
             std::process::exit(if ok { 0 } else { 1 });
         }
 
+        if args.sync_mcp_schemas {
+            let synced = mcp::sync_agent_tool_schemas();
+            if synced {
+                println!("Successfully synchronized OpenCADStudio MCP schemas to ~/.gemini/antigravity/mcp/opencadstudio/");
+            } else {
+                eprintln!(
+                    "Antigravity MCP directory ~/.gemini/antigravity/mcp/ not found; skipped sync."
+                );
+            }
+            return Ok(());
+        }
+
         // MCP is a client-neutral local entry point. It uses only stdin,
         // stdout and the authenticated GUI bridge, so it must run before any
         // logging or graphics setup can write to the protocol stream.
@@ -91,6 +120,16 @@ fn main() -> iced::Result {
             let _ = env_logger::try_init();
         }
 
+        // Unattended script runs need no window, so no GPU either.
+        if let Some(script) = args.batch.as_ref().or(args.each.as_ref()) {
+            let files = if args.each.is_some() {
+                &args.files[..]
+            } else {
+                &[]
+            };
+            std::process::exit(app::run_batch(script, files, args.read_only));
+        }
+
         // GPU backend selection. Explicit `--backend` wins; `--safe-mode`
         // forces GL for flaky drivers. On Windows the preference order starts
         // with DX12/Vulkan so the AMD OpenGL ICD (atio6axx.dll) is never
@@ -106,11 +145,13 @@ fn main() -> iced::Result {
         // survives a real offscreen render; a crash sentinel skips backends
         // that died with the previous run.
         let gpu = OpenCADStudio::gpu_backend::resolve_gpu(args.backend.as_deref(), args.safe_mode);
+        #[cfg(not(target_arch = "wasm32"))]
+        OpenCADStudio::sys::startup_times::mark("gpu resolved");
 
         // Headless modes exit without ever creating a window.
         if let Some(port) = args.http {
             if args.files.is_empty() {
-                rest::serve(port);
+                rest::serve(port, args.read_only);
                 return Ok(());
             }
             // Files + --http: boot the GUI and host the loopback REST channel
@@ -121,12 +162,17 @@ fn main() -> iced::Result {
         }
         if args.serve {
             // `app::serve` reads --port itself from the raw args.
-            app::serve();
+            app::serve(args.read_only);
             return Ok(());
         }
         if let Some(io) = &args.export {
             // clap enforces exactly two values for --export.
-            let code = app::export_headless(&io[0], &io[1], args.target_version.as_deref());
+            let code = app::export_headless(
+                &io[0],
+                &io[1],
+                args.target_version.as_deref(),
+                args.allow_lossy,
+            );
             std::process::exit(code);
         }
 
@@ -184,8 +230,9 @@ fn main() -> iced::Result {
         // The probe enables the packed renderer automatically on GPUs without
         // shader storage buffers; an explicit `--compat-renderer` does the
         // same without the notice.
-        let compat_renderer = args.compat_renderer || gpu.compat_renderer;
-        let gpu_compat_auto = !args.compat_renderer && gpu.compat_renderer;
+        let saved_compat = OpenCADStudio::gpu_backend::load_prefs().compat_renderer;
+        let compat_renderer = args.compat_renderer || saved_compat || gpu.compat_renderer;
+        let gpu_compat_auto = !args.compat_renderer && !saved_compat && gpu.compat_renderer;
         let _ = cli::GUI_CONFIG.set(cli::GuiConfig {
             files: if args.new { Vec::new() } else { args.files },
             new: args.new,
@@ -206,6 +253,8 @@ fn main() -> iced::Result {
         // backend. A stale file at the next launch means this run aborted, so
         // the resolver skips those backends instead of crashing again.
         // Inactive on macOS/wasm, where the resolver leaves the env alone.
+        #[cfg(not(target_arch = "wasm32"))]
+        OpenCADStudio::sys::startup_times::mark("entering app::run");
         if OpenCADStudio::gpu_backend::gpu_guard_active() {
             OpenCADStudio::gpu_backend::arm_sentinel(
                 gpu.backend_value.as_deref().unwrap_or("auto"),

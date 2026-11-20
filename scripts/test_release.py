@@ -50,9 +50,76 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             binary = str(Path(temp) / "build-script")
             subprocess.run(["rustc", str(Path(__file__).resolve().parents[1] / "build.rs"), "-o", binary], check=True)
-            for cargo in ("0.9.8", "2026.9.0", "2026.35.0", "2026.53.0", "2027.1.0"):
-                result = subprocess.check_output([binary], text=True, env={**os.environ, "CARGO_PKG_VERSION": cargo})
+            for cargo in ("0.9.8", "2026.9.0", "2026.35.0", "2026.53.0", "2027.1.0", "2026.40.1", "2026.5.2"):
+                result = subprocess.check_output([binary], text=True, env={
+                    **os.environ, "CARGO_PKG_VERSION": cargo, "OUT_DIR": temp,
+                    "CARGO_MANIFEST_DIR": str(Path(__file__).resolve().parents[1]),
+                })
                 self.assertIn(f"cargo:rustc-env=OCS_APP_VERSION={release.display_version(cargo)}\n", result)
+
+    def test_build_script_inputs(self):
+        """Cargo must watch real Git inputs, including in linked worktrees."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary = root / "build-script"
+            subprocess.run(["rustc", str(Path(__file__).resolve().parents[1] / "build.rs"), "-o", str(binary)], check=True)
+            repo = root / "repo"
+            repo.mkdir()
+
+            def git(*args, cwd=repo):
+                return subprocess.check_output(["git", *args], cwd=cwd, text=True).strip()
+
+            git("init", "-b", "perf/test-base")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "Initial")
+            worktree = root / "worktree"
+            git("worktree", "add", "-b", "perf/test-worktree", str(worktree))
+
+            def inputs(cwd):
+                # Cargo sets these for every build script.
+                output = subprocess.check_output([str(binary)], cwd=cwd, text=True, env={
+                    **os.environ, "CARGO_PKG_VERSION": "2026.44.0", "OUT_DIR": temp,
+                    "CARGO_MANIFEST_DIR": str(cwd),
+                })
+                return [(cwd / line.split("=", 1)[1]).resolve() for line in output.splitlines()
+                        if line.startswith("cargo:rerun-if-changed=")]
+
+            def git_path(cwd, name):
+                return (cwd / git("rev-parse", "--git-path", name, cwd=cwd)).resolve()
+
+            # Simulate the build script living in each checkout (also the
+            # only file Cargo needs to watch in a source archive).
+            for cwd in (repo, worktree):
+                (cwd / "build.rs").write_text("// fixture\n")
+                with self.subTest(checkout=cwd.name):
+                    watched = inputs(cwd)
+                    self.assertTrue(all(path.exists() for path in watched), watched)
+                    self.assertIn(git_path(cwd, "HEAD"), watched)
+                    ref = git_path(cwd, git("symbolic-ref", "HEAD", cwd=cwd))
+                    self.assertIn(ref, watched)
+                    self.assertFalse(any(path.name == "index" for path in watched))
+
+            git("pack-refs", "--all", "--prune")
+            with self.subTest(checkout="packed worktree"):
+                watched = inputs(worktree)
+                self.assertTrue(all(path.exists() for path in watched), watched)
+                self.assertIn(git_path(worktree, "packed-refs"), watched)
+                # A new commit recreates the loose branch reference without
+                # changing packed-refs. Its existing parent must be watched.
+                ref = git_path(worktree, git("symbolic-ref", "HEAD", cwd=worktree))
+                self.assertTrue(any(path.is_dir() and path in ref.parents for path in watched), watched)
+
+            git("checkout", "--detach", cwd=worktree)
+            with self.subTest(checkout="detached worktree"):
+                watched = inputs(worktree)
+                self.assertTrue(all(path.exists() for path in watched), watched)
+                self.assertIn(git_path(worktree, "HEAD"), watched)
+
+            archive = root / "archive"
+            archive.mkdir()
+            (archive / "build.rs").write_text("// fixture\n")
+            with self.subTest(checkout="source archive"):
+                watched = inputs(archive)
+                self.assertEqual(watched, [archive / "build.rs"])
 
     def test_calendar_versions(self):
         self.assertEqual(release.versions("v2026.35"), {
@@ -61,6 +128,10 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(release.versions("2026.09")["cargo"], "2026.9.0")
         self.assertEqual(release.display_version("2026.9.0"), "2026.09")
         self.assertEqual(release.display_version("0.9.8"), "0.9.8")
+        self.assertEqual(release.versions("v2026.40.1"), {
+            "version": "2026.40.1", "cargo": "2026.40.1", "msi": "26.40.1", "tag": "v2026.40.1",
+        })
+        self.assertEqual(release.display_version("2026.5.2"), "2026.05.2")
         self.assertEqual(datetime(2027, 1, 3, tzinfo=timezone.utc).strftime("v%G.%V"), "v2026.53")
         for value in ("2026.00", "2026.54", "2027.53", "2026.9", "2026.35.0", "bad", "0.09.8"):
             with self.assertRaises(ValueError, msg=value):

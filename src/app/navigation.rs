@@ -99,12 +99,12 @@ impl OpenCADStudio {
         // after it takes keyboard focus. Gate input separately from its metadata.
         let allowed = self.spacemouse_focused && self.active_modal.is_none();
         let camera = scene.navigation_camera();
-        let (w, h) = scene.selection.borrow().vp_size;
+        let (w, h) = scene.selection.borrow().view.vp_size;
         let bounds = scene.active_model_tile_bounds(w, h);
         let aspect = scene
             .active_viewport
             .and_then(|handle| match scene.document.get_entity(handle) {
-                Some(codec::EntityType::Viewport(vp)) => Some(vp.width / vp.height.max(1e-6)),
+                Some(document::EntityType::Viewport(vp)) => Some(vp.width / vp.height.max(1e-6)),
                 _ => None,
             })
             .unwrap_or((bounds.width / bounds.height.max(1.)).max(0.01) as f64);
@@ -211,17 +211,17 @@ impl OpenCADStudio {
                     .acknowledge(&view.target, &self.navigation_target());
                 self.spacemouse_pivot = (view.pivot_visible && moving)
                     .then_some((self.navigation_target(), view.pivot));
-                let (w, h) = self.tabs[i].scene.selection.borrow().vp_size;
+                let (w, h) = self.tabs[i].scene.selection.borrow().view.vp_size;
                 self.reproject_box_anchor(i, w, h);
                 // The pointer may be stationary while the left hand navigates.
                 // Refresh the active command's snap/preview against the new
                 // camera, using the existing pointer path without a click.
                 let cursor = {
                     let selection = self.tabs[i].scene.selection.borrow();
-                    (!selection.left_down
-                        && !selection.middle_down
+                    (!selection.input.left_down
+                        && !selection.input.middle_down
                         && self.tabs[i].active_cmd.is_some())
-                    .then_some(selection.last_move_pos)
+                    .then_some(selection.input.last_move_pos)
                     .flatten()
                 };
                 if let Some(cursor) = cursor {
@@ -246,7 +246,7 @@ impl OpenCADStudio {
             return None;
         }
         let scene = &self.tabs[self.active_tab].scene;
-        let (w, h) = scene.selection.borrow().vp_size;
+        let (w, h) = scene.selection.borrow().view.vp_size;
         let rect = scene
             .active_viewport
             .and_then(|handle| scene.viewport_screen_rect(handle, (w, h)))
@@ -294,7 +294,12 @@ impl OpenCADStudio {
                 }
             }
         }
-        crate::sys::open_url("https://3dconnexion.com/drivers/", self.main_window)
+        let url = if cfg!(target_os = "linux") {
+            "https://spacenav.sourceforge.net/"
+        } else {
+            "https://3dconnexion.com/drivers/"
+        };
+        crate::sys::open_url(url, self.main_window)
     }
 }
 
@@ -367,6 +372,7 @@ mod tests {
             .scene
             .selection
             .borrow_mut()
+            .view
             .vp_size = (800., 600.);
         app.spacemouse_focused = true;
         app.spacemouse.test_connect();
@@ -406,7 +412,7 @@ mod tests {
             .document
             .entities()
             .find_map(|e| {
-                if let codec::EntityType::LwPolyline(p) = e {
+                if let document::EntityType::LwPolyline(p) = e {
                     Some(p)
                 } else {
                     None
@@ -492,11 +498,11 @@ mod tests {
         let mut app = app();
         let scene = &mut app.tabs[app.active_tab].scene;
         let paper_camera = scene.camera.borrow().clone();
-        let mut vp = codec::entities::Viewport::default();
+        let mut vp = document::entities::Viewport::default();
         vp.width = 200.;
         vp.height = 100.;
         vp.view_height = 50.;
-        let handle = scene.add_entity(codec::EntityType::Viewport(vp));
+        let handle = scene.add_entity(document::EntityType::Viewport(Box::new(vp)));
         scene.active_viewport = Some(handle);
         let mut camera = scene.navigation_camera();
         camera.target = DVec3::new(120., 30., 8.);
@@ -509,7 +515,7 @@ mod tests {
         assert!((round_trip.distance - camera.distance).abs() < 1e-4);
         assert_eq!(scene.camera.borrow().target, paper_camera.target);
         assert_eq!(scene.camera.borrow().distance, paper_camera.distance);
-        if let Some(codec::EntityType::Viewport(vp)) = scene.document.get_entity_mut(handle) {
+        if let Some(document::EntityType::Viewport(vp)) = scene.document.get_entity_mut(handle) {
             vp.status.locked = true;
         }
         camera.target.x += 100.;

@@ -1,7 +1,6 @@
-use codec::entities::Solid3D;
-use codec::objects::SolidHistoryOperation;
-use codec::EntityType;
-use kernel::brep::Body;
+use document::entities::Solid3D;
+use document::objects::SolidHistoryOperation;
+use document::EntityType;
 use glam::DVec3;
 
 use crate::command::{
@@ -29,7 +28,10 @@ enum Step {
     EllipseSecond(DVec3),
     EllipseThird(DVec3, DVec3),
     TtrFirst,
-    TtrSecond { object: TangentObject, hit: DVec3 },
+    TtrSecond {
+        object: TangentObject,
+        hit: DVec3,
+    },
     TtrRadius {
         first: TangentObject,
         second: TangentObject,
@@ -60,8 +62,7 @@ impl Default for Defaults {
 }
 
 fn defaults() -> &'static std::sync::Mutex<Defaults> {
-    static DEFAULTS: std::sync::OnceLock<std::sync::Mutex<Defaults>> =
-        std::sync::OnceLock::new();
+    static DEFAULTS: std::sync::OnceLock<std::sync::Mutex<Defaults>> = std::sync::OnceLock::new();
     DEFAULTS.get_or_init(|| std::sync::Mutex::new(Defaults::default()))
 }
 
@@ -74,12 +75,15 @@ pub struct CylinderCommand {
     plane: WorkingPlane,
 }
 
+impl Default for CylinderCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CylinderCommand {
     pub fn new() -> Self {
-        let remembered = defaults()
-            .lock()
-            .map(|value| *value)
-            .unwrap_or_default();
+        let remembered = defaults().lock().map(|value| *value).unwrap_or_default();
         Self {
             step: Step::BaseCenter,
             frame: None,
@@ -134,7 +138,7 @@ impl CylinderCommand {
         let plane = WorkingPlane::new(a, first_axis, second_axis);
         let local_b = plane.to_local(b);
         let local_c = plane.to_local(c);
-        let circle = kernel::geom2d::arc_through_points(
+        let circle = ocs_geom::geom2d::arc_through_points(
             [0.0, 0.0],
             [local_b.x, local_b.y],
             [local_c.x, local_c.y],
@@ -171,7 +175,7 @@ impl CylinderCommand {
         .to_cols_array()
     }
 
-    fn build(&self, axis: DVec3) -> Option<(Body, SolidHistoryOperation, f64)> {
+    fn build(&self, axis: DVec3) -> Option<(ocs_solid::model::Brep, SolidHistoryOperation, f64)> {
         let (frame, height) = self.axis_frame(axis)?;
         let local = solid_model::elliptical_cylinder_solid(
             [0.0; 3],
@@ -249,12 +253,7 @@ impl CylinderCommand {
             return None;
         };
         let local = crate::modules::draw::draw::circle::pick_best_ttr_candidate(
-            first,
-            second,
-            radius,
-            first_hit,
-            second_hit,
-            None,
+            first, second, radius, first_hit, second_hit, None,
         )?;
         Some(self.plane.to_world(local))
     }
@@ -375,10 +374,7 @@ impl CylinderCommand {
                 })
             }
             Step::EllipseCenterFirstAxis(center) => (number > 0.0).then(|| {
-                self.step = Step::EllipseCenterSecondAxis(
-                    center,
-                    center + self.plane.x * number,
-                );
+                self.step = Step::EllipseCenterSecondAxis(center, center + self.plane.x * number);
                 CmdResult::NeedPoint
             }),
             Step::TtrRadius { .. } => {
@@ -488,48 +484,64 @@ impl CadCommand for CylinderCommand {
 
     fn prompt(&self) -> String {
         match self.step {
-            Step::BaseCenter =>
-                t!("CYLINDER  Specify center point of base or [3P/2P/Ttr/Elliptical]:").into_owned(),
+            Step::BaseCenter => {
+                t!("CYLINDER  Specify center point of base or [3P/2P/Ttr/Elliptical]:").into_owned()
+            }
             Step::BaseRadius => crate::tf!(
                 "CYLINDER  Specify base radius or [Diameter] <{:.4}>:",
                 self.remembered.major_radius
-            ).into_owned(),
+            )
+            .into_owned(),
             Step::BaseDiameter => crate::tf!(
                 "CYLINDER  Specify base diameter <{:.4}>:",
                 self.remembered.major_radius * 2.0
-            ).into_owned(),
+            )
+            .into_owned(),
             Step::ThreePointFirst => t!("CYLINDER  Specify first point on base:").into_owned(),
             Step::ThreePointSecond(_) => t!("CYLINDER  Specify second point on base:").into_owned(),
-            Step::ThreePointThird(_, _) => t!("CYLINDER  Specify third point on base:").into_owned(),
-            Step::TwoPointFirst => t!("CYLINDER  Specify first endpoint of base diameter:").into_owned(),
-            Step::TwoPointSecond(_) => t!("CYLINDER  Specify second endpoint of base diameter:").into_owned(),
-            Step::EllipseFirst =>
-                t!("CYLINDER  Specify endpoint of first axis or [Center]:").into_owned(),
+            Step::ThreePointThird(_, _) => {
+                t!("CYLINDER  Specify third point on base:").into_owned()
+            }
+            Step::TwoPointFirst => {
+                t!("CYLINDER  Specify first endpoint of base diameter:").into_owned()
+            }
+            Step::TwoPointSecond(_) => {
+                t!("CYLINDER  Specify second endpoint of base diameter:").into_owned()
+            }
+            Step::EllipseFirst => {
+                t!("CYLINDER  Specify endpoint of first axis or [Center]:").into_owned()
+            }
             Step::EllipseCenter => t!("CYLINDER  Specify center point:").into_owned(),
             Step::EllipseCenterFirstAxis(_) => crate::tf!(
                 "CYLINDER  Specify distance to first axis <{:.4}>:",
                 self.remembered.major_radius
-            ).into_owned(),
-            Step::EllipseCenterSecondAxis(_, _) =>
-                t!("CYLINDER  Specify endpoint of second axis:").into_owned(),
-            Step::EllipseSecond(_) =>
-                t!("CYLINDER  Specify other endpoint of first axis:").into_owned(),
-            Step::EllipseThird(_, _) =>
-                t!("CYLINDER  Specify endpoint of second axis:").into_owned(),
+            )
+            .into_owned(),
+            Step::EllipseCenterSecondAxis(_, _) => {
+                t!("CYLINDER  Specify endpoint of second axis:").into_owned()
+            }
+            Step::EllipseSecond(_) => {
+                t!("CYLINDER  Specify other endpoint of first axis:").into_owned()
+            }
+            Step::EllipseThird(_, _) => {
+                t!("CYLINDER  Specify endpoint of second axis:").into_owned()
+            }
             Step::TtrFirst => t!("CYLINDER  Select first tangent object:").into_owned(),
             Step::TtrSecond { .. } => t!("CYLINDER  Select second tangent object:").into_owned(),
             Step::TtrRadius { .. } => crate::tf!(
                 "CYLINDER  Specify base radius <{:.4}>:",
                 self.remembered.major_radius
-            ).into_owned(),
+            )
+            .into_owned(),
             Step::Height => crate::tf!(
                 "CYLINDER  Specify height or [2Point/Axis endpoint] <{:.4}>:",
                 self.remembered.height
-            ).into_owned(),
-            Step::HeightFirstPoint =>
-                t!("CYLINDER  Specify first point for height:").into_owned(),
-            Step::HeightSecondPoint(_) =>
-                t!("CYLINDER  Specify second point for height:").into_owned(),
+            )
+            .into_owned(),
+            Step::HeightFirstPoint => t!("CYLINDER  Specify first point for height:").into_owned(),
+            Step::HeightSecondPoint(_) => {
+                t!("CYLINDER  Specify second point for height:").into_owned()
+            }
             Step::AxisEndpoint => t!("CYLINDER  Specify axis endpoint:").into_owned(),
         }
     }
@@ -734,8 +746,12 @@ impl CadCommand for CylinderCommand {
     fn point_step_accepts_keywords(&self) -> bool {
         matches!(
             self.step,
-            Step::BaseCenter | Step::BaseRadius | Step::EllipseFirst | Step::Height
+            Step::BaseCenter | Step::BaseRadius | Step::EllipseFirst
         )
+    }
+
+    fn dyn_commit_as_text(&self) -> bool {
+        matches!(self.step, Step::Height | Step::BaseDiameter)
     }
 
     fn on_text_input(&mut self, raw: &str) -> Option<CmdResult> {
@@ -817,13 +833,97 @@ fn push_ellipse(
     const SEGMENTS: usize = 64;
     for index in 0..=SEGMENTS {
         let angle = index as f64 / SEGMENTS as f64 * std::f64::consts::TAU;
-        let point = center
-            + x_axis * (x_radius * angle.cos())
-            + y_axis * (y_radius * angle.sin());
+        let point = center + x_axis * (x_radius * angle.cos()) + y_axis * (y_radius * angle.sin());
         points.push(point.as_vec3().to_array());
     }
 }
 
 fn wire(name: &str, points: Vec<[f32; 3]>) -> WireModel {
     WireModel::solid(name.to_string(), points, WireModel::CYAN, false)
+}
+
+#[cfg(test)]
+mod cylinder_tests {
+    use super::*;
+
+    #[test]
+    fn cylinder_creation_height_workflow() {
+        // Reset defaults
+        if let Ok(mut defs) = defaults().lock() {
+            *defs = Defaults::default();
+        }
+
+        // Test 1: Typing height upon creation respects the typed height
+        let mut command = CylinderCommand::new();
+        assert!(!command.dyn_commit_as_text());
+
+        // Step 1: Center
+        assert!(matches!(
+            command.on_point(DVec3::ZERO),
+            CmdResult::NeedPoint
+        ));
+        assert!(!command.dyn_commit_as_text());
+
+        // Step 2: Radius
+        assert!(matches!(
+            command.on_point(DVec3::new(5.0, 0.0, 0.0)),
+            CmdResult::NeedPoint
+        ));
+
+        // Step 3: Height
+        assert!(command.dyn_commit_as_text());
+        assert!(!command.point_step_accepts_keywords());
+
+        let res = command.on_text_input("25.0");
+        let Some(CmdResult::CommitSolid { history, .. }) = res else {
+            panic!("expected CommitSolid");
+        };
+        let SolidHistoryOperation::Cylinder(cyl) = history else {
+            panic!("expected Cylinder history");
+        };
+        assert_eq!(cyl.height, 25.0);
+        assert_eq!(defaults().lock().unwrap().height, 25.0);
+
+        // Test 2: Create cylinder with mouse drag
+        let mut cmd1 = CylinderCommand::new();
+        cmd1.on_point(DVec3::ZERO);
+        cmd1.on_point(DVec3::new(4.0, 0.0, 0.0));
+        let res1 = cmd1.on_point(DVec3::new(0.0, 0.0, 10.0));
+        let CmdResult::CommitSolid { history, .. } = res1 else {
+            panic!("expected CommitSolid");
+        };
+        let SolidHistoryOperation::Cylinder(cyl1) = history else {
+            panic!("expected Cylinder history");
+        };
+        assert_eq!(cyl1.height, 10.0);
+        assert_eq!(defaults().lock().unwrap().height, 10.0);
+
+        // Test 3: Next cylinder with Enter respects remembered mouse-dragged height
+        let mut cmd2 = CylinderCommand::new();
+        cmd2.on_point(DVec3::ZERO);
+        cmd2.on_point(DVec3::new(4.0, 0.0, 0.0));
+        let res2 = cmd2.on_enter();
+        let CmdResult::CommitSolid { history, .. } = res2 else {
+            panic!("expected CommitSolid");
+        };
+        let SolidHistoryOperation::Cylinder(cyl2) = history else {
+            panic!("expected Cylinder history");
+        };
+        assert_eq!(cyl2.height, 10.0);
+
+        // Test 4: Next cylinder: typing different height respects the new typed height (not retaining 10.0)!
+        let mut cmd3 = CylinderCommand::new();
+        cmd3.on_point(DVec3::ZERO);
+        cmd3.on_point(DVec3::new(4.0, 0.0, 0.0));
+        assert!(cmd3.dyn_commit_as_text());
+        let res3 = cmd3.on_text_input("42.0");
+        let Some(CmdResult::CommitSolid { history, .. }) = res3 else {
+            panic!("expected CommitSolid");
+        };
+        let SolidHistoryOperation::Cylinder(cyl3) = history else {
+            panic!("expected Cylinder history");
+        };
+        assert_eq!(cyl3.height, 42.0);
+        assert_eq!(defaults().lock().unwrap().height, 42.0);
+    }
 }

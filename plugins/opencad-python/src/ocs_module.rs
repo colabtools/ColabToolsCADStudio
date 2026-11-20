@@ -13,14 +13,16 @@ mod ocs {
     use rustpython_vm::convert::TryFromObject;
     use rustpython_vm::{function::ArgIntoFloat, PyObjectRef, PyResult, VirtualMachine};
 
-    use codec::entities::{
+    use document::entities::{
         Arc, LwPolyline, LwVertex, MText, TableBuilder, Text, TextHorizontalAlignment,
         TextVerticalAlignment,
     };
-    use codec::objects::ObjectType;
-    use codec::types::{Transform, Vector2, Vector3};
+    use document::objects::ObjectType;
+    use document::types::Color;
+    use document::types::{Transform, Vector2, Vector3};
     use ocs_plugin_api::host::{
-        codec, EntityType, ExtendedDataRecord, Handle, ReaderEntityKind, XDataValue,
+        document, EntityType, ExtendedDataRecord, Handle, PluginClassParameterKind, ReaderEntityKind,
+        XDataValue,
     };
 
     use crate::host_ctx;
@@ -51,7 +53,7 @@ mod ocs {
         Ok(())
     }
 
-    fn top_level_blocks(document: &codec::CadDocument) -> std::collections::HashSet<Handle> {
+    fn top_level_blocks(document: &document::Document) -> std::collections::HashSet<Handle> {
         let mut blocks: std::collections::HashSet<Handle> = document
             .objects
             .values()
@@ -406,7 +408,7 @@ mod ocs {
         text.rotation = rotation;
         host_ctx::with_host(|host| {
             host_ctx::ensure_undo_started(host);
-            host.add_entity(EntityType::MText(text)).value()
+            host.add_entity(EntityType::MText(Box::new(text))).value()
         })
         .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))
     }
@@ -726,6 +728,56 @@ mod ocs {
         .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))
     }
 
+    /// A plugin class instance's declared parameter rows (API v14, additive):
+    /// the entity's XDATA class stamp resolves the session-registered class,
+    /// and every declared parameter reads its (name, value) pair from the
+    /// instance's design record. Returns a list of
+    /// `{"name": str, "value_kind": "Real" | "Integer" | "Text",
+    /// "editable": bool, "value": str | None}` dicts ("value" is `None`
+    /// where the record row does not carry the parameter's pair yet — the
+    /// row renders the declaration). Raises `ValueError` on a missing
+    /// entity, a broken linkage or a stale schema (the caller re-stages);
+    /// the values are exactly what the record row carries, never a unit or
+    /// semantic conversion.
+    #[pyfunction]
+    fn plugin_class_instance_properties(
+        handle: u64,
+        vm: &VirtualMachine,
+    ) -> PyResult<Vec<PyObjectRef>> {
+        let rows = host_ctx::with_host(|host| host.plugin_class_instance_properties(Handle::new(handle)))
+            .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))?
+            .map_err(|reason| {
+                vm.new_value_error(format!("ocs.plugin_class_instance_properties: {reason}"))
+            })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let dict = vm.ctx.new_dict();
+            dict.set_item("name", vm.new_pyobj(row.name), vm)?;
+            dict.set_item(
+                "value_kind",
+                vm.new_pyobj(kind_py_name(row.value_kind)),
+                vm,
+            )?;
+            dict.set_item("editable", vm.new_pyobj(row.editable), vm)?;
+            match row.value {
+                Some(value) => dict.set_item("value", vm.new_pyobj(value), vm)?,
+                None => dict.set_item("value", vm.ctx.none(), vm)?,
+            }
+            out.push(dict.into());
+        }
+        Ok(out)
+    }
+
+    /// The python spelling of a declared parameter kind (the schema's own
+    /// names; kinds append at the END of the wire enum forever).
+    fn kind_py_name(kind: PluginClassParameterKind) -> &'static str {
+        match kind {
+            PluginClassParameterKind::Real => "Real",
+            PluginClassParameterKind::Integer => "Integer",
+            PluginClassParameterKind::Text => "Text",
+        }
+    }
+
     fn xdata_record_to_py(
         vm: &VirtualMachine,
         record: &ExtendedDataRecord,
@@ -958,7 +1010,7 @@ mod ocs {
         options: &rustpython_vm::builtins::PyDictRef,
         vm: &VirtualMachine,
     ) -> PyResult<ocs_plugin_api::host::LayerConfig> {
-        use codec::types::{Color, LineWeight, Transparency};
+        use document::types::{Color, LineWeight, Transparency};
         ensure_known_entity_keys(
             options,
             "layer",
@@ -1342,7 +1394,7 @@ mod ocs {
             let document = host.document();
             let mut inserts = std::collections::HashMap::<String, usize>::new();
             for entity in document.entities() {
-                if let codec::entities::EntityType::Insert(insert) = entity {
+                if let document::entities::EntityType::Insert(insert) = entity {
                     *inserts.entry(insert.block_name.to_uppercase()).or_default() += 1;
                 }
             }
@@ -1546,7 +1598,7 @@ mod ocs {
     #[cfg(feature = "experimental-host-model")]
     #[pyfunction]
     fn layout_records(vm: &VirtualMachine) -> PyResult<PyObjectRef> {
-        use codec::objects::ObjectType;
+        use document::objects::ObjectType;
         let rows = host_ctx::with_host(|host| {
             let current = match host.system_variable("CTAB") {
                 Some(ocs_plugin_api::host::HostSettingValue::Text(name)) => name,
@@ -1558,7 +1610,7 @@ mod ocs {
             for entity in document.entities() {
                 let owner = entity.common().owner_handle.value();
                 *owned.entry(owner).or_default() += 1;
-                if matches!(entity, codec::entities::EntityType::Viewport(_)) {
+                if matches!(entity, document::entities::EntityType::Viewport(_)) {
                     *viewports.entry(owner).or_default() += 1;
                 }
             }
@@ -1640,9 +1692,15 @@ mod ocs {
             "cancel" => R::Cancel,
             other => return Err(vm.new_value_error(format!("ocs.command_step: unknown step {other:?}"))),
         };
-        let outcome = host_ctx::with_host(|host| host.run_command(request))
-            .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))?
-            .map_err(|error| vm.new_runtime_error(format!("ocs.command_step: {error}")))?;
+        let starts = matches!(request, R::Run { .. } | R::Start { .. });
+        let outcome = host_ctx::with_host(|host| {
+            if starts {
+                host_ctx::split_undo_group(host);
+            }
+            host.run_command(request)
+        })
+        .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))?
+        .map_err(|error| vm.new_runtime_error(format!("ocs.command_step: {error}")))?;
         let dict = vm.ctx.new_dict();
         let strings = |items: &[String]| -> PyObjectRef {
             PyObjectRef::from(vm.ctx.new_list(items.iter().map(|v| vm.new_pyobj(v.clone())).collect()))
@@ -1664,7 +1722,7 @@ mod ocs {
     #[cfg(feature = "experimental-host-model")]
     #[pyfunction]
     fn layer_records(vm: &VirtualMachine) -> PyResult<PyObjectRef> {
-        use codec::types::{LineWeight, Transparency};
+        use document::types::{LineWeight, Transparency};
         let rows = host_ctx::with_host(|host| {
             let document = host.document();
             let mut counts = std::collections::HashMap::<String, usize>::new();
@@ -1858,7 +1916,7 @@ mod ocs {
                     "ocs.export_layer_dwg: cannot create {output_path:?}: {error}"
                 ))
             })?;
-        if let Err(error) = codec::DwgWriter::write_to_writer(&mut file, &snapshot) {
+        if let Err(error) = document::DwgWriter::write_to_writer(&mut file, &snapshot) {
             drop(file);
             let _ = std::fs::remove_file(path);
             return Err(
@@ -3699,7 +3757,7 @@ mod ocs {
         }
         host_ctx::with_host(|host| {
             host_ctx::ensure_undo_started(host);
-            host.add_entity(EntityType::Table(builder.build())).value()
+            host.add_entity(EntityType::Table(Box::new(builder.build()))).value()
         })
         .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))
     }
@@ -3720,7 +3778,7 @@ mod ocs {
         y2: ArgIntoFloat,
         vm: &VirtualMachine,
     ) -> PyResult<u64> {
-        let line = codec::Line::from_coords(
+        let line = document::Line::from_coords(
             x1.into_float(),
             y1.into_float(),
             0.0,
@@ -3746,7 +3804,7 @@ mod ocs {
         vm: &VirtualMachine,
     ) -> PyResult<u64> {
         let circle =
-            codec::Circle::from_coords(x.into_float(), y.into_float(), 0.0, radius.into_float());
+            document::Circle::from_coords(x.into_float(), y.into_float(), 0.0, radius.into_float());
         host_ctx::with_host(|host| {
             host_ctx::ensure_undo_started(host);
             host.add_entity(EntityType::Circle(circle)).value()
@@ -3768,8 +3826,8 @@ mod ocs {
         end_deg: ArgIntoFloat,
         vm: &VirtualMachine,
     ) -> PyResult<u64> {
-        let center = codec::Vector3::new(x.into_float(), y.into_float(), 0.0);
-        let arc = codec::Arc::from_center_radius_angles(
+        let center = document::Vector3::new(x.into_float(), y.into_float(), 0.0);
+        let arc = document::Arc::from_center_radius_angles(
             center,
             radius.into_float(),
             start_deg.into_float().to_radians(),
@@ -3915,7 +3973,7 @@ mod ocs {
                     "ocs.add_points: each point must be [finite x, y, z]".to_owned(),
                 ));
             }
-            entities.push(EntityType::Point(codec::Point::from_coords(
+            entities.push(EntityType::Point(document::Point::from_coords(
                 point[0], point[1], point[2],
             )));
         }
@@ -4123,8 +4181,8 @@ mod ocs {
     /// `Color` as `{"kind": "ByLayer" | "None" | "ByBlock"}`,
     /// `{"kind": "Index", "value": n}` or
     /// `{"kind": "Rgb", "value": {"r": .., "g": .., "b": ..}}`.
-    fn color_to_py_dict(vm: &VirtualMachine, color: &codec::types::Color) -> PyResult<PyObjectRef> {
-        use codec::types::Color;
+    fn color_to_py_dict(vm: &VirtualMachine, color: &document::types::Color) -> PyResult<PyObjectRef> {
+        use document::types::Color;
         let dict = vm.ctx.new_dict();
         match color {
             Color::ByLayer => dict.set_item("kind", vm.new_pyobj("ByLayer"), vm)?,
@@ -4146,8 +4204,8 @@ mod ocs {
         Ok(dict.into())
     }
 
-    fn py_to_color_dict(value: PyObjectRef, vm: &VirtualMachine) -> PyResult<codec::types::Color> {
-        use codec::types::Color;
+    fn py_to_color_dict(value: PyObjectRef, vm: &VirtualMachine) -> PyResult<document::types::Color> {
+        use document::types::Color;
         let dict = value.try_into_value::<rustpython_vm::builtins::PyDictRef>(vm)?;
         let kind = dict.get_item("kind", vm)?.try_into_value::<String>(vm)?;
         let byte = |v: PyObjectRef, what: &str| -> PyResult<u8> {
@@ -4635,6 +4693,414 @@ mod ocs {
         result.map_err(|error| vm.new_runtime_error(format!("ocs.update_many: {error}")))
     }
 
+    // ── Entity colors + batch color edits ────────────────────────────────
+    //
+    // Generic primitives over the existing HostApi calls: colors are read
+    // from the in-process document snapshot, written through `update_entity`
+    // (one entity) and `update_entities_transaction` (batches, one undo step
+    // per call).
+
+    /// The codec color for a Python value: an int is an ACI index (1..=255),
+    /// a three-number sequence is `(r, g, b)`, and the strings "ByLayer",
+    /// "ByBlock" and "None" map to the named variants. Anything else is a
+    /// ValueError.
+    fn py_entity_color(value: PyObjectRef, vm: &VirtualMachine) -> PyResult<Color> {
+        if let Ok(index) = value.clone().try_into_value::<i64>(vm) {
+            let index = u8::try_from(index)
+                .ok()
+                .filter(|index| *index != 0)
+                .ok_or_else(|| {
+                    vm.new_value_error("ocs: a color index must be 1..=255".to_owned())
+                })?;
+            return Ok(Color::Index(index));
+        }
+        if let Ok(rgb) = value.clone().try_into_value::<Vec<i64>>(vm) {
+            let byte = |component: i64| {
+                u8::try_from(component).map_err(|_| {
+                    vm.new_value_error("ocs: RGB components must be 0..=255".to_owned())
+                })
+            };
+            return match rgb.as_slice() {
+                [r, g, b] => Ok(Color::Rgb {
+                    r: byte(*r)?,
+                    g: byte(*g)?,
+                    b: byte(*b)?,
+                }),
+                _ => Err(vm.new_value_error("ocs: an RGB color needs three numbers".to_owned())),
+            };
+        }
+        if let Ok(name) = value.clone().try_into_value::<String>(vm) {
+            return match name.as_str() {
+                "ByLayer" => Ok(Color::ByLayer),
+                "ByBlock" => Ok(Color::ByBlock),
+                "None" | "none" => Ok(Color::None),
+                other => Err(vm.new_value_error(format!(
+                    "ocs: unknown named color {other:?} (ByLayer, ByBlock, None)"
+                ))),
+            };
+        }
+        Err(vm.new_value_error(
+            "ocs: a color is an ACI index (1..=255), an (r, g, b) triple, or a named color"
+                .to_owned(),
+        ))
+    }
+
+    /// The color of one top-level entity, in the records schema's shape:
+    /// `None` when the entity does not exist, else a dict like
+    /// `{"kind": "Index", "value": 7}` / `{"kind": "Rgb", "value": …}` /
+    /// `{"kind": "ByLayer"}` — the same shapes the runtime schema publishes.
+    #[pyfunction]
+    fn get_entity_color(handle: u64, vm: &VirtualMachine) -> PyResult<Option<PyObjectRef>> {
+        let color = host_ctx::with_host(|host| {
+            host.document()
+                .get_entity(Handle::new(handle))
+                .map(|entity| entity.common().color)
+        })
+        .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))?;
+        let Some(color) = color else {
+            return Ok(None);
+        };
+        let dict = vm.ctx.new_dict();
+        match &color {
+            Color::ByLayer => dict.set_item("kind", vm.new_pyobj("ByLayer"), vm)?,
+            Color::None => dict.set_item("kind", vm.new_pyobj("None"), vm)?,
+            Color::ByBlock => dict.set_item("kind", vm.new_pyobj("ByBlock"), vm)?,
+            Color::Index(index) => {
+                dict.set_item("kind", vm.new_pyobj("Index"), vm)?;
+                dict.set_item("value", vm.new_pyobj(i64::from(*index)), vm)?;
+            }
+            Color::Rgb { r, g, b } => {
+                dict.set_item("kind", vm.new_pyobj("Rgb"), vm)?;
+                let rgb = vm.ctx.new_dict();
+                rgb.set_item("r", vm.new_pyobj(i64::from(*r)), vm)?;
+                rgb.set_item("g", vm.new_pyobj(i64::from(*g)), vm)?;
+                rgb.set_item("b", vm.new_pyobj(i64::from(*b)), vm)?;
+                dict.set_item("value", PyObjectRef::from(rgb), vm)?;
+            }
+        }
+        Ok(Some(PyObjectRef::from(dict)))
+    }
+
+    /// The variant name of one top-level entity ("Hatch", "Solid", …), or
+    /// `None` when the handle is absent. The common kinds carry their
+    /// canonical names; anything rarer reports "Other".
+    #[pyfunction]
+    fn entity_kind(handle: u64, vm: &VirtualMachine) -> PyResult<Option<String>> {
+        host_ctx::with_host(|host| {
+            let name = match host.document().get_entity(Handle::new(handle)) {
+                None => return None,
+                Some(entity) => match entity {
+                    EntityType::Point(_) => "Point",
+                    EntityType::Line(_) => "Line",
+                    EntityType::Circle(_) => "Circle",
+                    EntityType::Arc(_) => "Arc",
+                    EntityType::LwPolyline(_) => "Polyline",
+                    EntityType::Polyline2D(_) => "Polyline2D",
+                    EntityType::Polyline3D(_) => "Polyline3D",
+                    EntityType::Text(_) => "Text",
+                    EntityType::MText(_) => "MText",
+                    EntityType::Tolerance(_) => "Tolerance",
+                    EntityType::Insert(_) => "Block Reference",
+                    EntityType::Hatch(_) => "Hatch",
+                    EntityType::Solid(_) => "Solid",
+                    EntityType::Face3D(_) => "3D Face",
+                    EntityType::Table(_) => "Table",
+                    EntityType::Wipeout(_) => "Wipeout",
+                    _ => "Other",
+                },
+            };
+            Some(name.to_owned())
+        })
+        .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))
+    }
+
+    /// The carrying layer name of one top-level entity, or `None`.
+    #[pyfunction]
+    fn get_entity_layer(handle: u64, vm: &VirtualMachine) -> PyResult<Option<String>> {
+        host_ctx::with_host(|host| {
+            host.document()
+                .get_entity(Handle::new(handle))
+                .map(|entity| entity.common().layer.clone())
+        })
+        .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))
+    }
+
+    /// Handles (`int`) of the top-level entities currently carried by
+    /// `layer`.
+    #[pyfunction]
+    fn entities_on_layer(layer: String, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+        let handles = host_ctx::with_host(|host| {
+            let document = host.document();
+            let top = top_level_blocks(document);
+            document
+                .entities()
+                .filter(|entity| top.contains(&entity.common().owner_handle))
+                .filter(|entity| entity.common().layer.eq_ignore_ascii_case(&layer))
+                .map(|entity| {
+                    vm.new_pyobj(i64::try_from(entity.common().handle.value()).unwrap_or(0))
+                })
+                .collect::<Vec<_>>()
+        })
+        .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))?;
+        Ok(vm.ctx.new_list(handles).into())
+    }
+
+    /// Set many top-level entities' layer in one undo step
+    /// (`[{"handle": …, "layer": …}, …]`), the layer-moves twin of
+    /// `set_entity_colors`. Chunks in Python for very large batches.
+    #[pyfunction]
+    fn set_entity_layers(
+        pairs: PyObjectRef,
+        label: String,
+        vm: &VirtualMachine,
+    ) -> PyResult<usize> {
+        if label.trim().is_empty() {
+            return Err(
+                vm.new_value_error("ocs.set_entity_layers: an undo label is required".to_owned())
+            );
+        }
+        let entities = host_ctx::with_host(|host| -> PyResult<Vec<EntityType>> {
+            use rustpython_vm::builtins::PyDictRef;
+            let updates = pairs.try_into_value::<Vec<PyDictRef>>(vm)?;
+            let top = top_level_blocks(host.document());
+            let mut entities = Vec::new();
+            for update in updates {
+                let handle = update.get_item("handle", vm)?.try_into_value::<u64>(vm)?;
+                let Some(layer) = update
+                    .get_item_opt("layer", vm)?
+                    .and_then(|value| value.try_into_value::<String>(vm).ok())
+                else {
+                    return Err(vm.new_value_error(format!(
+                        "ocs.set_entity_layers: update for {handle} misses \"layer\""
+                    )));
+                };
+                // A layer the drawing does not carry would leave the entity
+                // pointing at no LAYER record.
+                if host.document().layers.get(&layer).is_none() {
+                    return Err(vm.new_value_error(format!(
+                        "ocs.set_entity_layers: layer {layer:?} not found"
+                    )));
+                }
+                let Some(mut entity) = host
+                    .document()
+                    .get_entity(Handle::new(handle))
+                    .filter(|entity| top.contains(&entity.common().owner_handle))
+                    .cloned()
+                else {
+                    return Err(vm.new_value_error(format!(
+                        "ocs.set_entity_layers: top-level entity {handle} not found"
+                    )));
+                };
+                if entity.common().layer == layer {
+                    continue;
+                }
+                entity.common_mut().layer = layer;
+                entities.push(entity);
+            }
+            Ok(entities)
+        })
+        .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))?;
+        let entities = entities?;
+        let count = entities.len();
+        host_ctx::with_host(|host| host.update_entities_transaction(&label, entities))
+            .ok_or_else(|| {
+                vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned())
+            })?
+            .map_err(|error| vm.new_runtime_error(format!("ocs.set_entity_layers: {error}")))?;
+        Ok(count)
+    }
+
+    /// Handles (`int`) of every top-level entity: the ungated twin of the
+    /// document-model's handle enumeration, for scripts that must sweep the
+    /// whole drawing on the portable build.
+    #[cfg(not(feature = "experimental-host-model"))]
+    #[pyfunction]
+    fn top_level_handles(vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+        let handles = host_ctx::with_host(|host| {
+            host.document()
+                .entities()
+                .map(|entity| {
+                    vm.new_pyobj(i64::try_from(entity.common().handle.value()).unwrap_or(0))
+                })
+                .collect::<Vec<_>>()
+        })
+        .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))?;
+        Ok(vm.ctx.new_list(handles).into())
+    }
+
+    /// Set one top-level entity's color; preserving handle and everything
+    /// else about it. Same contract as [`set_entity_layer`] with the color
+    /// field swapped in.
+    #[pyfunction]
+    fn set_entity_color(handle: u64, color: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+        let color = py_entity_color(color, vm)?;
+        let changed = host_ctx::with_host(|host| {
+            let document = host.document();
+            let Some(mut entity) = document
+                .get_entity(Handle::new(handle))
+                .filter(|entity| top_level_blocks(document).contains(&entity.common().owner_handle))
+                .cloned()
+            else {
+                return false;
+            };
+            if matches!(&entity.common().color, existing if *existing == color) {
+                return true;
+            }
+            entity.common_mut().color = color;
+            host_ctx::ensure_undo_started(host);
+            host.update_entity(entity)
+        })
+        .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))?;
+        if !changed {
+            return Err(vm.new_value_error(format!(
+                "ocs.set_entity_color: top-level entity {handle} not found"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Set many entity colors in one undo step: `[(handle, color), …]`.
+    /// One transaction per call; chunk the input in Python when the batch is
+    /// large (the write is the full entity, so the chunk sets the IPC size).
+    #[pyfunction]
+    fn set_entity_colors(
+        pairs: PyObjectRef,
+        label: String,
+        vm: &VirtualMachine,
+    ) -> PyResult<usize> {
+        if label.trim().is_empty() {
+            return Err(
+                vm.new_value_error("ocs.set_entity_colors: an undo label is required".to_owned())
+            );
+        }
+        let entities = host_ctx::with_host(|host| -> PyResult<Vec<EntityType>> {
+            use rustpython_vm::builtins::PyDictRef;
+            let updates = pairs.try_into_value::<Vec<PyDictRef>>(vm)?;
+            let top = top_level_blocks(host.document());
+            let mut entities = Vec::new();
+            for update in updates {
+                let handle = update.get_item("handle", vm)?.try_into_value::<u64>(vm)?;
+                let Some(color_value) = update.get_item_opt("color", vm)? else {
+                    return Err(vm.new_value_error(format!(
+                        "ocs.set_entity_colors: update for {handle} misses \"color\""
+                    )));
+                };
+                let color = py_entity_color(color_value, vm)?;
+                // Per-pair snapshot reads are deliberate: the transaction
+                // writes full typed entities, so the current color is
+                // needed anyway. Each chunk costs one snapshot re-clone
+                // (writes invalidate the dispatch snapshot) plus one IPC
+                // frame — chunk size balances both against the 64 MiB IPC
+                // cap.
+                let Some(mut entity) = host
+                    .document()
+                    .get_entity(Handle::new(handle))
+                    .filter(|entity| top.contains(&entity.common().owner_handle))
+                    .cloned()
+                else {
+                    return Err(vm.new_value_error(format!(
+                        "ocs.set_entity_colors: top-level entity {handle} not found"
+                    )));
+                };
+                if matches!(&entity.common().color, existing if *existing == color) {
+                    continue;
+                }
+                entity.common_mut().color = color;
+                entities.push(entity);
+            }
+            Ok(entities)
+        })
+        .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))?;
+        let entities = entities?;
+        let count = entities.len();
+        host_ctx::with_host(|host| host.update_entities_transaction(&label, entities))
+            .ok_or_else(|| {
+                vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned())
+            })?
+            .map_err(|error| vm.new_runtime_error(format!("ocs.set_entity_colors: {error}")))?;
+        Ok(count)
+    }
+
+    /// Create one layer record when it is missing, or rewrite its color
+    /// (+ optionally `frozen`) when it exists — idempotent.
+    #[pyfunction]
+    fn ensure_layer(name: String, color: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+        let color = py_entity_color(color, vm)?;
+        host_ctx::with_host(|host| {
+            let refused = format!("ocs.ensure_layer: rewriting {name} was refused");
+            host_ctx::ensure_undo_started(host);
+            if host.document().layers.get(&name).is_none() {
+                let created = host.add_layer(ocs_plugin_api::host::LayerConfig {
+                    name,
+                    color: Some(color),
+                    ..Default::default()
+                });
+                created
+                    .map(|_| ())
+                    .ok_or_else(|| vm.new_value_error("ocs.ensure_layer: a layer needs a name".to_owned()))
+            } else {
+                let changed = host.modify_layer(ocs_plugin_api::host::LayerConfig {
+                    name,
+                    color: Some(color),
+                    ..Default::default()
+                });
+                if changed {
+                    Ok(())
+                } else {
+                    Err(vm.new_runtime_error(refused))
+                }
+            }
+        })
+        .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))?
+    }
+
+    /// Set one layer record's freeze flag (thaw when `frozen` is false).
+    #[pyfunction]
+    fn freeze_layer(name: String, frozen: bool, vm: &VirtualMachine) -> PyResult<()> {
+        let refused = format!("ocs.freeze_layer: rewriting {name} was refused");
+        host_ctx::with_host(|host| {
+            if host.document().layers.get(&name).is_none() {
+                return Ok(());
+            }
+            host_ctx::ensure_undo_started(host);
+            let changed = host.modify_layer(ocs_plugin_api::host::LayerConfig {
+                name,
+                frozen: Some(frozen),
+                ..Default::default()
+            });
+            if changed {
+                Ok(())
+            } else {
+                Err(vm.new_runtime_error(refused))
+            }
+        })
+        .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))?
+    }
+
+    /// Thaw and unlock one layer record (leave every other property alone).
+    #[pyfunction]
+    fn thaw_layer(name: String, vm: &VirtualMachine) -> PyResult<()> {
+        host_ctx::with_host(|host| {
+            let refused = format!("ocs.thaw_layer: unlocking {name} was refused");
+            if host.document().layers.get(&name).is_none() {
+                return Ok(());
+            }
+            host_ctx::ensure_undo_started(host);
+            let changed = host.modify_layer(ocs_plugin_api::host::LayerConfig {
+                name,
+                frozen: Some(false),
+                locked: Some(false),
+                ..Default::default()
+            });
+            if changed {
+                Ok(())
+            } else {
+                Err(vm.new_runtime_error(refused))
+            }
+        })
+        .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))?
+    }
+
     #[cfg(test)]
     mod entity_crud_tests {
         use super::*;
@@ -4682,7 +5148,7 @@ mod ocs {
         #[test]
         fn unmapped_canvas_kind_accepts_only_layer_patch() {
             with_vm(|vm| {
-                let entity = EntityType::MLine(codec::entities::MLine::default());
+                let entity = EntityType::MLine(document::entities::MLine::default());
                 let patch = vm.ctx.new_dict();
                 patch.set_item("handle", vm.new_pyobj(1_u64), vm).unwrap();
                 patch
@@ -4868,7 +5334,7 @@ mod ocs {
         fn insert_is_created_by_block_name_and_preserves_block_identity() {
             with_vm(|vm| {
                 let mut insert =
-                    codec::entities::Insert::new("DOOR", Vector3::new(1.0, 2.0, 0.0));
+                    document::entities::Insert::new("DOOR", Vector3::new(1.0, 2.0, 0.0));
                 insert.set_x_scale(2.0);
                 let original = EntityType::Insert(insert);
                 let rendered = entity_to_dict(vm, &original)
@@ -5050,7 +5516,7 @@ mod ocs {
                 assert_eq!(definition.tag, "PART_NO");
                 assert_eq!(definition.text_style, "Standard");
 
-                let mut embedded = codec::entities::MText::default();
+                let mut embedded = document::entities::MText::default();
                 embedded.value = "first\\Psecond".into();
                 definition.embedded_mtext = Some(Box::new(embedded));
                 let entity = EntityType::AttributeDefinition(definition);
@@ -5123,7 +5589,7 @@ mod ocs {
                 };
                 assert_eq!(attribute.common.owner_handle, Handle::new(50));
                 attribute.attdef_handle = Handle::new(42);
-                let mut embedded = codec::entities::MText::default();
+                let mut embedded = document::entities::MText::default();
                 embedded.value = "first\\Psecond".into();
                 attribute.embedded_mtext = Some(Box::new(embedded));
                 let entity = EntityType::AttributeEntity(attribute);
@@ -5274,7 +5740,7 @@ mod ocs {
         #[test]
         fn phase_seven_kinds_survive_dwg_round_trip() {
             with_vm(|vm| {
-                let mut doc = codec::CadDocument::new();
+                let mut doc = document::Document::new();
                 let mut handles = Vec::new();
                 for kind in ["Ray", "XLine", "Solid", "Face3D"] {
                     let input = vm.ctx.new_dict();
@@ -5298,8 +5764,8 @@ mod ocs {
                 }
                 let path = std::env::temp_dir()
                     .join(format!("ocs_phase_seven_{}.dwg", std::process::id()));
-                codec::DwgWriter::write_to_file(&path, &doc).unwrap();
-                let reopened = codec::DwgReader::from_file(&path)
+                document::DwgWriter::write_to_file(&path, &doc).unwrap();
+                let reopened = document::DwgReader::from_file(&path)
                     .unwrap()
                     .read()
                     .unwrap();
@@ -5325,7 +5791,7 @@ mod ocs {
         #[test]
         fn text_is_in_editable_schema_and_keeps_unmentioned_fields() {
             with_vm(|vm| {
-                let mut text = codec::entities::Text::new();
+                let mut text = document::entities::Text::new();
                 text.value = "Before".into();
                 text.height = 3.5;
                 text.insertion_point = Vector3::new(1.0, 2.0, 0.0);
@@ -5363,7 +5829,7 @@ mod ocs {
                 dict.set_item("radius", vm.new_pyobj(5.0), vm).unwrap();
 
                 let entity = dict_to_entity(&dict, vm).expect("dict_to_entity");
-                let codec::EntityType::Circle(circle) = &entity else {
+                let document::EntityType::Circle(circle) = &entity else {
                     panic!("expected Circle, got {entity:?}");
                 };
                 assert_eq!(circle.common.layer, "Walls");
@@ -5462,7 +5928,7 @@ mod ocs {
                     .unwrap();
 
                 let entity = dict_to_entity(&dict, vm).expect("dict_to_entity");
-                let codec::EntityType::Polyline2D(polyline) = &entity else {
+                let document::EntityType::Polyline2D(polyline) = &entity else {
                     panic!("expected Polyline2D, got {entity:?}");
                 };
                 assert!(polyline.flags.is_closed());
@@ -5491,13 +5957,13 @@ mod ocs {
                     .unwrap();
 
                 let entity = dict_to_entity(&dict, vm).expect("dict_to_entity");
-                let codec::EntityType::MText(text) = &entity else {
+                let document::EntityType::MText(text) = &entity else {
                     panic!("expected MText, got {entity:?}");
                 };
                 assert_eq!(text.value, "hello");
                 assert_eq!(
                     text.attachment_point,
-                    codec::entities::AttachmentPoint::MiddleCenter
+                    document::entities::AttachmentPoint::MiddleCenter
                 );
 
                 let round_tripped = entity_to_dict(vm, &entity).expect("entity_to_dict");
@@ -5539,7 +6005,7 @@ mod ocs {
                 let updated = apply_dict_to_entity(&existing, &update_dict, vm)
                     .expect("apply_dict_to_entity");
 
-                let codec::EntityType::Line(line) = &updated else {
+                let document::EntityType::Line(line) = &updated else {
                     panic!("expected Line, got {updated:?}");
                 };
                 assert_eq!(line.common.layer, "Geometry", "layer must be preserved");
@@ -5562,7 +6028,7 @@ mod ocs {
                     .unwrap();
                 let updated =
                     apply_dict_to_entity(&updated, &update_dict, vm).expect("apply_dict_to_entity");
-                let codec::EntityType::Line(line) = &updated else {
+                let document::EntityType::Line(line) = &updated else {
                     panic!("expected Line, got {updated:?}");
                 };
                 assert_eq!(line.common.layer, "Renamed");
@@ -5574,7 +6040,7 @@ mod ocs {
         /// The concrete Phase 1 acceptance test: create, read,
         /// edit, delete, save, and reopen a Line and an Ellipse, with common
         /// properties preserved — exercised against a real
-        /// `codec::CadDocument` and a real DWG round trip (not a fake
+        /// `document::Document` and a real DWG round trip (not a fake
         /// `HostApi`; `dict_to_entity`/`apply_dict_to_entity`/`entity_to_dict`
         /// are exactly what a live `HostApi`-backed `ocs.add`/`ocs.update`/
         /// `ocs.get_entity` call into, so this covers the same logic without
@@ -5582,14 +6048,14 @@ mod ocs {
         #[test]
         fn line_and_ellipse_survive_create_read_edit_delete_save_reopen() {
             with_vm(|vm| {
-                let mut doc = codec::CadDocument::new();
+                let mut doc = document::Document::new();
                 // A layer must exist in the document's layer table before an
                 // entity can reference it — same requirement `set_entity_layer`
                 // above already enforces for a live document. Without this,
                 // the DWG writer silently falls back the entity to layer "0"
                 // instead of erroring, which this test caught the first time
                 // around (it used "Geometry" without registering it first).
-                doc.layers.add(codec::Layer::new("Geometry")).unwrap();
+                doc.layers.add(document::Layer::new("Geometry")).unwrap();
 
                 // --- CREATE ---
                 let add_line = vm.ctx.new_dict();
@@ -5643,7 +6109,7 @@ mod ocs {
                     .expect("apply_dict_to_entity Line");
                 *doc.get_entity_mut(line_handle).unwrap() = updated;
 
-                let codec::EntityType::Line(line) = doc.get_entity(line_handle).unwrap() else {
+                let document::EntityType::Line(line) = doc.get_entity(line_handle).unwrap() else {
                     panic!("expected Line");
                 };
                 assert_eq!(
@@ -5670,14 +6136,14 @@ mod ocs {
                     "ocs_entity_crud_acceptance_test_{}.dwg",
                     std::process::id()
                 ));
-                codec::DwgWriter::write_to_file(&path, &doc).expect("write dwg");
-                let reopened = codec::DwgReader::from_file(&path)
+                document::DwgWriter::write_to_file(&path, &doc).expect("write dwg");
+                let reopened = document::DwgReader::from_file(&path)
                     .expect("open dwg")
                     .read()
                     .expect("read dwg");
                 let _ = std::fs::remove_file(&path);
 
-                let codec::EntityType::Line(reopened_line) = reopened
+                let document::EntityType::Line(reopened_line) = reopened
                     .get_entity(line_handle)
                     .expect("line survives save/reopen")
                 else {
@@ -5703,6 +6169,221 @@ mod ocs {
                 );
             });
         }
+    }
+
+    // ── Quad cursor menu panels (API v15) ───────────────────────────────────
+
+    /// Register declarative quad cursor menu panels (API v15). Each panel is
+    /// a dict `{"panel_id", "title", "applies_to": [...], "items": [...]}`;
+    /// an item is `{"control_id", "label", "icon", "action"}` where `icon`
+    /// is `{"glyph": "X"}` or `{"svg": "<svg…>"}` (raw bytes, ≤ 8 KiB — an
+    /// oversized or malformed icon degrades to a glyph tile, per the §4
+    /// contract) and `action` is `{"command": "LINE"}` or `{"python":
+    /// "code"}` — code run when the item is picked, with `handles`,
+    /// `type_keys` and `pick_point` bound. The host attaches this plugin's identity from the transport;
+    /// the call returns one bool per panel (registration order), `False`
+    /// marking a refused panel (caps, duplicate control ids, an id another
+    /// plugin owns).
+    #[pyfunction]
+    fn register_quad_panels(
+        panels: Vec<PyObjectRef>,
+        vm: &VirtualMachine,
+    ) -> PyResult<PyObjectRef> {
+        // All parsing happens before `host_ctx::with_host`, per the module's
+        // sentinel-error discipline.
+        let parsed: Vec<(ocs_plugin_api::dialog::QuadPanelDef, Vec<(String, String)>)> = panels
+            .into_iter()
+            .map(|panel| py_to_quad_panel_def(panel, vm))
+            .collect::<PyResult<_>>()?;
+        let defs: Vec<ocs_plugin_api::dialog::QuadPanelDef> =
+            parsed.iter().map(|(def, _)| def.clone()).collect();
+        let results =
+            host_ctx::with_host(|host| host.register_quad_panels(crate::PLUGIN_ID, &defs))
+                .ok_or_else(|| {
+                    vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned())
+                })?;
+        // A registered panel's Python items keep their code for the plugin's
+        // session: the script itself is gone by the time an item is picked.
+        for ((def, scripts), registered) in parsed.iter().zip(&results) {
+            if *registered {
+                crate::quad_scripts::replace_panel(&def.panel_id, scripts.clone());
+            }
+        }
+        let items = results
+            .into_iter()
+            .map(|registered| vm.new_pyobj(registered))
+            .collect();
+        Ok(vm.ctx.new_list(items).into())
+    }
+
+    /// Remove quad panels this plugin registered earlier in the session
+    /// (API v15). One bool per id (order): `False` marks an id this plugin
+    /// does not own (another plugin's panel is refused, not removed).
+    #[pyfunction]
+    fn unregister_quad_panels(
+        panel_ids: Vec<String>,
+        vm: &VirtualMachine,
+    ) -> PyResult<PyObjectRef> {
+        let refs: Vec<&str> = panel_ids.iter().map(String::as_str).collect();
+        let results = host_ctx::with_host(|host| host.unregister_quad_panels(crate::PLUGIN_ID, &refs))
+            .ok_or_else(|| {
+                vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned())
+            })?;
+        for (panel_id, removed) in panel_ids.iter().zip(&results) {
+            if *removed {
+                crate::quad_scripts::replace_panel(panel_id, Vec::new());
+            }
+        }
+        let items = results
+            .into_iter()
+            .map(|removed| vm.new_pyobj(removed))
+            .collect();
+        Ok(vm.ctx.new_list(items).into())
+    }
+
+    /// One panel dict → [`QuadPanelDef`](ocs_plugin_api::dialog::QuadPanelDef).
+    fn py_to_quad_panel_def(
+        panel: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<(ocs_plugin_api::dialog::QuadPanelDef, Vec<(String, String)>)> {
+        use rustpython_vm::convert::TryFromObject;
+        let dict = panel.downcast::<rustpython_vm::builtins::PyDict>().map_err(|_| {
+            vm.new_type_error("each quad panel must be a dict".to_owned())
+        })?;
+        let panel_id = dict.get_item("panel_id", vm)?.try_into_value::<String>(vm)?;
+        let title = dict.get_item("title", vm)?.try_into_value::<String>(vm)?;
+        let mut def = ocs_plugin_api::dialog::QuadPanelDef::new(panel_id, title);
+        let mut scripts = Vec::new();
+        if let Some(applies_to) = dict.get_item_opt("applies_to", vm)? {
+            if !vm.is_none(&applies_to) {
+                let keys: Vec<String> = py_string_list(applies_to, vm)?;
+                def.applies_to = keys;
+            }
+        }
+        if let Some(items) = dict.get_item_opt("items", vm)? {
+            if !vm.is_none(&items) {
+                let raw_items: Vec<PyObjectRef> = Vec::try_from_object(vm, items)
+                    .map_err(|_| vm.new_type_error("items must be a list of dicts".to_owned()))?;
+                for item in raw_items {
+                    let (item, script) = py_to_quad_item_def(item, vm)?;
+                    if let Some(script) = script {
+                        scripts.push((item.control_id.clone(), script));
+                    }
+                    def.items.push(item);
+                }
+            }
+        }
+        Ok((def, scripts))
+    }
+
+    /// One item dict → [`QuadItemDef`](ocs_plugin_api::dialog::QuadItemDef).
+    fn py_to_quad_item_def(
+        item: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<(ocs_plugin_api::dialog::QuadItemDef, Option<String>)> {
+        use rustpython_vm::convert::TryFromObject;
+        let dict = item.downcast::<rustpython_vm::builtins::PyDict>().map_err(|_| {
+            vm.new_type_error("each quad item must be a dict".to_owned())
+        })?;
+        let control_id = dict.get_item("control_id", vm)?.try_into_value::<String>(vm)?;
+        let label = dict.get_item("label", vm)?.try_into_value::<String>(vm)?;
+        let icon = match dict.get_item_opt("icon", vm)? {
+            Some(icon) if !vm.is_none(&icon) => py_to_quad_icon(icon, vm)?,
+            // No icon: the glyph tile from the label (the §4 fallback).
+            _ => ocs_plugin_api::ribbon::owned::OwnedIconKind::Glyph(String::new()),
+        };
+        let (action, script) = match dict.get_item_opt("action", vm)? {
+            Some(action) if !vm.is_none(&action) => py_to_quad_action(action, vm)?,
+            _ => return Err(vm.new_value_error(QUAD_ACTION_FORMS.to_owned())),
+        };
+        Ok((
+            ocs_plugin_api::dialog::QuadItemDef {
+                control_id,
+                label,
+                icon,
+                action,
+            },
+            script,
+        ))
+    }
+
+    /// `{"svg": "<svg…>"}` → raw bytes, `{"glyph": "X"}` → the glyph.
+    fn py_to_quad_icon(
+        icon: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<ocs_plugin_api::ribbon::owned::OwnedIconKind> {
+        use rustpython_vm::convert::TryFromObject;
+        let dict = icon.downcast::<rustpython_vm::builtins::PyDict>().map_err(|_| {
+            vm.new_type_error(
+                "a quad icon must be {\"svg\": \"<svg…>\"} or {\"glyph\": \"X\"}".to_owned(),
+            )
+        })?;
+        if let Some(svg) = dict.get_item_opt("svg", vm)? {
+            if !vm.is_none(&svg) {
+                let text = svg.try_into_value::<String>(vm)?;
+                return Ok(ocs_plugin_api::ribbon::owned::OwnedIconKind::Svg(
+                    text.into_bytes(),
+                ));
+            }
+        }
+        if let Some(glyph) = dict.get_item_opt("glyph", vm)? {
+            if !vm.is_none(&glyph) {
+                return Ok(ocs_plugin_api::ribbon::owned::OwnedIconKind::Glyph(
+                    glyph.try_into_value::<String>(vm)?,
+                ));
+            }
+        }
+        Err(vm.new_value_error(
+            "a quad icon must be {\"svg\": \"<svg…>\"} or {\"glyph\": \"X\"}".to_owned(),
+        ))
+    }
+
+    /// The forms a Python quad item's action takes.
+    const QUAD_ACTION_FORMS: &str = "a quad action must be {\"command\": \"VERB\"} or \
+        {\"python\": \"code\"}: a script's own functions are gone by the time an item \
+        is picked, so a Python item carries the code to run";
+
+    /// `{"command": "LINE"}` → the verb dispatch; `{"python": "code"}` → the
+    /// quad-action notification, answered by running that code (see
+    /// `quad_scripts`) with `handles`, `type_keys` and `pick_point` bound.
+    fn py_to_quad_action(
+        action: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<(ocs_plugin_api::dialog::QuadActionDef, Option<String>)> {
+        use rustpython_vm::convert::TryFromObject;
+        let dict = action
+            .downcast::<rustpython_vm::builtins::PyDict>()
+            .map_err(|_| vm.new_type_error(QUAD_ACTION_FORMS.to_owned()))?;
+        if let Some(command) = dict.get_item_opt("command", vm)? {
+            if !vm.is_none(&command) {
+                return Ok((
+                    ocs_plugin_api::dialog::QuadActionDef::Command(
+                        command.try_into_value::<String>(vm)?,
+                    ),
+                    None,
+                ));
+            }
+        }
+        if let Some(code) = dict.get_item_opt("python", vm)? {
+            if !vm.is_none(&code) {
+                let code = code.try_into_value::<String>(vm)?;
+                // Compiled now, so a typo shows at registration, not on a pick.
+                vm.compile(&code, rustpython_vm::compiler::Mode::Exec, "<quad>".to_owned())
+                    .map_err(|err| vm.new_value_error(format!("quad python code: {err}")))?;
+                return Ok((ocs_plugin_api::dialog::QuadActionDef::Callback, Some(code)));
+            }
+        }
+        Err(vm.new_value_error(QUAD_ACTION_FORMS.to_owned()))
+    }
+
+    /// A Python list of strings → `Vec<String>` (the `applies_to` keys).
+    fn py_string_list(value: PyObjectRef, vm: &VirtualMachine) -> PyResult<Vec<String>> {
+        use rustpython_vm::convert::TryFromObject;
+        let list: Vec<PyObjectRef> = Vec::try_from_object(vm, value)
+            .map_err(|_| vm.new_type_error("applies_to must be a list of strings".to_owned()))?;
+        list.into_iter()
+            .map(|key| key.try_into_value::<String>(vm))
+            .collect()
     }
 }
 
@@ -5740,7 +6421,7 @@ mod tests {
         let mut current = None;
         for line in converter.lines() {
             let line = line.trim();
-            if let Some(arm) = line.strip_prefix("codec::EntityType::") {
+            if let Some(arm) = line.strip_prefix("document::EntityType::") {
                 if let Some((kind, _)) = arm.split_once("(value) => {") {
                     current = Some(kind.to_owned());
                     emitted.entry(kind.to_owned()).or_default();
@@ -5800,8 +6481,8 @@ mod tests {
     #[cfg(feature = "experimental-host-model")]
     #[test]
     fn entity_snapshot_uses_catalog_variant_name() {
-        use ocs_plugin_api::host::codec;
-        let hatch = codec::EntityType::Hatch(codec::entities::Hatch::default());
+        use ocs_plugin_api::host::document;
+        let hatch = document::EntityType::Hatch(document::entities::Hatch::default());
         let value = serde_json::to_value(hatch).unwrap();
         let kind = value.as_object().unwrap().keys().next().unwrap();
         assert_eq!(kind, "Hatch");
@@ -5829,6 +6510,16 @@ mod tests {
         assert!(
             error.contains("not running inside a PY_ command"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn class_instance_properties_reaches_for_the_host() {
+        // The binding completes its own argument parsing first; outside a
+        // PY_ command the host lookup is the sentinel, not a parse error.
+        assert_eq!(
+            eval("ocs.plugin_class_instance_properties(11)"),
+            Err(NO_HOST.to_string())
         );
     }
 
@@ -5992,5 +6683,47 @@ mod tests {
         );
         let bad = eval(r#"ocs.add_text_left("Note", 0.0, 0.0, 0.0, 0.0, 0.0)"#);
         assert!(matches!(bad, Err(ref msg) if msg.starts_with("ValueError: ocs.add_text_left:")));
+    }
+
+    #[test]
+    fn entity_color_helpers_validate_before_reaching_host() {
+        assert_eq!(eval(r#"ocs.get_entity_color(7)"#), Err(NO_HOST.to_string()));
+        assert_eq!(eval(r#"ocs.entity_kind(7)"#), Err(NO_HOST.to_string()));
+        assert_eq!(
+            eval(r#"ocs.entities_on_layer("0")"#),
+            Err(NO_HOST.to_string())
+        );
+        assert_eq!(eval(r#"ocs.get_entity_layer(7)"#), Err(NO_HOST.to_string()));
+        assert_eq!(
+            eval(r#"ocs.set_entity_color(7, 5)"#),
+            Err(NO_HOST.to_string())
+        );
+        assert_eq!(
+            eval(r#"ocs.set_entity_colors([{"handle": 7, "color": "ByLayer"}], "label")"#),
+            Err(NO_HOST.to_string())
+        );
+        assert_eq!(
+            eval(r#"ocs.set_entity_layers([{"handle": 7, "layer": "Walls"}], "label")"#),
+            Err(NO_HOST.to_string())
+        );
+        assert_eq!(
+            eval(r#"ocs.ensure_layer("Walls", 3)"#),
+            Err(NO_HOST.to_string())
+        );
+        assert_eq!(
+            eval(r#"ocs.freeze_layer("Walls", True)"#),
+            Err(NO_HOST.to_string())
+        );
+        assert_eq!(eval(r#"ocs.thaw_layer("Walls")"#), Err(NO_HOST.to_string()));
+    }
+
+    #[test]
+    fn entity_color_batch_arguments_shape_check_first() {
+        // Batch entries are read inside the host context, so without a host
+        // the NO_HOST error comes first, even for a malformed entry.
+        let empty_batch = eval(r#"ocs.set_entity_colors([], "label")"#);
+        assert_eq!(empty_batch, Err(NO_HOST.to_string()));
+        let malformed = eval(r#"ocs.set_entity_colors([{"handle": 7}], "label")"#);
+        assert_eq!(malformed, Err(NO_HOST.to_string()));
     }
 }

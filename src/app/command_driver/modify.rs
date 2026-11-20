@@ -1,7 +1,12 @@
 use super::*;
 
 impl OpenCADStudio {
-    pub(super) fn handle_lengthen_entity(&mut self, handle: Handle, pick_pt: glam::DVec3, mode: crate::modules::draw::modify::lengthen::LenMode) -> Option<Task<Message>> {
+    pub(super) fn handle_lengthen_entity(
+        &mut self,
+        handle: Handle,
+        pick_pt: glam::DVec3,
+        mode: crate::modules::draw::modify::lengthen::LenMode,
+    ) -> Option<Task<Message>> {
         let i = self.active_tab;
         if self.reject_locked_edit(i, handle) {
             return Some(Task::none());
@@ -35,7 +40,12 @@ impl OpenCADStudio {
         None
     }
 
-    pub(super) fn handle_divide_entity(&mut self, handle: Handle, n: usize, marker: Option<crate::command::CurveMarker>) {
+    pub(super) fn handle_divide_entity(
+        &mut self,
+        handle: Handle,
+        n: usize,
+        marker: Option<crate::command::CurveMarker>,
+    ) {
         let i = self.active_tab;
         use crate::modules::draw::inquiry::divide::divide_entity;
         let pts = self.tabs[i]
@@ -56,9 +66,8 @@ impl OpenCADStudio {
             self.command_line
                 .push_output(crate::tf!("DIVIDE: {count} marker(s) placed.").as_ref());
         } else {
-            self.command_line.push_error(
-                crate::t!("DIVIDE: entity type not supported or N < 2.").as_ref(),
-            );
+            self.command_line
+                .push_error(crate::t!("DIVIDE: entity type not supported or N < 2.").as_ref());
         }
         self.tabs[i].active_cmd = None;
         self.tabs[i].snap_result = None;
@@ -105,12 +114,20 @@ impl OpenCADStudio {
         self.restore_pre_cmd_tangent();
     }
 
-    pub(super) fn handle_pedit_op(&mut self, handle: Handle, op: crate::modules::draw::modify::pedit::PeditOp) -> Task<Message> {
+    pub(super) fn handle_pedit_op(
+        &mut self,
+        handle: Handle,
+        op: crate::modules::draw::modify::pedit::PeditOp,
+    ) -> Task<Message> {
         let i = self.active_tab;
         self.apply_pedit_result(i, handle, op)
     }
 
-    pub(super) fn handle_join_to_source(&mut self, source: Handle, handles: Vec<Handle>) -> Option<Task<Message>> {
+    pub(super) fn handle_join_to_source(
+        &mut self,
+        source: Handle,
+        handles: Vec<Handle>,
+    ) -> Option<Task<Message>> {
         let i = self.active_tab;
         if self.reject_locked_edit(i, source) {
             return Some(Task::none());
@@ -135,6 +152,10 @@ impl OpenCADStudio {
                     .collect();
                 crate::modules::draw::modify::join::join_to_source(entity, &candidates)
             });
+        let line_source = matches!(
+            self.tabs[i].scene.document.get_entity(source),
+            Some(document::EntityType::Line(_))
+        );
         if let Some((replacement, consumed)) = joined {
             self.push_undo_snapshot(i, "JOIN");
             if let Some(entity) = self.tabs[i].scene.document.get_entity_mut(source) {
@@ -146,10 +167,21 @@ impl OpenCADStudio {
                 .scene
                 .bump_entities(&[(source, crate::scene::ChangeKind::Modified)]);
             self.tabs[i].dirty = true;
-            self.command_line.push_output(&format!(
-                "JOIN: {} objects joined to source.",
-                consumed.len()
-            ));
+            let count = consumed.len();
+            let message = match self.tabs[i].scene.document.get_entity(source) {
+                Some(document::EntityType::Arc(_)) if count == 1 => {
+                    crate::tf!("{count} arc joined to source")
+                }
+                Some(document::EntityType::Arc(_)) => crate::tf!("{count} arcs joined to source"),
+                Some(document::EntityType::Line(_)) if line_source && count == 1 => {
+                    crate::tf!("{count} line joined to source")
+                }
+                Some(document::EntityType::Line(_)) if line_source => {
+                    crate::tf!("{count} lines joined to source")
+                }
+                _ => crate::tf!("{count} segments added to polyline"),
+            };
+            self.command_line.push_output(message.as_ref());
             self.refresh_properties();
         } else {
             self.command_line
@@ -176,13 +208,58 @@ impl OpenCADStudio {
             .iter()
             .filter_map(|&h| self.tabs[i].scene.document.get_entity(h).map(|e| (h, e)))
             .collect();
+        let discarded_note = |discarded: usize| match discarded {
+            0 => String::new(),
+            1 => crate::t!(", 1 object discarded from the operation").into_owned(),
+            count => crate::tf!(", {count} objects discarded from the operation").into_owned(),
+        };
         match join_entities(&pairs) {
             Some((to_remove, merged)) => {
+                // The reference's summary: what went in and what came out.
+                let count_in = to_remove.len();
+                let joined: Vec<&document::EntityType> = pairs
+                    .iter()
+                    .filter(|(h, _)| to_remove.contains(h))
+                    .map(|(_, e)| *e)
+                    .collect();
+                let all = |test: fn(&document::EntityType) -> bool| joined.iter().all(|e| test(e));
+                let polylines = joined
+                    .iter()
+                    .filter(|e| {
+                        matches!(
+                            e,
+                            document::EntityType::LwPolyline(_)
+                                | document::EntityType::Polyline2D(_)
+                        )
+                    })
+                    .count();
+                let summary = match (merged.as_slice(), merged.len()) {
+                    ([document::EntityType::Line(_)], _)
+                        if all(|e| matches!(e, document::EntityType::Line(_))) =>
+                    {
+                        crate::tf!("{count_in} lines joined into 1 line").into_owned()
+                    }
+                    ([document::EntityType::Arc(_)], _)
+                        if all(|e| matches!(e, document::EntityType::Arc(_))) =>
+                    {
+                        crate::tf!("{count_in} arcs joined into 1 arc").into_owned()
+                    }
+                    (_, 1) if polylines > 0 => {
+                        let count = count_in - polylines;
+                        if count == 1 {
+                            crate::t!("1 segment joined into 1 polyline").into_owned()
+                        } else {
+                            crate::tf!("{count} segments joined into 1 polyline").into_owned()
+                        }
+                    }
+                    (_, 1) => crate::tf!("{count_in} objects converted to 1 polyline").into_owned(),
+                    (_, count) => {
+                        crate::tf!("{count_in} objects converted to {count} polylines").into_owned()
+                    }
+                } + &discarded_note(pairs.len() - count_in);
                 let label = self.history_label_from_active_cmd(i, "JOIN");
                 self.push_undo_snapshot(i, label);
                 self.tabs[i].scene.erase_entities(&to_remove);
-                let count_in = to_remove.len();
-                let count_out = merged.len();
                 for e in merged {
                     self.tabs[i].scene.add_entity(e);
                 }
@@ -191,26 +268,30 @@ impl OpenCADStudio {
                 self.tabs[i].active_cmd = None;
                 self.tabs[i].snap_result = None;
                 self.restore_pre_cmd_tangent();
-                self.command_line.push_output(
-                    crate::tf!("JOIN: {count_in} object(s) joined into {count_out}.")
-                        .as_ref(),
-                );
+                self.command_line.push_output(&summary);
                 self.refresh_properties();
             }
             None => {
+                let count = pairs.len();
                 self.tabs[i].active_cmd = None;
                 self.tabs[i].snap_result = None;
                 self.tabs[i].scene.clear_preview_wire();
                 self.restore_pre_cmd_tangent();
-                self.command_line.push_error(
-                    crate::t!("JOIN: objects don't form a single connected chain, or contain an unsupported type / tilted arc.").as_ref(),
+                self.command_line.push_output(
+                    crate::tf!("0 objects joined, {count} objects discarded from the operation")
+                        .as_ref(),
                 );
             }
         }
         None
     }
 
-    pub(super) fn handle_break_entity(&mut self, handle: Handle, p1: glam::DVec3, p2: glam::DVec3) -> Option<Task<Message>> {
+    pub(super) fn handle_break_entity(
+        &mut self,
+        handle: Handle,
+        p1: glam::DVec3,
+        p2: glam::DVec3,
+    ) -> Option<Task<Message>> {
         let i = self.active_tab;
         if self.reject_locked_edit(i, handle) {
             return Some(Task::none());
@@ -224,13 +305,15 @@ impl OpenCADStudio {
         match replacement {
             Some(frags) => {
                 let unchanged = frags.len() == 1
-                    && self.tabs[i].scene.document.get_entity(handle).is_some_and(
-                        |original| {
+                    && self.tabs[i]
+                        .scene
+                        .document
+                        .get_entity(handle)
+                        .is_some_and(|original| {
                             let mut fragment = frags[0].clone();
                             fragment.common_mut().handle = handle;
                             &fragment == original
-                        },
-                    );
+                        });
                 if unchanged {
                     self.tabs[i].active_cmd = None;
                     self.tabs[i].snap_result = None;
@@ -282,7 +365,6 @@ impl OpenCADStudio {
         None
     }
 
-
     pub(super) fn handle_hatchedit_apply(&mut self, result: CmdResult) -> Option<Task<Message>> {
         let i = self.active_tab;
         let CmdResult::HatcheditApply {
@@ -300,23 +382,22 @@ impl OpenCADStudio {
         }
         if !matches!(
             self.tabs[i].scene.document.get_entity(handle),
-            Some(codec::EntityType::Hatch(_))
+            Some(document::EntityType::Hatch(_))
         ) {
             self.command_line
                 .push_error(crate::t!("HATCHEDIT: hatch entity not found.").as_ref());
         } else {
             use crate::command::{CadCommand, HatchEditOperation};
             if matches!(&operation, HatchEditOperation::BeginAssociate) {
-                let associative = matches!(self.tabs[i].scene.document.get_entity(handle),Some(codec::EntityType::Hatch(h)) if h.is_associative);
+                let associative = matches!(self.tabs[i].scene.document.get_entity(handle),Some(document::EntityType::Hatch(h)) if h.is_associative);
                 if associative {
                     self.command_line
                         .push_info("HATCHEDIT: hatch is already associative.");
                     self.tabs[i].active_cmd = None;
                 } else {
                     let plane = match self.tabs[i].scene.document.get_entity(handle) {
-                        Some(codec::EntityType::Hatch(h)) => {
-                            let storage =
-                                crate::entities::curve::ocs_plane(h.normal, h.elevation);
+                        Some(document::EntityType::Hatch(h)) => {
+                            let storage = crate::entities::curve::ocs_plane(h.normal, h.elevation);
                             crate::command::WorkingPlane::new(
                                 glam::DVec3::from_array(storage.origin),
                                 glam::DVec3::from_array(storage.x_axis),
@@ -325,10 +406,12 @@ impl OpenCADStudio {
                         }
                         _ => self.tabs[i].ucs_xform().working_plane(),
                     };
-                    let mut sources =
-                        self.tabs[i].scene.boundary_sources_on_plane(plane, 1e-6);
+                    let mut sources = self.tabs[i].scene.boundary_sources_on_plane(plane, 1e-6);
                     sources.remove(&handle);
-                    let command=crate::modules::draw::draw::hatchedit::HatcheditCommand::for_association(handle,name,scale,angle,plane,sources);
+                    let command =
+                        crate::modules::draw::draw::hatchedit::HatcheditCommand::for_association(
+                            handle, name, scale, angle, plane, sources,
+                        );
                     self.tabs[i].scene.deselect_all();
                     self.command_line.push_info(&command.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(command));
@@ -336,19 +419,16 @@ impl OpenCADStudio {
                 return Some(Task::none());
             }
             if let HatchEditOperation::DrawOrderBoundary { above } = &operation {
-                let references: Vec<_> =
-                    match self.tabs[i].scene.document.get_entity(handle) {
-                        Some(codec::EntityType::Hatch(h)) => h
-                            .paths
-                            .iter()
-                            .flat_map(|p| p.boundary_handles.iter())
-                            .filter(|h| {
-                                self.tabs[i].scene.document.get_entity(**h).is_some()
-                            })
-                            .map(|h| format!("{:X}", h.value()))
-                            .collect(),
-                        _ => Vec::new(),
-                    };
+                let references: Vec<_> = match self.tabs[i].scene.document.get_entity(handle) {
+                    Some(document::EntityType::Hatch(h)) => h
+                        .paths
+                        .iter()
+                        .flat_map(|p| p.boundary_handles.iter())
+                        .filter(|h| self.tabs[i].scene.document.get_entity(**h).is_some())
+                        .map(|h| format!("{:X}", h.value()))
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 self.tabs[i].active_cmd = None;
                 if references.is_empty() {
                     self.command_line
@@ -392,15 +472,15 @@ impl OpenCADStudio {
                             name
                         }
                     });
-                    if layer.as_ref().is_some_and(|name| {
-                        self.tabs[i].scene.document.layers.get(name).is_none()
-                    }) {
+                    if layer
+                        .as_ref()
+                        .is_some_and(|name| self.tabs[i].scene.document.layers.get(name).is_none())
+                    {
                         self.discard_last_undo_entry(i);
                         self.command_line.push_error("HATCHEDIT: layer not found.");
                         return Some(Task::none());
                     }
-                    if let Some(entity) = self.tabs[i].scene.document.get_entity_mut(handle)
-                    {
+                    if let Some(entity) = self.tabs[i].scene.document.get_entity_mut(handle) {
                         let common = entity.common_mut();
                         if let Some(value) = color {
                             common.color = value;
@@ -414,6 +494,7 @@ impl OpenCADStudio {
                             common.transparency = value;
                         }
                     }
+                    self.tabs[i].scene.refresh_fill_model(handle);
                     self.tabs[i]
                         .scene
                         .bump_entities(&[(handle, crate::scene::ChangeKind::Modified)]);
@@ -436,17 +517,13 @@ impl OpenCADStudio {
                             }
                         }
                     }
-                    if let Some(codec::EntityType::Hatch(hatch)) =
+                    if let Some(document::EntityType::Hatch(hatch)) =
                         self.tabs[i].scene.document.get_entity_mut(handle)
                     {
                         if !name.is_empty() && name != hatch.pattern.name {
-                            if let Some(entry) =
-                                crate::scene::model::hatch_patterns::find(&name)
-                            {
+                            if let Some(entry) = crate::scene::model::hatch_patterns::find(&name) {
                                 let mut pattern =
-                                    crate::scene::model::hatch_patterns::build_dxf_pattern(
-                                        entry,
-                                    );
+                                    crate::scene::model::hatch_patterns::build_dxf_pattern(entry);
                                 crate::entities::hatch::scale_pattern_geometry(
                                     &mut pattern,
                                     scale.max(1.0e-6) as f64,
@@ -467,7 +544,7 @@ impl OpenCADStudio {
                                     crate::scene::model::hatch_model::HatchPattern::Solid
                                 );
                                 hatch.pattern_type =
-                                    codec::entities::HatchPatternType::Predefined;
+                                    document::entities::HatchPatternType::Predefined;
                                 hatch.gradient_color.enabled = false;
                             }
                         } else {
@@ -483,7 +560,7 @@ impl OpenCADStudio {
                         hatch.pattern_scale = scale.max(1.0e-6) as f64;
                         hatch.pattern_angle = (angle as f64).to_radians();
                         if let Some((x, y)) = origin {
-                            hatch.set_pattern_origin(codec::types::Vector2::new(x, y));
+                            hatch.set_pattern_origin(document::types::Vector2::new(x, y));
                         }
                         if disassociate {
                             for path in &mut hatch.paths {
@@ -514,6 +591,7 @@ impl OpenCADStudio {
                             }
                         }
                     }
+                    self.tabs[i].scene.refresh_fill_model(handle);
                     self.tabs[i]
                         .scene
                         .bump_entities(&[(handle, crate::scene::ChangeKind::Modified)]);
@@ -533,29 +611,22 @@ impl OpenCADStudio {
                         || paths.iter().any(|path| {
                             path.boundary_handles.is_empty()
                                 || path.boundary_handles.iter().any(|source| {
-                                    self.tabs[i]
-                                        .scene
-                                        .document
-                                        .get_entity(*source)
-                                        .is_none()
+                                    self.tabs[i].scene.document.get_entity(*source).is_none()
                                 })
                         })
                     {
                         self.discard_last_undo_entry(i);
-                        self.command_line.push_error(
-                            "HATCHEDIT: associated boundary is no longer available.",
-                        );
+                        self.command_line
+                            .push_error("HATCHEDIT: associated boundary is no longer available.");
                         return Some(Task::none());
                     }
                     self.tabs[i].scene.replace_hatch_association(handle, paths);
                 }
                 HatchEditOperation::RecreateBoundary { associate, region } => {
                     let source = self.tabs[i].scene.document.get_entity(handle).cloned();
-                    if let Some(codec::EntityType::Hatch(source)) = source {
-                        let storage = crate::entities::curve::ocs_plane(
-                            source.normal,
-                            source.elevation,
-                        );
+                    if let Some(document::EntityType::Hatch(source)) = source {
+                        let storage =
+                            crate::entities::curve::ocs_plane(source.normal, source.elevation);
                         let plane = crate::command::WorkingPlane::new(
                             glam::DVec3::from_array(storage.origin),
                             glam::DVec3::from_array(storage.x_axis),
@@ -573,13 +644,11 @@ impl OpenCADStudio {
                                 })
                                 .collect::<Option<Vec<_>>>();
                             let Some(loops) = loops.filter(|loops| {
-                                !loops.is_empty()
-                                    && loops.iter().all(|ring| !ring.is_empty())
+                                !loops.is_empty() && loops.iter().all(|ring| !ring.is_empty())
                             }) else {
                                 self.discard_last_undo_entry(i);
-                                self.command_line.push_error(
-                                    "HATCHEDIT: boundary cannot form a region.",
-                                );
+                                self.command_line
+                                    .push_error("HATCHEDIT: boundary cannot form a region.");
                                 return Some(Task::none());
                             };
                             let contained = loops
@@ -592,10 +661,10 @@ impl OpenCADStudio {
                                         .enumerate()
                                         .map(|(outer, boundary)| {
                                             inner != outer
-                                                && kernel::geom2d::contains(
+                                                && ocs_geom::geom2d::contains(
                                                     boundary,
                                                     seed,
-                                                    kernel::geom2d::Tolerance::new(1e-6),
+                                                    ocs_geom::geom2d::Tolerance::new(1e-6),
                                                 )
                                         })
                                         .collect::<Vec<_>>()
@@ -612,8 +681,7 @@ impl OpenCADStudio {
                                 .map(|(outer, depth)| {
                                     let mut indices = vec![outer];
                                     indices.extend((0..loops.len()).filter(|inner| {
-                                        depths[*inner] == *depth + 1
-                                            && contained[*inner][outer]
+                                        depths[*inner] == *depth + 1 && contained[*inner][outer]
                                     }));
                                     indices
                                 })
@@ -632,9 +700,8 @@ impl OpenCADStudio {
                                 .collect::<Option<Vec<_>>>();
                             let Some(entities) = entities else {
                                 self.discard_last_undo_entry(i);
-                                self.command_line.push_error(
-                                    "HATCHEDIT: boundary cannot form a region.",
-                                );
+                                self.command_line
+                                    .push_error("HATCHEDIT: boundary cannot form a region.");
                                 return Some(Task::none());
                             };
                             (entities, groups)
@@ -642,21 +709,18 @@ impl OpenCADStudio {
                             let rings = crate::scene::hatch_boundary_rings(&source);
                             if rings.len() != source.paths.len() {
                                 self.discard_last_undo_entry(i);
-                                self.command_line.push_error(
-                                    "HATCHEDIT: boundary cannot form a polyline.",
-                                );
+                                self.command_line
+                                    .push_error("HATCHEDIT: boundary cannot form a polyline.");
                                 return Some(Task::none());
                             }
                             let entities = crate::scene::boundary_entities(&rings, plane);
                             if entities.len() != source.paths.len() {
                                 self.discard_last_undo_entry(i);
-                                self.command_line.push_error(
-                                    "HATCHEDIT: boundary cannot form a polyline.",
-                                );
+                                self.command_line
+                                    .push_error("HATCHEDIT: boundary cannot form a polyline.");
                                 return Some(Task::none());
                             }
-                            let groups =
-                                (0..entities.len()).map(|index| vec![index]).collect();
+                            let groups = (0..entities.len()).map(|index| vec![index]).collect();
                             (entities, groups)
                         };
                         let mut path_handles = vec![None; source.paths.len()];
@@ -670,7 +734,7 @@ impl OpenCADStudio {
                             }
                         }
                         if associate {
-                            if let Some(codec::EntityType::Hatch(hatch)) =
+                            if let Some(document::EntityType::Hatch(hatch)) =
                                 self.tabs[i].scene.document.get_entity_mut(handle)
                             {
                                 for (path, boundary) in
@@ -681,8 +745,7 @@ impl OpenCADStudio {
                                         path.flags.set_external(true);
                                     }
                                 }
-                                hatch.is_associative =
-                                    path_handles.iter().all(Option::is_some);
+                                hatch.is_associative = path_handles.iter().all(Option::is_some);
                             }
                         }
                         self.tabs[i]
@@ -692,12 +755,12 @@ impl OpenCADStudio {
                 }
                 HatchEditOperation::Separate => {
                     let source = self.tabs[i].scene.document.get_entity(handle).cloned();
-                    if let Some(codec::EntityType::Hatch(hatch)) = source {
+                    if let Some(document::EntityType::Hatch(hatch)) = source {
                         let groups = crate::scene::separated_hatch_path_groups(&hatch);
                         if groups.len() > 1 {
                             for paths in groups {
                                 let mut separated = hatch.clone();
-                                separated.common.handle = codec::Handle::NULL;
+                                separated.common.handle = document::Handle::NULL;
                                 separated.paths = paths;
                                 separated.is_associative = separated
                                     .paths
@@ -705,7 +768,7 @@ impl OpenCADStudio {
                                     .any(|path| !path.boundary_handles.is_empty());
                                 self.tabs[i]
                                     .scene
-                                    .add_entity(codec::EntityType::Hatch(separated));
+                                    .add_entity(document::EntityType::Hatch(separated));
                             }
                             self.tabs[i].scene.erase_entities(&[handle]);
                         }
@@ -725,6 +788,101 @@ impl OpenCADStudio {
         self.tabs[i].scene.clear_preview_wire();
         self.restore_pre_cmd_tangent();
         None
+    }
+
+    /// OK on the Hatch panel during HATCHEDIT: what changed on the panel
+    /// goes onto the hatch as one undo step, and HATCHEDIT ends.
+    pub(in crate::app) fn apply_hatch_panel_edit(
+        &mut self,
+        handle: document::Handle,
+        before: &crate::modules::draw::draw::hatch::HatchSettings,
+        after: &crate::modules::draw::draw::hatch::HatchSettings,
+    ) {
+        let i = self.active_tab;
+        let finish = |app: &mut Self| {
+            app.tabs[i].active_cmd = None;
+            app.tabs[i].snap_result = None;
+            app.tabs[i].scene.clear_preview_wire();
+            app.restore_pre_cmd_tangent();
+        };
+        if before == after {
+            finish(self);
+            return;
+        }
+        if self.reject_locked_edit(i, handle) {
+            return;
+        }
+        let Some(document::EntityType::Hatch(mut hatch)) =
+            self.tabs[i].scene.document.get_entity(handle).cloned()
+        else {
+            self.command_line
+                .push_error(crate::t!("HATCHEDIT: hatch entity not found.").as_ref());
+            finish(self);
+            return;
+        };
+        let layer = after
+            .layer
+            .clone()
+            .filter(|name| before.layer.as_ref() != Some(name));
+        if layer
+            .as_ref()
+            .is_some_and(|name| self.tabs[i].scene.document.layers.get(name).is_none())
+        {
+            self.command_line.push_error("HATCHEDIT: layer not found.");
+            return;
+        }
+        self.push_undo_snapshot(i, "HATCHEDIT");
+        crate::entities::hatch::apply_panel_settings(&mut hatch, before, after);
+        if after.color != before.color {
+            hatch.common.color = after.color.unwrap_or(document::types::Color::ByLayer);
+            hatch.common.color_name = None;
+            hatch.common.color_book_handle = None;
+        }
+        if let Some(name) = layer {
+            hatch.common.layer = name;
+        }
+        if after.transparency != before.transparency {
+            hatch.common.transparency = match after.transparency {
+                Some(percent) => {
+                    document::types::Transparency::from_percent(f64::from(percent) / 100.0)
+                }
+                None => document::types::Transparency::ByLayer,
+            };
+        }
+        self.tabs[i]
+            .scene
+            .update_entity(document::EntityType::Hatch(hatch));
+        if after.annotative != before.annotative {
+            crate::scene::annotative::set_entity_annotative(
+                &mut self.tabs[i].scene.document,
+                handle,
+                after.annotative,
+            );
+            if after.annotative {
+                if let Some(scale) = self.tabs[i].scene.creation_annotation_scale_handle() {
+                    crate::scene::annotative::create_annotation_context(
+                        &mut self.tabs[i].scene.document,
+                        handle,
+                        scale,
+                    );
+                }
+            }
+        }
+        if after.draw_order != before.draw_order {
+            let _ = match after.draw_order {
+                1 => self.apply_draw_order(i, &[handle], Some(false), None),
+                2 => self.apply_draw_order(i, &[handle], Some(true), None),
+                _ => None,
+            };
+        }
+        self.tabs[i]
+            .scene
+            .bump_entities(&[(handle, crate::scene::ChangeKind::Modified)]);
+        self.tabs[i].dirty = true;
+        self.refresh_properties();
+        self.command_line
+            .push_output(crate::t!("HATCHEDIT: hatch updated.").as_ref());
+        finish(self);
     }
 
     fn apply_pedit_result(

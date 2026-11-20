@@ -8,15 +8,47 @@
 //! via [`CmdResult::Dispatch`], so the coordinate-system math and persistence
 //! stay in one place. (#169)
 
-use crate::command::{CadCommand, CmdResult};
-use glam::DVec3;
+use crate::command::{CadCommand, CmdResult, WorkingPlane};
+use crate::scene::model::wire_model::WireModel;
 use crate::t;
+use glam::DVec3;
+
+/// The option prompt's keywords, in the order of its bracket list.
+const OPTIONS: [&str; 11] = [
+    "FACE", "OBJECT", "WORLD", "VIEW", "3POINT", "Z", "X", "Y", "ORIGIN", "SAVE", "DELETE",
+];
+
+/// The option a label of the localized prompt names (`M`, `Monde` for World
+/// in French): its bracket list lines up with [`OPTIONS`]. A `_` prefix
+/// keeps the typed text as an international keyword.
+fn localized_option(typed: &str) -> Option<&'static str> {
+    if typed.starts_with('_') {
+        return None;
+    }
+    let prompt = t!(
+        "UCS  specify new origin or [Face/OBject/World/View/3Point/Z/X/Y/Origin/Save/Delete] or name:"
+    );
+    let labels = prompt.split_once('[')?.1.split_once(']')?.0;
+    let labels: Vec<&str> = labels.split('/').collect();
+    if labels.len() != OPTIONS.len() {
+        return None;
+    }
+    if typed == "3" {
+        return Some("3POINT");
+    }
+    labels
+        .iter()
+        .zip(OPTIONS)
+        .find(|(label, _)| crate::command::keyword_matches(label, label, typed))
+        .map(|(_, option)| option)
+}
 
 #[derive(Default)]
 pub struct UcsCommand {
     /// The chosen option keyword (uppercased), once entered; `None` until then.
     option: Option<String>,
     points: Vec<DVec3>,
+    plane: WorkingPlane,
 }
 
 impl UcsCommand {
@@ -54,10 +86,10 @@ impl CadCommand for UcsCommand {
 
     fn prompt(&self) -> String {
         match self.option.as_deref() {
-            None => t!(
-                "UCS  option [Face/OBject/World/View/3Point/Z/X/Y/Origin/Save/Delete] or name:"
-            )
-            .into_owned(),
+            None => {
+                t!("UCS  specify new origin or [Face/OBject/World/View/3Point/Z/X/Y/Origin/Save/Delete] or name:")
+                    .into_owned()
+            }
             Some("Z") => t!("UCS  rotation angle about Z (degrees):").into_owned(),
             Some("X") => t!("UCS  rotation angle about X (degrees):").into_owned(),
             Some("Y") => t!("UCS  rotation angle about Y (degrees):").into_owned(),
@@ -79,10 +111,44 @@ impl CadCommand for UcsCommand {
         true
     }
 
+    fn set_working_plane(&mut self, plane: WorkingPlane) {
+        self.plane = plane;
+    }
+
+    /// The new X and Y axes, drawn from the origin while the 3-point UCS is
+    /// being placed.
+    fn on_mouse_move(&mut self, pt: DVec3) -> Option<WireModel> {
+        if !matches!(self.option.as_deref(), Some("3POINT") | Some("3P")) {
+            return None;
+        }
+        let (origin, x, y) = match self.points.as_slice() {
+            [origin] => (*origin, pt - *origin, self.plane.z.cross(pt - *origin)),
+            [origin, on_x] => {
+                let x = *on_x - *origin;
+                let d = pt - *origin;
+                (
+                    *origin,
+                    x,
+                    d - x * (d.dot(x) / x.length_squared().max(1.0e-300)),
+                )
+            }
+            _ => return None,
+        };
+        let y = y.normalize_or_zero() * x.length();
+        if y == DVec3::ZERO {
+            return None;
+        }
+        let corner = [origin + x, origin, origin + y].map(|p| p.to_array());
+        let (points, points_low) = crate::scene::convert::tessellate::points_to_ds(corner);
+        let mut wire = WireModel::solid("ucs_preview".into(), points, WireModel::CYAN, false);
+        wire.points_low = points_low;
+        Some(wire)
+    }
+
     fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
         let t = text.trim();
-        if matches!(self.option.as_deref(), Some("3POINT") | Some("3P"))
-            && crate::app::helpers::parse_coord(t).is_some()
+        if matches!(self.option.as_deref(), None | Some("3POINT") | Some("3P"))
+            && crate::entities::coord_parse::parse_coord(t).is_some()
         {
             return None;
         }
@@ -93,7 +159,9 @@ impl CadCommand for UcsCommand {
                     // Bare Enter → list (delegate to inline `UCS`).
                     return Some(CmdResult::Dispatch("UCS LIST".into()));
                 }
-                let up = t.to_uppercase();
+                let up = localized_option(t)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| t.trim_start_matches('_').to_uppercase());
                 if Self::is_zero_arg(&up) {
                     Some(CmdResult::Dispatch(format!("UCS {up}")))
                 } else if Self::takes_value(&up) || Self::takes_point(&up) {
@@ -111,6 +179,11 @@ impl CadCommand for UcsCommand {
     }
 
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
+        // A click at the option prompt is the new origin; the X axis and XY
+        // plane points follow, each optional.
+        if self.option.is_none() {
+            self.option = Some("3P".into());
+        }
         if matches!(self.option.as_deref(), Some("3POINT") | Some("3P")) {
             self.points.push(pt);
             if self.points.len() < 3 {
@@ -131,8 +204,7 @@ impl CadCommand for UcsCommand {
                 points[2].z,
             ));
         }
-        // A clicked point only makes sense for the Origin option; otherwise a
-        // stray click is ignored (keep waiting for the typed keyword / value).
+        // Other point-taking options retain their explicit behavior.
         if matches!(self.option.as_deref(), Some(o) if Self::takes_point(o)) {
             self.option.take();
             return CmdResult::Dispatch(format!("UCS ORIGINW {},{},{}", pt.x, pt.y, pt.z));
@@ -141,11 +213,92 @@ impl CadCommand for UcsCommand {
     }
 
     fn on_enter(&mut self) -> CmdResult {
+        let points = std::mem::take(&mut self.points);
         match self.option.take() {
             // No option chosen yet → behave like bare `UCS` (list).
             None => CmdResult::Dispatch("UCS LIST".into()),
+            // Enter accepts the axes placed so far: the origin alone moves the
+            // UCS, an X point turns it about its current Z.
+            Some(opt) if matches!(opt.as_str(), "3POINT" | "3P") && !points.is_empty() => {
+                let origin = points[0];
+                let Some(&on_x) = points.get(1) else {
+                    return CmdResult::Dispatch(format!(
+                        "UCS ORIGINW {},{},{}",
+                        origin.x, origin.y, origin.z
+                    ));
+                };
+                let y = self.plane.z.cross(on_x - origin);
+                let on_xy = origin + if y == DVec3::ZERO { self.plane.y } else { y };
+                CmdResult::Dispatch(format!(
+                    "UCS 3POINTW {},{},{}|{},{},{}|{},{},{}",
+                    origin.x, origin.y, origin.z, on_x.x, on_x.y, on_x.z, on_xy.x, on_xy.y, on_xy.z,
+                ))
+            }
             // Option chosen but no value supplied → cancel cleanly.
             Some(_) => CmdResult::Cancel,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_ucs_accepts_origin_then_x_then_xy_without_option() {
+        let mut cmd = UcsCommand::new();
+        assert!(matches!(
+            cmd.on_point(DVec3::new(10.0, 20.0, 0.0)),
+            CmdResult::NeedPoint
+        ));
+        assert_eq!(cmd.points.len(), 1);
+        assert!(matches!(
+            cmd.on_point(DVec3::new(11.0, 20.0, 0.0)),
+            CmdResult::NeedPoint
+        ));
+        match cmd.on_point(DVec3::new(10.0, 21.0, 0.0)) {
+            CmdResult::Dispatch(command) => {
+                assert_eq!(command, "UCS 3POINTW 10,20,0|11,20,0|10,21,0")
+            }
+            _ => panic!("three clicks must dispatch the new UCS"),
+        }
+    }
+
+    #[test]
+    fn initial_coordinate_is_delegated_to_point_pipeline() {
+        let mut cmd = UcsCommand::new();
+        assert!(cmd.on_text_input("10,20,0").is_none());
+        assert!(matches!(
+            cmd.on_point(DVec3::new(10.0, 20.0, 0.0)),
+            CmdResult::NeedPoint
+        ));
+        assert_eq!(cmd.points.len(), 1);
+    }
+
+    #[test]
+    fn explicit_origin_still_changes_only_origin() {
+        let mut cmd = UcsCommand::new();
+        assert!(matches!(cmd.on_text_input("O"), Some(CmdResult::NeedPoint)));
+        match cmd.on_point(DVec3::new(10.0, 20.0, 0.0)) {
+            CmdResult::Dispatch(command) => assert_eq!(command, "UCS ORIGINW 10,20,0"),
+            _ => panic!("explicit Origin must dispatch after one point"),
+        }
+    }
+
+    #[test]
+    fn localized_and_international_options_work() {
+        // Tests run in en-US: the prompt's labels are the English ones.
+        for option in ["World", "W", "_World"] {
+            let mut cmd = UcsCommand::new();
+            let result = cmd.on_text_input(option);
+            assert!(matches!(result, Some(CmdResult::Dispatch(s)) if s == "UCS WORLD"));
+        }
+        let mut cmd = UcsCommand::new();
+        assert!(matches!(
+            cmd.on_text_input("Save"),
+            Some(CmdResult::NeedPoint)
+        ));
+        let result = cmd.on_text_input("MiPlano");
+        assert!(matches!(result, Some(CmdResult::Dispatch(s)) if s == "UCS SAVE MiPlano"));
     }
 }

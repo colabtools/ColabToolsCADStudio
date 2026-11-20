@@ -1,23 +1,23 @@
 cask "open-cad-studio" do
-  version "0.4.8"
-  sha256 "8fa92be6045c57ac1994bd20fbb2def7269e25c327b7e62cb59745977c66f421"
+  arch arm: "arm64", intel: "x86_64"
 
-  url "https://github.com/HakanSeven12/OpenCADStudio/releases/download/v#{version}/OpenCADStudio-v#{version}-macos-arm64.dmg",
+  version "2026.44"
+  sha256 arm:   "fb4b1f612a0238d99cdf245f9e9c4e8677510f4cd94222c89c742a5bd8711b57",
+         intel: "59c086e8a3aec13c00e01529b8f5f638eedb6a42184bc70172ff6ca7d46e3e81"
+
+  url "https://github.com/HakanSeven12/OpenCADStudio/releases/download/v#{version}/OpenCADStudio-v#{version}-macos-#{arch}.dmg",
       verified: "github.com/HakanSeven12/OpenCADStudio/"
   name "Open CAD Studio"
   desc "CAD application for 2D drafting and 3D modeling that reads/writes DWG and DXF"
   homepage "https://github.com/HakanSeven12/OpenCADStudio"
 
-  # Only an Apple Silicon (arm64) build is published.
-  depends_on arch: :arm64
+  depends_on macos: ">= :big_sur"
 
   app "OpenCADStudio.app"
 
-  # The app is ad-hoc signed but not notarised (no paid Apple Developer ID).
-  # Install with `--no-quarantine` so Gatekeeper does not block first launch:
-  #   brew install --cask --no-quarantine packaging/homebrew/open-cad-studio.rb
-  # or, once published to a tap:
-  #   brew install --cask --no-quarantine hakanseven12/tap/open-cad-studio
+  # The app is ad-hoc signed but not notarised (no paid Apple Developer ID),
+  # so macOS asks once on first launch: System Settings > Privacy & Security >
+  # Open Anyway. Homebrew installs casks only from a tap; see README.md.
 
   zap trash: [
     "~/Library/Application Support/OpenCADStudio",

@@ -3,6 +3,167 @@
 
 use super::*;
 
+fn validated_layout_name(raw: &str) -> Result<String, Value> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(failure("name_required", "Supply a layout name"));
+    }
+    if name.chars().count() > 255 {
+        return Err(failure(
+            "invalid_layout_name",
+            "A layout name is limited to 255 characters",
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| "<>/\\\":;?*|=`".contains(*c) || c.is_control())
+    {
+        return Err(failure(
+            "invalid_layout_name",
+            format!("A layout name cannot contain {bad:?}"),
+        ));
+    }
+    Ok(name.to_owned())
+}
+
+fn canonical_layout_name(scene: &crate::scene::Scene, name: &str) -> Result<String, Value> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(failure("name_required", "Supply a layout name"));
+    }
+    scene
+        .layout_names()
+        .into_iter()
+        .find(|existing| existing.eq_ignore_ascii_case(name))
+        .ok_or_else(|| failure("layout_missing", format!("Layout '{name}' does not exist")))
+}
+
+fn page_is_landscape(ps: &document::objects::PlotSettings) -> bool {
+    use document::objects::PlotRotation;
+    let natural_landscape = ps.paper_width > ps.paper_height;
+    let quarter_turn = matches!(
+        ps.rotation,
+        PlotRotation::Degrees90 | PlotRotation::Degrees270
+    );
+    natural_landscape != quarter_turn
+}
+
+fn set_page_orientation(ps: &mut document::objects::PlotSettings, landscape: bool) {
+    use document::objects::PlotRotation;
+    let natural_landscape = ps.paper_width > ps.paper_height;
+    let upside_down = matches!(
+        ps.rotation,
+        PlotRotation::Degrees180 | PlotRotation::Degrees270
+    );
+    ps.rotation = match ((landscape != natural_landscape), upside_down) {
+        (false, false) => PlotRotation::None,
+        (true, false) => PlotRotation::Degrees90,
+        (false, true) => PlotRotation::Degrees180,
+        (true, true) => PlotRotation::Degrees270,
+    };
+}
+
+pub(crate) fn layout_listing(scene: &crate::scene::Scene) -> Value {
+    let names = scene.layout_names();
+    let layouts = names
+        .iter()
+        .map(|name| {
+            let layout = scene
+                .document
+                .objects
+                .values()
+                .find_map(|object| match object {
+                    document::objects::ObjectType::Layout(layout) if layout.name == *name => {
+                        Some(layout)
+                    }
+                    _ => None,
+                });
+            json!({
+                "name": name,
+                "handle": layout.map(|layout| format!("{:X}", layout.handle.value())),
+                "current": scene.current_layout == *name,
+                "model": name == "Model",
+                "tab_order": layout.map_or(0, |layout| layout.tab_order),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "ok": true,
+        "current": scene.current_layout,
+        "count": layouts.len(),
+        "layouts": layouts,
+    })
+}
+
+pub(crate) fn page_setup_read(
+    scene: &crate::scene::Scene,
+    requested: &str,
+) -> Result<Value, Value> {
+    let name = canonical_layout_name(scene, requested)?;
+    let layout = scene
+        .document
+        .objects
+        .values()
+        .find_map(|object| match object {
+            document::objects::ObjectType::Layout(layout) if layout.name == name => Some(layout),
+            _ => None,
+        });
+    let initialized = layout.is_some_and(|layout| !crate::scene::page_setup_uninitialized(layout));
+    let ps = scene.plot_settings_for(&name).ok_or_else(|| {
+        failure(
+            "layout_missing",
+            format!("Layout '{name}' has no readable page setup"),
+        )
+    })?;
+    use document::objects::{PlotRotation, PlotType};
+    let rotation = match ps.rotation {
+        PlotRotation::None => 0,
+        PlotRotation::Degrees90 => 90,
+        PlotRotation::Degrees180 => 180,
+        PlotRotation::Degrees270 => 270,
+    };
+    let area = match ps.plot_type {
+        PlotType::Window => "window",
+        PlotType::Layout => "layout",
+        PlotType::LastScreenDisplay => "display",
+        PlotType::Limits => "limits",
+        PlotType::View => "view",
+        _ => "extents",
+    };
+    let window = (ps.plot_type == PlotType::Window && !ps.plot_window.is_empty()).then(|| {
+        json!([
+            ps.plot_window.lower_left_x,
+            ps.plot_window.lower_left_y,
+            ps.plot_window.upper_right_x,
+            ps.plot_window.upper_right_y,
+        ])
+    });
+    Ok(json!({
+        "ok": true,
+        "layout": name,
+        "page_setup": {
+            "initialized": initialized,
+            "paper": ps.paper_size,
+            "paper_width_mm": ps.paper_width,
+            "paper_height_mm": ps.paper_height,
+            "rotation": rotation,
+            "orientation": if page_is_landscape(&ps) { "landscape" } else { "portrait" },
+            "scale": {
+                "numerator": ps.scale_numerator,
+                "denominator": ps.scale_denominator,
+                "fit": ps.is_scale_to_fit(),
+            },
+            "center": ps.flags.plot_centered,
+            "plot_style": ps.current_style_sheet,
+            "area": area,
+            "view": ps.plot_view_name,
+            "window": window,
+            "offset_x": ps.origin_x,
+            "offset_y": ps.origin_y,
+        }
+    }))
+}
+
 impl OpenCADStudio {
     /// `close` — close a document tab. A dirty
     /// document is refused unless `"discard":true`; discarding clears the
@@ -20,7 +181,10 @@ impl OpenCADStudio {
             self.set_control_result(json!({ "closed": false, "reason": "start_page" }));
             return Ok(Task::none());
         }
-        if self.tabs[index].dirty && !req["discard"].as_bool().unwrap_or(false) {
+        if self.tabs[index].dirty
+            && self.tabs[index].block_test.is_none()
+            && !req["discard"].as_bool().unwrap_or(false)
+        {
             return Err(failure(
                 "document_dirty",
                 "Save the document or pass discard:true",
@@ -28,9 +192,12 @@ impl OpenCADStudio {
         }
         self.tabs[index].dirty = false;
         let remaining = self.tabs.len();
+        // Resolve the stable id now; the message may be handled after other
+        // batched messages have shifted `index`.
+        let tab_id = self.tabs[index].id;
         // The close may queue async work (autosave cleanup) — return the
         // task so the runtime drives it.
-        let close_task = self.update(Message::TabClose(index));
+        let close_task = self.update(Message::TabClose(tab_id));
         let closed_document = req["document_id"].as_u64();
         self.set_control_result(json!({
             "closed": true,
@@ -47,14 +214,42 @@ impl OpenCADStudio {
     /// "set":{"MIRRTEXT":0}}` writes (one undo step, validated per name).
     pub(super) fn control_sysvar(&mut self, req: &Value) -> Result<Task<Message>, Value> {
         if let Some(set) = req["set"].as_object() {
-            self.push_undo_snapshot(self.active_tab, "SYSVAR");
+            let i = self.active_tab;
+            // Validate the complete batch before opening history or changing the
+            // document. Apart from making the operation atomic, this keeps a
+            // later bad variable from leaving an earlier variable half-applied.
+            {
+                let document = &self.tabs[i].scene.document;
+                for (name, value) in set {
+                    validate_sysvar(document, name, value)?;
+                }
+            }
+
+            self.push_undo_snapshot(i, "SYSVAR");
             let mut applied = serde_json::Map::new();
             for (name, value) in set {
-                set_sysvar(&mut self.tabs[self.active_tab].scene.document, name, value)
-                    .map_err(|e| {
-                        // Nothing committed yet — the snapshot is empty.
-                        e
+                if name.eq_ignore_ascii_case("clayer") {
+                    let layer = value
+                        .as_str()
+                        .expect("validate_sysvar checked CLAYER as a string");
+                    self.set_current_layer_name(i, layer).map_err(|error| {
+                        failure(
+                            "invalid_sysvar_value",
+                            format!("Layer {layer:?} could not be made current: {error}"),
+                        )
                     })?;
+                } else {
+                    let units_before = self.tabs[i].scene.document.header.insertion_units;
+                    set_sysvar(&mut self.tabs[i].scene.document, name, value)?;
+                    if name.eq_ignore_ascii_case("insunits") {
+                        self.tabs[i].scene.insertion_units_changed(units_before);
+                    }
+                }
+                // System variables are persisted drawing state, not merely a
+                // UI preference. CLAYER is already marked dirty by the unified
+                // layer path; keeping this assignment for every variable makes
+                // mixed batches follow the same contract.
+                self.tabs[i].dirty = true;
                 applied.insert(name.to_ascii_lowercase(), value.clone());
             }
             self.set_control_result(json!({ "set": applied }));
@@ -89,16 +284,15 @@ impl OpenCADStudio {
     }
 
     /// `layout_create` — add a layout with the default A4 page setup.
-    pub(super) fn control_layout_create(
-        &mut self,
-        req: &Value,
-    ) -> Result<Task<Message>, Value> {
-        let name = string(req, "name")?.to_owned();
-        if name.is_empty() {
-            return Err(failure("name_required", "Supply a layout name"));
-        }
+    pub(super) fn control_layout_create(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        let name = validated_layout_name(string(req, "name")?)?;
         let i = self.active_tab;
-        if self.tabs[i].scene.layout_names().iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+        if self.tabs[i]
+            .scene
+            .layout_names()
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&name))
+        {
             return Err(failure(
                 "layout_exists",
                 format!("Layout '{name}' already exists"),
@@ -107,7 +301,6 @@ impl OpenCADStudio {
         self.push_undo_snapshot(i, "LAYOUTCREATE");
         self.tabs[i]
             .scene
-            .document
             .add_layout(&name)
             .map_err(|e| failure("layout_failed", e))?;
         let plot_style = self
@@ -115,11 +308,16 @@ impl OpenCADStudio {
             .as_ref()
             .map(|style| style.name.clone())
             .unwrap_or_default();
-        let layout_flags = i16::from(
-            self.tabs[i].scene.document.header.paper_space_linetype_scaling,
-        ) | (i16::from(self.tabs[i].scene.document.header.paper_space_limit_check) << 1);
+        let layout_flags =
+            i16::from(
+                self.tabs[i]
+                    .scene
+                    .document
+                    .header
+                    .paper_space_linetype_scaling,
+            ) | (i16::from(self.tabs[i].scene.document.header.paper_space_limit_check) << 1);
         for obj in self.tabs[i].scene.document.objects.values_mut() {
-            if let codec::objects::ObjectType::Layout(layout) = obj {
+            if let document::objects::ObjectType::Layout(layout) = obj {
                 if layout.name == name {
                     layout.flags = layout_flags;
                     crate::scene::apply_default_page_setup(layout, &plot_style);
@@ -128,33 +326,118 @@ impl OpenCADStudio {
             }
         }
         self.tabs[i].scene.ensure_sheet_viewport(&name);
+        self.tabs[i].scene.initialize_layout_default_viewport(&name);
         self.tabs[i].dirty = true;
         let layouts = self.tabs[i].scene.layout_names();
         self.set_control_result(json!({ "layout": name, "layouts": layouts }));
         Ok(Task::none())
     }
 
+    /// `layout_rename` — rename a paper layout and its dictionary entry.
+    pub(super) fn control_layout_rename(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        let i = self.active_tab;
+        if self.tabs[i].active_block_edit.is_some() {
+            return Err(failure(
+                "block_editor_active",
+                "Close the block editor before renaming layouts",
+            ));
+        }
+        let name = canonical_layout_name(&self.tabs[i].scene, string(req, "name")?)?;
+        if name == "Model" {
+            return Err(failure(
+                "layout_protected",
+                "The Model layout cannot be renamed",
+            ));
+        }
+        let new_name = validated_layout_name(string(req, "new_name")?)?;
+        if name == new_name {
+            return Err(failure(
+                "layout_name_unchanged",
+                "The new layout name matches the current one",
+            ));
+        }
+        if self.tabs[i]
+            .scene
+            .layout_names()
+            .iter()
+            .any(|existing| existing != &name && existing.eq_ignore_ascii_case(&new_name))
+        {
+            return Err(failure(
+                "layout_exists",
+                format!("Layout '{new_name}' already exists"),
+            ));
+        }
+        self.push_undo_snapshot(i, "LAYOUT RENAME");
+        self.tabs[i].scene.rename_layout(&name, &new_name);
+        if self.tabs[i].scene.current_layout == name {
+            self.tabs[i].scene.set_current_layout(new_name.clone());
+        }
+        self.tabs[i].dirty = true;
+        let current = self.tabs[i].scene.current_layout.clone();
+        let layouts = self.tabs[i].scene.layout_names();
+        self.set_control_result(json!({
+            "name": name,
+            "new_name": new_name,
+            "current": current,
+            "layouts": layouts,
+        }));
+        Ok(Task::none())
+    }
+
+    /// `layout_activate` — make an existing model or paper layout current.
+    pub(super) fn control_layout_activate(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        let i = self.active_tab;
+        if self.tabs[i].active_block_edit.is_some() {
+            return Err(failure(
+                "block_editor_active",
+                "Close the block editor before switching layouts",
+            ));
+        }
+        let name = canonical_layout_name(&self.tabs[i].scene, string(req, "name")?)?;
+        let task = self.on_layout_switch_view_only(name.clone());
+        let current = self.tabs[i].scene.current_layout.clone();
+        self.set_control_result(json!({ "layout": name, "current": current }));
+        Ok(task)
+    }
+
+    /// `layout_delete` — delete a paper layout, falling back to Model when active.
+    pub(super) fn control_layout_delete(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        let i = self.active_tab;
+        if self.tabs[i].active_block_edit.is_some() {
+            return Err(failure(
+                "block_editor_active",
+                "Close the block editor before deleting layouts",
+            ));
+        }
+        let name = canonical_layout_name(&self.tabs[i].scene, string(req, "name")?)?;
+        if name == "Model" {
+            return Err(failure(
+                "layout_protected",
+                "The Model layout cannot be deleted",
+            ));
+        }
+        let task = self.update(Message::LayoutDelete(name.clone()));
+        let current = self.tabs[i].scene.current_layout.clone();
+        let layouts = self.tabs[i].scene.layout_names();
+        self.set_control_result(json!({
+            "deleted": name,
+            "current": current,
+            "layouts": layouts,
+        }));
+        Ok(task)
+    }
+
     /// `page_setup_set` — write a layout's plot configuration
     /// Explicit fields win; everything else
     /// keeps the layout's stored setup. Paper names resolve through the
     /// catalog; scales are `"fit"` or `"paper:drawing"` like `"1:100"`.
-    pub(super) fn control_page_setup_set(
-        &mut self,
-        req: &Value,
-    ) -> Result<Task<Message>, Value> {
-        let layout = string(req, "layout")?.to_owned();
+    pub(super) fn control_page_setup_set(&mut self, req: &Value) -> Result<Task<Message>, Value> {
         let i = self.active_tab;
-        if !self.tabs[i].scene.layout_names().iter().any(|n| n.eq_ignore_ascii_case(&layout)) {
-            return Err(failure(
-                "layout_missing",
-                format!("Layout '{layout}' does not exist"),
-            ));
-        }
-        let mut ps = self
-            .tabs[i]
+        let layout = canonical_layout_name(&self.tabs[i].scene, string(req, "layout")?)?;
+        let mut ps = self.tabs[i]
             .scene
             .plot_settings_for(&layout)
-            .unwrap_or_else(|| codec::objects::PlotSettings::new(String::new()));
+            .unwrap_or_else(|| document::objects::PlotSettings::new(String::new()));
         if let Some(paper) = req["paper"].as_str().filter(|p| !p.is_empty()) {
             let resolved = crate::io::paper_catalog::resolve(paper)
                 .ok_or_else(|| failure("invalid_paper", format!("Unknown paper '{paper}'")))?;
@@ -162,17 +445,25 @@ impl OpenCADStudio {
             let (width, height) = resolved.portrait_mm();
             ps.paper_width = width;
             ps.paper_height = height;
-            ps.rotation = if req["orientation"].as_str().is_some_and(|o| o.eq_ignore_ascii_case("portrait")) {
-                codec::objects::PlotRotation::None
+        }
+        if let Some(orientation) = req["orientation"].as_str() {
+            if orientation.eq_ignore_ascii_case("portrait") {
+                set_page_orientation(&mut ps, false);
+            } else if orientation.eq_ignore_ascii_case("landscape") {
+                set_page_orientation(&mut ps, true);
             } else {
-                codec::objects::PlotRotation::Degrees90
-            };
+                return Err(failure(
+                    "invalid_orientation",
+                    "orientation must be portrait or landscape",
+                ));
+            }
         }
         if let Some(fit) = req["fit"].as_bool() {
             if fit {
                 ps.set_scale_to_fit();
                 ps.flags.use_standard_scale = true;
             } else {
+                ps.scale_type = document::objects::ScaledType::CustomScale;
                 ps.flags.use_standard_scale = false;
             }
         }
@@ -190,6 +481,7 @@ impl OpenCADStudio {
             };
             ps.scale_numerator = numerator;
             ps.scale_denominator = denominator;
+            ps.scale_type = document::objects::ScaledType::CustomScale;
             ps.standard_scale_factor = numerator / denominator;
             ps.flags.use_standard_scale = false;
         }
@@ -200,14 +492,90 @@ impl OpenCADStudio {
             ps.current_style_sheet = style.to_owned();
             ps.flags.plot_plot_styles = !style.is_empty();
         }
-        if let Some(window) = req["window"].as_array().filter(|v| v.len() == 4) {
-            let coord = |k: usize| window[k].as_f64().unwrap_or(0.0);
-            ps.set_plot_window(coord(0), coord(1), coord(2), coord(3));
-            ps.plot_type = codec::objects::PlotType::Window;
+        for (key, origin) in [
+            ("offset_x", &mut ps.origin_x),
+            ("offset_y", &mut ps.origin_y),
+        ] {
+            if req.get(key).is_some() {
+                let Some(value) = req[key].as_f64().filter(|value| value.is_finite()) else {
+                    return Err(failure(
+                        "invalid_offset",
+                        format!("{key} must be a finite number in mm"),
+                    ));
+                };
+                *origin = value;
+            }
+        }
+        if let Some(area) = req["area"].as_str() {
+            use document::objects::PlotType;
+            ps.plot_type = if area.eq_ignore_ascii_case("extents") {
+                PlotType::Extents
+            } else if area.eq_ignore_ascii_case("display") {
+                PlotType::LastScreenDisplay
+            } else if area.eq_ignore_ascii_case("limits") {
+                PlotType::Limits
+            } else if area.eq_ignore_ascii_case("layout") {
+                PlotType::Layout
+            } else if area.eq_ignore_ascii_case("window") {
+                PlotType::Window
+            } else {
+                return Err(failure(
+                    "invalid_area",
+                    "area must be extents, display, limits, layout or window",
+                ));
+            };
+        }
+        if ps.plot_type == document::objects::PlotType::Window
+            && req["area"].as_str().is_some_and(|area| area.eq_ignore_ascii_case("window"))
+            && req.get("window").is_none()
+        {
+            return Err(failure(
+                "window_required",
+                "Supply window:[x0,y0,x1,y1] when area is window",
+            ));
+        }
+        if let Some(value) = req.get("window") {
+            let Some(window) = value.as_array().filter(|window| window.len() == 4) else {
+                return Err(failure(
+                    "invalid_window",
+                    "window must be four finite numbers [x0,y0,x1,y1]",
+                ));
+            };
+            let mut coordinates = [0.0; 4];
+            for (index, value) in window.iter().enumerate() {
+                let Some(value) = value.as_f64().filter(|value| value.is_finite()) else {
+                    return Err(failure(
+                        "invalid_window",
+                        "window must be four finite numbers [x0,y0,x1,y1]",
+                    ));
+                };
+                coordinates[index] = value;
+            }
+            if coordinates[2] <= coordinates[0] || coordinates[3] <= coordinates[1] {
+                return Err(failure(
+                    "invalid_window",
+                    "window must have positive width and height",
+                ));
+            }
+            ps.set_plot_window(
+                coordinates[0],
+                coordinates[1],
+                coordinates[2],
+                coordinates[3],
+            );
+            ps.plot_type = document::objects::PlotType::Window;
         }
         self.push_undo_snapshot(i, "PAGESETUP");
         if !self.tabs[i].scene.set_layout_plot_settings(&layout, &ps) {
-            return Err(failure("layout_missing", format!("Layout '{layout}' vanished")));
+            return Err(failure(
+                "layout_missing",
+                format!("Layout '{layout}' vanished"),
+            ));
+        }
+        // Only a layout that was never opened gets its first viewport; one
+        // whose viewports the user erased stays as it is.
+        if layout != "Model" && self.tabs[i].scene.unopened_layouts.remove(&layout) {
+            self.tabs[i].scene.initialize_layout_default_viewport(&layout);
         }
         self.tabs[i].dirty = true;
         self.set_control_result(json!({
@@ -216,7 +584,7 @@ impl OpenCADStudio {
             "scale": json!({
                 "numerator": ps.scale_numerator,
                 "denominator": ps.scale_denominator,
-                "fit": ps.flags.use_standard_scale,
+                "fit": ps.is_scale_to_fit(),
             }),
             "plot_style": ps.current_style_sheet,
         }));
@@ -224,15 +592,18 @@ impl OpenCADStudio {
     }
 
     /// `entities_copy_to` — copy entities into another open document
-    /// Referenced layer definitions travel along;
-    /// the new handles are returned.
-    pub(super) fn control_entities_copy_to(
-        &mut self,
-        req: &Value,
-    ) -> Result<Task<Message>, Value> {
+    /// The dependency snapshot the interactive copy takes travels with them:
+    /// referenced layers, linetypes and styles, and every block definition the
+    /// source holds for the copied references — transitively, with its object
+    /// graph — so a moved reference keeps pointing at a record the target has.
+    /// A reference whose definition the source itself does not hold stays a
+    /// dangling reference here, as it does when the drawing is loaded, and the
+    /// audit reports it. The new handles are returned.
+    pub(super) fn control_entities_copy_to(&mut self, req: &Value) -> Result<Task<Message>, Value> {
         let handles = crate::app::control::entities::hex_handles(req, "handles")?;
-        let target = req["document_id"]
+        let target = req["target_document_id"]
             .as_u64()
+            .or_else(|| req["document_id"].as_u64())
             .ok_or_else(|| failure("document_required", "Supply the target document_id"))?;
         let source_index = self.active_tab;
         let target_index = self
@@ -245,49 +616,51 @@ impl OpenCADStudio {
             &handles,
         )?;
 
-        // Clone out of the source first so the two tabs never borrow together.
-        let cloned: Vec<codec::EntityType> = handles
-            .iter()
-            .filter_map(|handle| self.tabs[source_index].scene.document.get_entity(*handle))
-            .map(|entity| entity.clone())
-            .collect();
-
-        // Copy the referenced layer definitions out of the source before the
-        // target borrow starts (the two tabs never borrow together).
-        let mut missing_layers: Vec<codec::tables::Layer> = Vec::new();
-        {
-            let source_document = &self.tabs[source_index].scene.document;
-            for entity in &cloned {
-                let layer = entity.common().layer.clone();
-                if layer.is_empty()
-                    || layer == "0"
-                    || source_document.layers.contains(&layer)
-                    || missing_layers.iter().any(|l| l.name == layer)
-                {
-                    continue;
-                }
-                if let Some(source_layer) = source_document.layers.get(&layer) {
-                    missing_layers.push(source_layer.clone());
-                }
-            }
-        }
+        // Snapshot out of the source first so the two tabs never borrow together.
+        use crate::app::command_driver::clipboard::{
+            copy_to_clipboard_kernel, finish_paste_in_scene, paste_entities_kernel, PasteSpace,
+        };
+        let (cloned, deps) =
+            copy_to_clipboard_kernel(&self.tabs[source_index].scene.document, &handles);
 
         self.push_undo_snapshot(target_index, "COPYTO");
-        let mut created = Vec::new();
-        {
+        let created: Vec<String> = {
             let scene = &mut self.tabs[target_index].scene;
-            crate::io::linetypes::populate_document(&mut scene.document);
-            for layer_record in &missing_layers {
-                if !scene.document.layers.contains(&layer_record.name) {
-                    let mut layer_record = layer_record.clone();
-                    layer_record.handle = scene.document.allocate_handle();
-                    let _ = scene.document.layers.add(layer_record);
+            // New geometry lands in the space the target is editing: its block
+            // editor session, a paper layout with no active viewport, or model.
+            let layout = scene.current_layout.clone();
+            let space = match scene.block_edit_block {
+                Some(block) => PasteSpace::Block(block),
+                None if layout != "Model" && scene.active_viewport.is_none() => {
+                    PasteSpace::Layout(&layout)
                 }
+                None => PasteSpace::Model,
+            };
+            let first_new_handle = scene.document.next_handle();
+            let records_before = scene.document.block_records.len();
+            let (by_index, handle_map) =
+                paste_entities_kernel(&mut scene.document, &cloned, &deps, None, space);
+            for linetype in cloned.iter().map(|e| e.common().linetype.clone()) {
+                // The kernel copies the records the source declares; a linetype
+                // it only names still needs this drawing's catalogue entry.
+                crate::io::linetypes::ensure_catalog_linetype(&mut scene.document, &linetype);
             }
-            for entity in cloned {
-                created.push(format!("{:X}", scene.add_entity_clone(entity).value()));
-            }
-        }
+            // Same Scene half an interactive paste runs, so a copied image,
+            // hatch, group or constraint arrives wired the way a pasted one does.
+            finish_paste_in_scene(
+                scene,
+                &deps,
+                &by_index,
+                &handle_map,
+                records_before,
+                first_new_handle,
+            );
+            by_index
+                .iter()
+                .filter(|handle| !handle.is_null())
+                .map(|handle| format!("{:X}", handle.value()))
+                .collect()
+        };
         self.tabs[target_index].dirty = true;
         self.post_ref_op(target_index);
         let created_count = created.len();
@@ -330,13 +703,8 @@ impl OpenCADStudio {
             return Err(failure("name_required", "Supply a set name"));
         }
         let handles = crate::app::control::entities::hex_handles(req, "handles")?;
-        let stored: Vec<String> = handles
-            .iter()
-            .map(|h| format!("{:X}", h.value()))
-            .collect();
-        self.control
-            .selection_sets
-            .insert(name.clone(), handles);
+        let stored: Vec<String> = handles.iter().map(|h| format!("{:X}", h.value())).collect();
+        self.control.selection_sets.insert(name.clone(), handles);
         let count = self
             .control
             .selection_sets
@@ -360,10 +728,7 @@ impl OpenCADStudio {
             .get(&name)
             .cloned()
             .ok_or_else(|| failure("selection_set_missing", format!("No set named '{name}'")))?;
-        let stored: Vec<String> = handles
-            .iter()
-            .map(|h| format!("{:X}", h.value()))
-            .collect();
+        let stored: Vec<String> = handles.iter().map(|h| format!("{:X}", h.value())).collect();
         let select = req["select"].as_bool().unwrap_or(true);
         let mut selected = 0;
         if select {
@@ -376,6 +741,9 @@ impl OpenCADStudio {
                     selected += 1;
                 }
             }
+            // The selection this replaces was what the panel and the grip
+            // overlay were built from; same rebuild the `select` op runs.
+            self.refresh_properties();
         }
         self.set_control_result(json!({
             "name": name,
@@ -388,7 +756,7 @@ impl OpenCADStudio {
     /// `new` with `"template"` — the web build reads no files from a path, so
     /// a template is refused there rather than silently ignored.
     #[cfg(target_arch = "wasm32")]
-    pub(in crate::app) fn apply_template(&mut self, _template: &str) -> Result<usize, Value> {
+    pub(in crate::app) fn apply_template(&mut self, _template: &str) -> Result<(), Value> {
         Err(failure(
             "invalid_request",
             "starting from a template needs the desktop build",
@@ -399,7 +767,7 @@ impl OpenCADStudio {
     /// file. Tables and styles come from the template; the document keeps no
     /// source path.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(in crate::app) fn apply_template(&mut self, template: &str) -> Result<usize, Value> {
+    pub(in crate::app) fn apply_template(&mut self, template: &str) -> Result<(), Value> {
         let path = std::path::PathBuf::from(template);
         let bytes = self
             .read_drawing(&path)
@@ -415,7 +783,7 @@ impl OpenCADStudio {
         } else {
             path.clone()
         };
-        let (mut document, purged) = crate::io::load_bytes_finalized(&load_path, bytes)
+        let mut document = crate::io::load_bytes_finalized(&load_path, bytes)
             .map_err(|e| failure("template_failed", e))?;
         document.source_path = Some(path.to_string_lossy().into_owned());
         let i = self.active_tab;
@@ -430,10 +798,17 @@ impl OpenCADStudio {
         }
         crate::app::style_ops::ensure_standard_styles(&mut self.tabs[i].scene.document);
         self.tabs[i].adopt_active_ucs_from_header();
+        // The template's saved view and its grid/snap state, as an opened
+        // drawing gets them (#2198).
+        self.tabs[i].scene.restore_saved_camera();
+        self.adopt_view_display(i);
         self.tabs[i].current_path = None;
         self.tabs[i].is_start = false;
         self.tabs[i].dirty = true;
-        Ok(purged)
+        // A whole document just became resident in the tab (API v9): the
+        // boundary announces `DocumentOpened` once.
+        self.tabs[i].note_document_loaded(None);
+        Ok(())
     }
 
     /// `file_identity` — stable per-document GUID (the drawing's SPMDOCUNIQUE value,
@@ -462,22 +837,24 @@ impl OpenCADStudio {
                     &mut self.tabs[i].scene.document,
                     handle,
                     FILE_IDENTITY_APP,
-                    Some(vec![codec::xdata::XDataValue::String(identity.clone())]),
+                    Some(vec![document::xdata::XDataValue::String(identity.clone())]),
                 );
             }
             None => {
-                let mut text = codec::entities::Text::with_value(
+                let mut text = document::entities::Text::with_value(
                     FILE_IDENTITY_APP,
-                    codec::types::Vector3::ZERO,
+                    document::types::Vector3::ZERO,
                 )
                 .with_height(0.0001);
                 text.common.invisible = true;
-                let handle = self.tabs[i].scene.add_entity(codec::EntityType::Text(text));
+                let handle = self.tabs[i]
+                    .scene
+                    .add_entity(document::EntityType::Text(text));
                 crate::scene::view::dispatch::set_entity_xdata(
                     &mut self.tabs[i].scene.document,
                     handle,
                     FILE_IDENTITY_APP,
-                    Some(vec![codec::xdata::XDataValue::String(identity.clone())]),
+                    Some(vec![document::xdata::XDataValue::String(identity.clone())]),
                 );
             }
         }
@@ -492,7 +869,7 @@ impl OpenCADStudio {
 const FILE_IDENTITY_APP: &str = "SPMDOCUNIQUE";
 
 /// The handle of the entity carrying the file identity, if present.
-fn find_file_identity_marker(document: &codec::CadDocument) -> Option<codec::Handle> {
+fn find_file_identity_marker(document: &document::Document) -> Option<document::Handle> {
     document
         .entities()
         .find(|entity| {
@@ -506,14 +883,14 @@ fn find_file_identity_marker(document: &codec::CadDocument) -> Option<codec::Han
 }
 
 /// The identity GUID from the marker entity's XData.
-fn marker_identity(document: &codec::CadDocument, handle: codec::Handle) -> Option<String> {
+fn marker_identity(document: &document::Document, handle: document::Handle) -> Option<String> {
     let record = document
         .get_entity(handle)?
         .common()
         .extended_data
         .get_record(FILE_IDENTITY_APP)?;
     match record.values.first() {
-        Some(codec::xdata::XDataValue::String(text)) => Some(text.clone()),
+        Some(document::xdata::XDataValue::String(text)) => Some(text.clone()),
         _ => None,
     }
 }
@@ -537,8 +914,19 @@ pub(crate) fn new_guid_v4() -> String {
 
 /// The readable registry; `WRITABLE_SYSVARS` is the subset `set` accepts.
 const READABLE_SYSVARS: &[&str] = &[
-    "celtscale", "clayer", "ctextstyle", "extmax", "extmin", "filletrad",
-    "insunits", "ltscale", "mirrtext", "osmode", "pdmode", "pdsize",
+    "celtscale",
+    "clayer",
+    "constraintstatus",
+    "ctextstyle",
+    "extmax",
+    "extmin",
+    "filletrad",
+    "insunits",
+    "ltscale",
+    "mirrtext",
+    "osmode",
+    "pdmode",
+    "pdsize",
     "textsize",
 ];
 
@@ -564,13 +952,116 @@ fn read_sysvar(scene: &crate::scene::Scene, name: &str) -> Option<Value> {
             let (_, max) = scene.model_space_extents()?;
             json!([max.x, max.y, max.z])
         }
+        // Constraint state per active space: the scope the solver is working
+        // in and how much of it is constrained. `dof` is the solver's own
+        // derived figure, so it is null until a solve has run.
+        // `scene.block_edit_block` is the scene-side record that
+        // `DocumentTab::current_parametric_scope()` resolves its BEDIT
+        // session to; this read only has the scene, so it follows that field.
+        "constraintstatus" => {
+            use crate::scene::parametric_constraints::ParametricScope;
+            let scope = scene
+                .block_edit_block
+                .map(ParametricScope::Block)
+                .unwrap_or(ParametricScope::ModelSpace);
+            let set = scene.parametric_constraint_set(scope);
+            let owner = scope.owner_handle(&scene.document);
+            json!({
+                "scope": scene
+                    .document
+                    .block_records
+                    .iter()
+                    .find(|record| record.handle == owner)
+                    .map(|record| record.name.clone()),
+                "constraint_count": set.map_or(0, |set| set.constraints.len()),
+                "enabled_count": set.map_or(0, |set| {
+                    set.constraints.iter().filter(|constraint| constraint.enabled).count()
+                }),
+                "dof": set.and_then(|set| set.dof),
+            })
+        }
         _ => return None,
     };
     Some(value)
 }
 
-fn set_sysvar(document: &mut codec::CadDocument, name: &str, value: &Value) -> Result<(), Value> {
+fn validate_sysvar(document: &document::Document, name: &str, value: &Value) -> Result<(), Value> {
     let failure = |message: &str| crate::app::control::failure("invalid_sysvar_value", message);
+    match name.to_ascii_lowercase().as_str() {
+        "ltscale" => {
+            positive(value, "ltscale", failure)?;
+        }
+        "pdmode" => {
+            integer(value, "pdmode", failure)?;
+        }
+        "pdsize" => {
+            value
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| failure("pdsize needs a finite number"))?;
+        }
+        "celtscale" => {
+            positive(value, "celtscale", failure)?;
+        }
+        "textsize" => {
+            positive(value, "textsize", failure)?;
+        }
+        "filletrad" => {
+            value
+                .as_f64()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .ok_or_else(|| failure("filletrad needs a finite number >= 0"))?;
+        }
+        "mirrtext" => {
+            // Keep the historical coercion used by set_sysvar: omitted or
+            // non-integer values resolve to the enabled state.
+        }
+        "insunits" => {
+            integer(value, "insunits", failure)?;
+        }
+        "osmode" => {
+            value
+                .as_i64()
+                .and_then(|v| i32::try_from(v).ok())
+                .ok_or_else(|| failure("osmode needs an integer"))?;
+        }
+        "clayer" => {
+            let name = value
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| failure("clayer needs a layer name"))?;
+            if document.layers.get(name).is_none() {
+                return Err(failure(&format!("Layer '{name}' does not exist")));
+            }
+        }
+        "ctextstyle" => {
+            let name = value
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| failure("ctextstyle needs a text style name"))?;
+            if document.text_styles.get(name).is_none() {
+                return Err(failure(&format!("Text style '{name}' does not exist")));
+            }
+        }
+        other => {
+            return Err(crate::app::control::failure(
+                "unknown_sysvar",
+                format!(
+                    "System variable '{other}' is read-only or unknown. Writable: {}",
+                    "celtscale, clayer, ctextstyle, filletrad, insunits, ltscale, mirrtext, osmode, pdmode, pdsize, textsize"
+                ),
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn set_sysvar(document: &mut document::Document, name: &str, value: &Value) -> Result<(), Value> {
+    validate_sysvar(document, name, value)?;
+    let failure = |message: &str| crate::app::control::failure("invalid_sysvar_value", message);
+    // The header and the tables are separate fields of the acadrust document;
+    // borrow them through it, not through the whole Document.
+    let document: &mut document::CadDocument = document;
     let header = &mut document.header;
     match name.to_ascii_lowercase().as_str() {
         "ltscale" => {
@@ -649,22 +1140,14 @@ fn set_sysvar(document: &mut codec::CadDocument, name: &str, value: &Value) -> R
     Ok(())
 }
 
-fn positive(
-    value: &Value,
-    name: &str,
-    failure: impl Fn(&str) -> Value,
-) -> Result<f64, Value> {
+fn positive(value: &Value, name: &str, failure: impl Fn(&str) -> Value) -> Result<f64, Value> {
     value
         .as_f64()
         .filter(|v| v.is_finite() && *v > 0.0)
         .ok_or_else(|| failure(&format!("{name} needs a finite number > 0")))
 }
 
-fn integer(
-    value: &Value,
-    name: &str,
-    failure: impl Fn(&str) -> Value,
-) -> Result<i16, Value> {
+fn integer(value: &Value, name: &str, failure: impl Fn(&str) -> Value) -> Result<i16, Value> {
     value
         .as_i64()
         .and_then(|v| i16::try_from(v).ok())

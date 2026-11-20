@@ -1,35 +1,41 @@
 // View module — viewport tools, navigation, visual styles, palettes, interface.
 
+mod assistant_palette;
 mod cascade;
+mod count_palette;
+pub mod dview;
 mod file_tabs;
+mod graphic_attributes_palette;
 mod layout_tabs;
 pub mod limits;
-mod orbit;
-mod ortho;
+pub(crate) mod orbit;
+pub(crate) mod ortho;
 mod pan;
-mod persp;
+pub(crate) mod persp;
 pub mod plot_window;
-pub mod quick_print;
 mod properties_palette;
+pub mod quick_print;
 mod sheetset;
 mod tile_horiz;
 mod tile_vert;
-pub mod visual_style;
 mod tool_palettes;
 pub mod ucs_cmd;
 mod ucs_icon;
-mod view_front;
-mod view_iso;
-mod view_right;
-mod view_top;
+pub mod view_cmd;
+pub(crate) mod view_front;
+pub(crate) mod view_iso;
+pub(crate) mod view_right;
+pub(crate) mod view_top;
 mod viewcube;
-mod vports_config;
+pub mod visual_style;
+pub(crate) mod vports_config;
+mod vports_highlight;
 mod vports_join;
 mod vports_named;
 mod vports_restore;
-mod zoom_ext;
-mod zoom_in;
-mod zoom_out;
+pub(crate) mod zoom_ext;
+pub(crate) mod zoom_in;
+pub(crate) mod zoom_out;
 pub mod zoom_window;
 
 use crate::modules::{CadModule, IconKind, ModuleEvent, RibbonGroup, RibbonItem, ToolDef};
@@ -72,10 +78,11 @@ impl CadModule for ViewModule {
                 RibbonGroup {
                     title: "Model Viewports",
                     tools: vec![
-                        RibbonItem::LargeTool(vports_config::tool()),
+                        vports_config::dropdown(),
                         RibbonItem::Tool(vports_named::tool()),
                         RibbonItem::Tool(vports_join::tool()),
                         RibbonItem::Tool(vports_restore::tool()),
+                        RibbonItem::Tool(vports_highlight::tool()),
                     ],
                 },
                 // ── Visual Style ──────────────────────────────────────────────────
@@ -120,7 +127,10 @@ impl CadModule for ViewModule {
                     tools: vec![
                         RibbonItem::LargeTool(tool_palettes::tool()),
                         RibbonItem::LargeTool(properties_palette::tool()),
+                        RibbonItem::LargeTool(count_palette::tool()),
+                        RibbonItem::LargeTool(graphic_attributes_palette::tool()),
                         RibbonItem::LargeTool(sheetset::tool()),
+                        RibbonItem::LargeTool(assistant_palette::tool()),
                     ],
                 },
                 // ── Interface ─────────────────────────────────────────────────────

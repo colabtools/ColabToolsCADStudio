@@ -5,7 +5,7 @@ impl OpenCADStudio {
         match cmd {
             // ── LAYER management ─────────────────────────────────────────
             cmd if cmd == "LAYER" || cmd.starts_with("LAYER ") || cmd.starts_with("LA ") => {
-                use codec::tables::Layer;
+                use document::tables::Layer;
                 let raw_rest = if cmd.starts_with("LAYER ") {
                     cmd.trim_start_matches("LAYER ").trim()
                 } else if cmd.starts_with("LA ") {
@@ -14,7 +14,7 @@ impl OpenCADStudio {
                     ""
                 };
                 let parts: Vec<&str> = raw_rest.split_whitespace().collect();
-                let sub = parts.get(0).map(|s| s.to_uppercase()).unwrap_or_default();
+                let sub = parts.first().map(|s| s.to_uppercase()).unwrap_or_default();
                 match sub.as_str() {
                     "" | "LIST" | "?" => {
                         let info: Vec<String> = self.tabs[i]
@@ -41,125 +41,164 @@ impl OpenCADStudio {
                     "NEW" | "N" => {
                         let name = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
                         if name.is_empty() {
-                            self.command_line.push_error(crate::t!("Usage: LAYER NEW <name>").as_ref());
-                        } else if self.tabs[i].scene.document.layers.contains(&name) {
                             self.command_line
-                                .push_error(crate::tf!("LAYER: '{}' already exists.", name).as_ref());
+                                .push_error(crate::t!("Usage: LAYER NEW <name>").as_ref());
+                        } else if self.tabs[i].scene.document.layers.contains(&name) {
+                            self.command_line.push_error(
+                                crate::tf!("LAYER: '{}' already exists.", name).as_ref(),
+                            );
                         } else {
+                            // The snapshot records the state before the
+                            // change, so every option takes it first.
+                            self.push_undo_snapshot(i, "LAYER NEW");
                             let mut layer = Layer::new(&name);
                             // Allocate a unique handle so the layer survives a
                             // DWG save (handle-based format; issue #67).
                             layer.handle = self.tabs[i].scene.document.allocate_handle();
                             let _ = self.tabs[i].scene.document.layers.add(layer);
-                            self.push_undo_snapshot(i, "LAYER NEW");
                             self.tabs[i].dirty = true;
                             self.command_line
                                 .push_output(crate::tf!("LAYER: '{}' created.", name).as_ref());
                         }
                     }
                     "ON" => {
+                        self.push_undo_snapshot(i, "LAYER ON");
                         for name in &parts[1..] {
                             if let Some(l) = self.tabs[i].scene.document.layers.get_mut(name) {
                                 l.flags.off = false;
                                 l.flags.frozen = false;
                             }
                         }
-                        self.push_undo_snapshot(i, "LAYER ON");
                         self.tabs[i].dirty = true;
-                        self.command_line.push_output(crate::t!("LAYER: layers turned on.").as_ref());
+                        self.command_line
+                            .push_output(crate::t!("LAYER: layers turned on.").as_ref());
                     }
                     "OFF" => {
+                        self.push_undo_snapshot(i, "LAYER OFF");
                         for name in &parts[1..] {
                             if let Some(l) = self.tabs[i].scene.document.layers.get_mut(name) {
                                 l.flags.off = true;
                             }
                         }
-                        self.push_undo_snapshot(i, "LAYER OFF");
                         self.tabs[i].dirty = true;
-                        self.command_line.push_output(crate::t!("LAYER: layers turned off.").as_ref());
+                        self.command_line
+                            .push_output(crate::t!("LAYER: layers turned off.").as_ref());
                     }
                     "FREEZE" | "FR" => {
+                        self.push_undo_snapshot(i, "LAYER FREEZE");
                         for name in &parts[1..] {
                             if let Some(l) = self.tabs[i].scene.document.layers.get_mut(name) {
                                 l.flags.frozen = true;
                             }
                         }
-                        self.push_undo_snapshot(i, "LAYER FREEZE");
                         self.tabs[i].dirty = true;
-                        self.command_line.push_output(crate::t!("LAYER: layers frozen.").as_ref());
+                        self.command_line
+                            .push_output(crate::t!("LAYER: layers frozen.").as_ref());
                     }
                     "THAW" | "TH" => {
+                        self.push_undo_snapshot(i, "LAYER THAW");
                         for name in &parts[1..] {
                             if let Some(l) = self.tabs[i].scene.document.layers.get_mut(name) {
                                 l.flags.frozen = false;
                             }
                         }
-                        self.push_undo_snapshot(i, "LAYER THAW");
                         self.tabs[i].dirty = true;
-                        self.command_line.push_output(crate::t!("LAYER: layers thawed.").as_ref());
+                        self.command_line
+                            .push_output(crate::t!("LAYER: layers thawed.").as_ref());
                     }
                     "LOCK" | "LO" => {
+                        self.push_undo_snapshot(i, "LAYER LOCK");
+                        let names: Vec<String> =
+                            parts[1..].iter().map(|name| (*name).to_string()).collect();
                         for name in &parts[1..] {
                             if let Some(l) = self.tabs[i].scene.document.layers.get_mut(name) {
                                 l.flags.locked = true;
                             }
                         }
-                        self.push_undo_snapshot(i, "LAYER LOCK");
+                        self.tabs[i].scene.invalidate_layer_dependencies(&names);
                         self.tabs[i].dirty = true;
                         self.refresh_properties();
-                        self.command_line.push_output(crate::t!("LAYER: layers locked.").as_ref());
+                        self.command_line
+                            .push_output(crate::t!("LAYER: layers locked.").as_ref());
                     }
                     "UNLOCK" | "UL" => {
+                        self.push_undo_snapshot(i, "LAYER UNLOCK");
+                        let names: Vec<String> =
+                            parts[1..].iter().map(|name| (*name).to_string()).collect();
                         for name in &parts[1..] {
                             if let Some(l) = self.tabs[i].scene.document.layers.get_mut(name) {
                                 l.flags.locked = false;
                             }
                         }
-                        self.push_undo_snapshot(i, "LAYER UNLOCK");
+                        self.tabs[i].scene.invalidate_layer_dependencies(&names);
                         self.tabs[i].dirty = true;
                         self.refresh_properties();
-                        self.command_line.push_output(crate::t!("LAYER: layers unlocked.").as_ref());
+                        self.command_line
+                            .push_output(crate::t!("LAYER: layers unlocked.").as_ref());
                     }
                     "COLOR" | "C" => {
-                        // LAYER COLOR <name> <aci_index>
-                        let layer_name = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
-                        let color_str = parts.get(2).map(|s| s.trim()).unwrap_or("");
-                        if let Ok(idx) = color_str.parse::<i16>() {
-                            if let Some(l) = self.tabs[i].scene.document.layers.get_mut(&layer_name)
-                            {
-                                l.color = codec::types::Color::from_index(idx);
-                                l.color_name = None;
-                                l.book_name = None;
-                                self.push_undo_snapshot(i, "LAYER COLOR");
-                                self.tabs[i].dirty = true;
-                                // By-layer colour is baked into every wire on
-                                // this layer. The dependency index maps block
-                                // children back to their top-level INSERTs, so
-                                // unrelated entities stay warm.
-                                self.tabs[i]
-                                    .scene
-                                    .invalidate_layer_dependencies(std::slice::from_ref(
-                                        &layer_name,
-                                    ));
-                                self.command_line.push_output(crate::tf!(
-                                    "LAYER: '{}' color set to ACI {}.",
-                                    layer_name, idx
-                                ).as_ref());
-                            } else {
-                                self.command_line
-                                    .push_error(crate::tf!("LAYER: '{}' not found.", layer_name).as_ref());
-                            }
+                        use document::types::Color;
+                        // LAYER COLOR <name> <colour>  |  LAYER COLOR <colour> <name>
+                        // The colour is an ACI index or one of the names the
+                        // layer manager offers (RED, BYLAYER, ...), the same
+                        // values `-LAYER COLOR` takes.
+                        let first = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                        let second = parts.get(2).map(|s| s.trim()).unwrap_or("");
+                        let exists = |name: &str| {
+                            self.tabs[i].scene.document.layers.contains(name)
+                        };
+                        let parsed = if !first.is_empty() && exists(first) {
+                            crate::ui::window::attman_dialog::parse_color(second)
+                                .map(|color| (first.to_string(), color))
                         } else {
-                            self.command_line
-                                .push_error(crate::t!("Usage: LAYER COLOR <name> <aci_index>").as_ref());
-                        }
+                            crate::ui::window::attman_dialog::parse_color(first)
+                                .filter(|_| !second.is_empty() && exists(second))
+                                .map(|color| (second.to_string(), color))
+                        };
+                        let Some((layer_name, color)) = parsed else {
+                            self.command_line.push_error(
+                                crate::t!("Usage: LAYER COLOR <name> <color>").as_ref(),
+                            );
+                            return Some(Task::none());
+                        };
+                        self.push_undo_snapshot(i, "LAYER COLOR");
+                        let Some(layer) =
+                            self.tabs[i].scene.document.layers.get_mut(&layer_name)
+                        else {
+                            self.command_line.push_error(
+                                crate::tf!("LAYER: '{}' not found.", layer_name).as_ref(),
+                            );
+                            return Some(Task::none());
+                        };
+                        layer.color = color;
+                        layer.color_name = None;
+                        layer.book_name = None;
+                        self.tabs[i].dirty = true;
+                        // By-layer colour is baked into every wire on this
+                        // layer. The dependency index maps block children back
+                        // to their top-level INSERTs, so unrelated entities
+                        // stay warm.
+                        self.tabs[i]
+                            .scene
+                            .invalidate_layer_dependencies(std::slice::from_ref(&layer_name));
+                        let shown = match color {
+                            Color::Index(idx) => crate::tf!("ACI {idx}"),
+                            Color::ByLayer => crate::tf!("ByLayer"),
+                            Color::ByBlock => crate::tf!("ByBlock"),
+                            Color::None => crate::tf!("None"),
+                            Color::Rgb { r, g, b } => crate::tf!("RGB {r},{g},{b}"),
+                        };
+                        self.command_line.push_output(
+                            crate::tf!("LAYER: '{}' color set to {}.", layer_name, shown).as_ref(),
+                        );
                     }
                     "SET" | "S" | "CURRENT" => {
                         let name = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
                         if self.tabs[i].scene.document.layers.contains(&name) {
                             self.tabs[i].layers.current_layer = name.clone();
-                            self.command_line
-                                .push_output(crate::tf!("LAYER: current layer set to '{}'.", name).as_ref());
+                            self.command_line.push_output(
+                                crate::tf!("LAYER: current layer set to '{}'.", name).as_ref(),
+                            );
                         } else {
                             self.command_line
                                 .push_error(crate::tf!("LAYER: '{}' not found.", name).as_ref());
@@ -167,7 +206,7 @@ impl OpenCADStudio {
                     }
                     _ => {
                         self.command_line.push_info(
-                            crate::t!("Usage: LAYER LIST | NEW <name> | ON/OFF/FREEZE/THAW/LOCK/UNLOCK <name> | COLOR <name> <aci> | SET <name>").as_ref()
+                            crate::t!("Usage: LAYER LIST | NEW <name> | ON/OFF/FREEZE/THAW/LOCK/UNLOCK <name> | COLOR <name> <color> | SET <name>").as_ref()
                         );
                     }
                 }
@@ -186,8 +225,8 @@ impl OpenCADStudio {
             // ── UCS management (inline `UCS <option> …`) ─────────────────────
             cmd if cmd.starts_with("UCS ") => {
                 use super::super::helpers::{ucs_rotated_z, ucs_to_wcs, ucs_z_axis};
-                use codec::tables::Ucs;
-                use codec::types::Vector3;
+                use document::tables::Ucs;
+                use document::types::Vector3;
                 let parts: Vec<&str> = cmd.splitn(4, ' ').collect();
                 let sub = parts.get(1).map(|s| s.to_uppercase()).unwrap_or_default();
                 let mut active_changed = false;
@@ -206,22 +245,29 @@ impl OpenCADStudio {
                             .map(|u| u.name.clone())
                             .collect();
                         if names.is_empty() {
-                            self.command_line.push_output(crate::tf!(
-                                "Active UCS: {}  |  No named UCSs defined.",
-                                active_name
-                            ).as_ref());
+                            self.command_line.push_output(
+                                crate::tf!(
+                                    "Active UCS: {}  |  No named UCSs defined.",
+                                    active_name
+                                )
+                                .as_ref(),
+                            );
                         } else {
-                            self.command_line.push_output(crate::tf!(
-                                "Active UCS: {}  |  Named: {}",
-                                active_name,
-                                names.join(", ")
-                            ).as_ref());
+                            self.command_line.push_output(
+                                crate::tf!(
+                                    "Active UCS: {}  |  Named: {}",
+                                    active_name,
+                                    names.join(", ")
+                                )
+                                .as_ref(),
+                            );
                         }
                     }
                     "SAVE" | "S" => {
                         let name = parts.get(2).map(|s| s.trim()).unwrap_or("").to_string();
                         if name.is_empty() {
-                            self.command_line.push_error(crate::t!("Usage: UCS SAVE <name>").as_ref());
+                            self.command_line
+                                .push_error(crate::t!("Usage: UCS SAVE <name>").as_ref());
                         } else {
                             // Save the current active UCS under this name.
                             let mut ucs = match &self.tabs[i].active_ucs {
@@ -239,14 +285,9 @@ impl OpenCADStudio {
                                 .get(&name)
                                 .map(|existing| existing.handle)
                                 .filter(|handle| !handle.is_null())
-                                .unwrap_or_else(|| {
-                                    self.tabs[i].scene.document.allocate_handle()
-                                });
-                            self.tabs[i]
-                                .scene
-                                .document
-                                .ucss
-                                .add_or_replace(ucs.clone());
+                                .unwrap_or_else(|| self.tabs[i].scene.document.allocate_handle());
+                            self.tabs[i].scene.document.ucss.add_or_replace(ucs.clone());
+                            self.tabs[i].scene.bump_ucs_epoch();
                             self.tabs[i].active_ucs = Some(ucs);
                             active_changed = true;
                             self.tabs[i].dirty = true;
@@ -257,28 +298,30 @@ impl OpenCADStudio {
                     "DELETE" | "DEL" | "D" => {
                         let name = parts.get(2).map(|s| s.trim()).unwrap_or("").to_string();
                         if name.is_empty() {
-                            self.command_line.push_error(crate::t!("Usage: UCS DELETE <name>").as_ref());
-                        } else if let Some(removed) =
-                            self.tabs[i].scene.document.ucss.remove(&name)
+                            self.command_line
+                                .push_error(crate::t!("Usage: UCS DELETE <name>").as_ref());
+                        } else if let Some(removed) = self.tabs[i].scene.document.ucss.remove(&name)
                         {
+                            self.tabs[i].scene.bump_ucs_epoch();
                             let removed_handle = removed.handle;
                             for entity in self.tabs[i].scene.document.entities_mut() {
-                                if let codec::EntityType::Viewport(viewport) = entity {
+                                if let document::EntityType::Viewport(viewport) = entity {
                                     if viewport.ucs_handle == removed_handle {
-                                        viewport.ucs_handle = codec::Handle::NULL;
+                                        viewport.ucs_handle = document::Handle::NULL;
                                     }
                                 }
                             }
-                            let active_matches = self.tabs[i].active_ucs.as_ref().is_some_and(|ucs| {
-                                (!removed_handle.is_null() && ucs.handle == removed_handle)
-                                    || ucs.name.eq_ignore_ascii_case(&name)
-                            });
+                            let active_matches =
+                                self.tabs[i].active_ucs.as_ref().is_some_and(|ucs| {
+                                    (!removed_handle.is_null() && ucs.handle == removed_handle)
+                                        || ucs.name.eq_ignore_ascii_case(&name)
+                                });
                             if active_matches {
                                 if let Some(active) = self.tabs[i].active_ucs.as_mut() {
                                     active.name = "*ACTIVE*".to_string();
-                                    active.handle = codec::Handle::NULL;
-                                    active.named_ucs_handle = codec::Handle::NULL;
-                                    active.base_ucs_handle = codec::Handle::NULL;
+                                    active.handle = document::Handle::NULL;
+                                    active.named_ucs_handle = document::Handle::NULL;
+                                    active.base_ucs_handle = document::Handle::NULL;
                                 }
                                 active_changed = true;
                             }
@@ -293,8 +336,9 @@ impl OpenCADStudio {
                     "W" | "WORLD" => {
                         self.tabs[i].active_ucs = None;
                         active_changed = true;
-                        self.command_line
-                            .push_output(crate::t!("UCS reset to World Coordinate System.").as_ref());
+                        self.command_line.push_output(
+                            crate::t!("UCS reset to World Coordinate System.").as_ref(),
+                        );
                     }
                     "VIEW" | "V" => {
                         let rotation = self.tabs[i].scene.active_camera_rotation();
@@ -325,7 +369,7 @@ impl OpenCADStudio {
                             .and_then(|token| {
                                 u64::from_str_radix(token.trim().trim_start_matches("0x"), 16).ok()
                             })
-                            .map(codec::Handle::new)
+                            .map(document::Handle::new)
                             .zip(
                                 parts
                                     .get(3)
@@ -343,22 +387,25 @@ impl OpenCADStudio {
                                 self.tabs[i].active_cmd = Some(Box::new(picker));
                             }
                             Some((handle, pick)) => {
-                                let built = self.tabs[i]
-                                    .scene
-                                    .solid_models
-                                    .get(&handle)
-                                    .and_then(|body| {
-                                        use crate::scene::model::solid_model;
-                                        let face =
-                                            solid_model::nearest_planar_face(body, pick.to_array())?;
-                                        solid_model::planar_face_normal(body, face)
-                                    })
-                                    .and_then(|normal| {
-                                        super::super::helpers::ucs_from_normal(
-                                            pick,
-                                            glam::DVec3::from_array(normal),
-                                        )
-                                    });
+                                self.tabs[i].scene.set_ducs_face_at(None);
+                                self.tabs[i].scene.restore_solid_models(&[handle]);
+                                let built =
+                                    self.tabs[i]
+                                        .scene
+                                        .solid_models
+                                        .get(&handle)
+                                        .and_then(|body| {
+                                            use crate::scene::model::solid_model;
+                                            let face = solid_model::nearest_planar_face(
+                                                body,
+                                                pick.to_array(),
+                                            )?;
+                                            solid_model::planar_face_ucs(
+                                                body,
+                                                face,
+                                                pick.to_array(),
+                                            )
+                                        });
                                 match built {
                                     Some(ucs) => {
                                         self.tabs[i].active_ucs = Some(ucs);
@@ -384,7 +431,7 @@ impl OpenCADStudio {
                             .and_then(|token| {
                                 u64::from_str_radix(token.trim().trim_start_matches("0x"), 16).ok()
                             })
-                            .map(codec::Handle::new);
+                            .map(document::Handle::new);
                         match target {
                             // Bare `UCS OBJECT` starts the pick; the click
                             // comes back through this arm with the handle.
@@ -398,7 +445,9 @@ impl OpenCADStudio {
                                     .scene
                                     .document
                                     .get_entity(handle)
-                                    .and_then(crate::scene::model::sweep_model::extrusion_profile_of)
+                                    .and_then(
+                                        crate::scene::model::sweep_model::extrusion_profile_of,
+                                    )
                                     .and_then(|(profile, _)| {
                                         // The profile plane already carries the
                                         // entity's own in-plane axes, so adopt
@@ -410,8 +459,7 @@ impl OpenCADStudio {
                                         let plane = profile.plane;
                                         let x = glam::DVec3::from_array(plane.x_axis);
                                         let y = glam::DVec3::from_array(plane.y_axis);
-                                        if x.length_squared() < 1e-12
-                                            || y.length_squared() < 1e-12
+                                        if x.length_squared() < 1e-12 || y.length_squared() < 1e-12
                                         {
                                             return None;
                                         }
@@ -421,10 +469,8 @@ impl OpenCADStudio {
                                             plane.origin[1],
                                             plane.origin[2],
                                         );
-                                        ucs.x_axis =
-                                            Vector3::new(x.x, x.y, x.z);
-                                        ucs.y_axis =
-                                            Vector3::new(y.x, y.y, y.z);
+                                        ucs.x_axis = Vector3::new(x.x, x.y, x.z);
+                                        ucs.y_axis = Vector3::new(y.x, y.y, y.z);
                                         Some(ucs)
                                     });
                                 match built {
@@ -505,12 +551,18 @@ impl OpenCADStudio {
                                 wcs_origin.z as f64,
                             );
                             active_changed = true;
-                            self.command_line.push_output(crate::tf!(
-                                "UCS origin set to ({:.4}, {:.4}, {:.4}).",
-                                wcs_origin.x, wcs_origin.y, wcs_origin.z
-                            ).as_ref());
+                            self.command_line.push_output(
+                                crate::tf!(
+                                    "UCS origin set to ({:.4}, {:.4}, {:.4}).",
+                                    wcs_origin.x,
+                                    wcs_origin.y,
+                                    wcs_origin.z
+                                )
+                                .as_ref(),
+                            );
                         } else {
-                            self.command_line.push_error(crate::t!("Usage: UCS ORIGIN x,y,z").as_ref());
+                            self.command_line
+                                .push_error(crate::t!("Usage: UCS ORIGIN x,y,z").as_ref());
                         }
                     }
                     // UCS Z angle  — rotate active UCS around its Z axis by degrees
@@ -520,9 +572,7 @@ impl OpenCADStudio {
                             let rad = angle_deg.to_radians();
                             let current = self.tabs[i].active_ucs.as_ref();
                             let origin = current
-                                .map(|u| {
-                                    glam::DVec3::new(u.origin.x, u.origin.y, u.origin.z)
-                                })
+                                .map(|u| glam::DVec3::new(u.origin.x, u.origin.y, u.origin.z))
                                 .unwrap_or(glam::DVec3::ZERO);
                             let mut new_ucs = ucs_rotated_z(origin, rad);
                             // If already had axes, compose rotation on top
@@ -548,10 +598,12 @@ impl OpenCADStudio {
                             }
                             self.tabs[i].active_ucs = Some(new_ucs);
                             active_changed = true;
-                            self.command_line
-                                .push_output(crate::tf!("UCS rotated {:.2}° around Z.", angle_deg).as_ref());
+                            self.command_line.push_output(
+                                crate::tf!("UCS rotated {:.2}° around Z.", angle_deg).as_ref(),
+                            );
                         } else {
-                            self.command_line.push_error(crate::t!("Usage: UCS Z <angle_degrees>").as_ref());
+                            self.command_line
+                                .push_error(crate::t!("Usage: UCS Z <angle_degrees>").as_ref());
                         }
                     }
                     // UCS X angle  — rotate around current UCS X axis
@@ -576,10 +628,12 @@ impl OpenCADStudio {
                             let ny = rot * old_y;
                             ucs.y_axis = Vector3::new(ny.x as f64, ny.y as f64, ny.z as f64);
                             active_changed = true;
-                            self.command_line
-                                .push_output(crate::tf!("UCS rotated {:.2}° around X.", angle_deg).as_ref());
+                            self.command_line.push_output(
+                                crate::tf!("UCS rotated {:.2}° around X.", angle_deg).as_ref(),
+                            );
                         } else {
-                            self.command_line.push_error(crate::t!("Usage: UCS X <angle_degrees>").as_ref());
+                            self.command_line
+                                .push_error(crate::t!("Usage: UCS X <angle_degrees>").as_ref());
                         }
                     }
                     // UCS Y angle  — rotate around current UCS Y axis
@@ -604,10 +658,12 @@ impl OpenCADStudio {
                             let nx = rot * old_x;
                             ucs.x_axis = Vector3::new(nx.x as f64, nx.y as f64, nx.z as f64);
                             active_changed = true;
-                            self.command_line
-                                .push_output(crate::tf!("UCS rotated {:.2}° around Y.", angle_deg).as_ref());
+                            self.command_line.push_output(
+                                crate::tf!("UCS rotated {:.2}° around Y.", angle_deg).as_ref(),
+                            );
                         } else {
-                            self.command_line.push_error(crate::t!("Usage: UCS Y <angle_degrees>").as_ref());
+                            self.command_line
+                                .push_error(crate::t!("Usage: UCS Y <angle_degrees>").as_ref());
                         }
                     }
                     _ => {
@@ -644,8 +700,7 @@ impl OpenCADStudio {
             cmd if cmd == "CREATESKETCH" || cmd.starts_with("CREATESKETCH ") => {
                 if self.tabs[i].sketch_session.is_some() {
                     self.command_line.push_error(
-                        crate::t!("A sketch is already open — FINISHSKETCH closes it.")
-                            .as_ref(),
+                        crate::t!("A sketch is already open — FINISHSKETCH closes it.").as_ref(),
                     );
                     return Some(Task::none());
                 }
@@ -664,10 +719,8 @@ impl OpenCADStudio {
                     self.commit_active_ucs_change(i, "CREATESKETCH");
                 } else if !arg.is_empty() {
                     self.command_line.push_error(
-                        crate::t!(
-                            "Usage: CREATESKETCH [XY|XZ|YZ]; bare uses the current UCS."
-                        )
-                        .as_ref(),
+                        crate::t!("Usage: CREATESKETCH [XY|XZ|YZ]; bare uses the current UCS.")
+                            .as_ref(),
                     );
                     return Some(Task::none());
                 }
@@ -682,15 +735,7 @@ impl OpenCADStudio {
                     // rearrange themselves on upgrade for a panel they have
                     // not asked for.
                     let id = crate::ui::dock::PanelId::Browser;
-                    if self.dock.location(id).is_none() {
-                        // dock() clamps an out-of-range index to the end of
-                        // the edge, so this appends below whatever is there.
-                        self.dock
-                            .dock(id, crate::app::config::DockSide::Right, usize::MAX);
-                    }
-                    // Open expanded so it is usable straight away; the pin
-                    // button still collapses it.
-                    self.dock_expanded = Some(id);
+                    self.dock_open_at_default(id);
                     self.command_line
                         .push_output(crate::t!("Browser opened.").as_ref());
                 } else {
@@ -723,16 +768,19 @@ impl OpenCADStudio {
                     "" | "CURRENT" | "C" => {
                         let r = self.tabs[i].scene.viewcube_ucs_mat();
                         self.plan_snap(i, r);
-                        self.command_line.push_output(crate::t!("PLAN: current UCS plan view.").as_ref());
+                        self.command_line
+                            .push_output(crate::t!("PLAN: current UCS plan view.").as_ref());
                     }
                     "WORLD" | "W" => {
                         self.plan_snap(i, glam::Mat4::IDENTITY);
-                        self.command_line.push_output(crate::t!("PLAN: world plan view.").as_ref());
+                        self.command_line
+                            .push_output(crate::t!("PLAN: world plan view.").as_ref());
                     }
                     "UCS" | "U" => {
                         let name = parts.get(2).map(|s| s.trim()).unwrap_or("");
                         if name.is_empty() {
-                            self.command_line.push_info(crate::t!("Usage: PLAN UCS <name>").as_ref());
+                            self.command_line
+                                .push_info(crate::t!("Usage: PLAN UCS <name>").as_ref());
                         } else {
                             let ucs = self.tabs[i]
                                 .scene
@@ -743,13 +791,12 @@ impl OpenCADStudio {
                                 .cloned();
                             match ucs {
                                 Some(u) => {
-                                    let r = crate::app::helpers::UcsXform::from_ucs(&u)
-                                        .rotation_mat();
+                                    let r =
+                                        crate::app::helpers::UcsXform::from_ucs(&u).rotation_mat();
                                     self.plan_snap(i, r);
-                                    self.command_line.push_output(crate::tf!(
-                                        "PLAN: plan view of UCS '{}'.",
-                                        u.name
-                                    ).as_ref());
+                                    self.command_line.push_output(
+                                        crate::tf!("PLAN: plan view of UCS '{}'.", u.name).as_ref(),
+                                    );
                                 }
                                 None => self
                                     .command_line
@@ -757,12 +804,29 @@ impl OpenCADStudio {
                             }
                         }
                     }
-                    _ => self
-                        .command_line
-                        .push_info(crate::t!("Usage: PLAN [CURRENT / UCS <name> / WORLD]").as_ref()),
+                    _ => self.command_line.push_info(
+                        crate::t!("Usage: PLAN [CURRENT / UCS <name> / WORLD]").as_ref(),
+                    ),
                 }
             }
 
+            // -VIEW: the command-line form of VIEW (modules/view/view_cmd.rs).
+            // The command gathers the input; `-VIEW >…` carries out what it
+            // gathered. A whole line (`-VIEW _O _FRONT`) feeds its words to
+            // the command one by one, as typed.
+            "-VIEW" => {
+                use crate::command::CadCommand;
+                let c =
+                    crate::modules::view::view_cmd::DashViewCommand::new(self.dash_view_names(i));
+                self.command_line.push_info(&c.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(c));
+            }
+            cmd if cmd.starts_with("-VIEW >") => {
+                return Some(self.run_dash_view(&cmd["-VIEW >".len()..], i));
+            }
+            cmd if cmd.starts_with("-VIEW ") => {
+                return Some(self.run_command_line(cmd));
+            }
             "VIEW" => {
                 use crate::command::KeywordCommand;
                 let c = KeywordCommand::new(
@@ -791,16 +855,19 @@ impl OpenCADStudio {
                             .map(|v| v.name.clone())
                             .collect();
                         if views.is_empty() {
-                            self.command_line.push_output(crate::t!("No named views saved.").as_ref());
-                        } else {
                             self.command_line
-                                .push_output(crate::tf!("Named views: {}", views.join(", ")).as_ref());
+                                .push_output(crate::t!("No named views saved.").as_ref());
+                        } else {
+                            self.command_line.push_output(
+                                crate::tf!("Named views: {}", views.join(", ")).as_ref(),
+                            );
                         }
                     }
                     "SAVE" | "S" => {
                         let name = parts.get(2).map(|s| s.trim()).unwrap_or("").to_string();
                         if name.is_empty() {
-                            self.command_line.push_error(crate::t!("Usage: VIEW SAVE <name>").as_ref());
+                            self.command_line
+                                .push_error(crate::t!("Usage: VIEW SAVE <name>").as_ref());
                         } else {
                             let new_view = self.tabs[i].scene.current_as_named_view(&name);
                             self.tabs[i].scene.document.views.add_or_replace(new_view);
@@ -808,12 +875,59 @@ impl OpenCADStudio {
                                 .push_output(crate::tf!("View '{}' saved.", name).as_ref());
                         }
                     }
+                    "WINDOW" | "W" => {
+                        // A plan view of the window between two corners.
+                        let args: Vec<&str> = parts
+                            .get(2)
+                            .map(|s| s.split_whitespace().collect())
+                            .unwrap_or_default();
+                        let corner = |s: &str| {
+                            let mut c = s.split(',');
+                            Some((
+                                c.next()?.trim().parse::<f64>().ok()?,
+                                c.next()?.trim().parse::<f64>().ok()?,
+                            ))
+                        };
+                        match (
+                            args.first(),
+                            args.get(1).and_then(|s| corner(s)),
+                            args.get(2).and_then(|s| corner(s)),
+                        ) {
+                            (Some(name), Some(a), Some(b)) if a.0 != b.0 && a.1 != b.1 => {
+                                use document::types::Vector3;
+                                let mut view = self.tabs[i].scene.current_as_named_view(name);
+                                view.target = Vector3 {
+                                    x: (a.0 + b.0) / 2.0,
+                                    y: (a.1 + b.1) / 2.0,
+                                    z: 0.0,
+                                };
+                                view.direction = Vector3 {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    z: 1.0,
+                                };
+                                view.width = (b.0 - a.0).abs();
+                                view.height = (b.1 - a.1).abs();
+                                self.tabs[i].scene.document.views.add_or_replace(view);
+                                self.command_line
+                                    .push_output(crate::tf!("View '{}' saved.", name).as_ref());
+                            }
+                            _ => self.command_line.push_error(
+                                crate::t!("Usage: VIEW WINDOW <name> <x1,y1> <x2,y2>").as_ref(),
+                            ),
+                        }
+                    }
                     "DELETE" | "DEL" | "D" => {
                         let name = parts.get(2).map(|s| s.trim()).unwrap_or("").to_string();
                         if name.is_empty() {
-                            self.command_line.push_error(crate::t!("Usage: VIEW DELETE <name>").as_ref());
+                            self.command_line
+                                .push_error(crate::t!("Usage: VIEW DELETE <name>").as_ref());
                         } else {
-                            if self.tabs[i].scene.document.views.remove(&name).is_some() {
+                            if let Some(view) = self.tabs[i].scene.document.views.remove(&name) {
+                                crate::scene::erase_background(
+                                    &mut self.tabs[i].scene.document,
+                                    view.background_handle,
+                                );
                                 self.command_line
                                     .push_output(crate::tf!("View '{}' deleted.", name).as_ref());
                             } else {
@@ -825,47 +939,38 @@ impl OpenCADStudio {
                     "RESTORE" | "R" => {
                         let name = parts.get(2).map(|s| s.trim()).unwrap_or("").to_string();
                         if name.is_empty() {
-                            self.command_line.push_error(crate::t!("Usage: VIEW RESTORE <name>").as_ref());
+                            self.command_line
+                                .push_error(crate::t!("Usage: VIEW RESTORE <name>").as_ref());
                         } else {
                             let found = self.tabs[i].scene.document.views.get(&name).cloned();
                             if let Some(v) = found {
                                 self.tabs[i].scene.restore_named_view(&v);
-                                self.command_line
-                                    .push_output(crate::tf!("View '{}' restored.", v.name).as_ref());
+                                self.apply_view_render_mode(i, &v);
+                                self.command_line.push_output(
+                                    crate::tf!("View '{}' restored.", v.name).as_ref(),
+                                );
                             } else {
                                 self.command_line
                                     .push_error(crate::tf!("View '{}' not found.", name).as_ref());
                             }
                         }
                     }
-                    // Standard orientation presets — snap the camera to a world
-                    // axis view (these names take precedence over a same-named
-                    // saved view, matching the standard orientation behaviour).
-                    "TOP" | "FRONT" | "BACK" | "LEFT" | "RIGHT" | "BOTTOM" => {
-                        use crate::scene::pipeline::viewcube::{
-                            FACE_BACK, FACE_BOTTOM, FACE_FRONT, FACE_LEFT, FACE_RIGHT, FACE_TOP,
-                        };
-                        let face = match sub.as_str() {
-                            "TOP" => FACE_TOP,
-                            "BOTTOM" => FACE_BOTTOM,
-                            "FRONT" => FACE_FRONT,
-                            "BACK" => FACE_BACK,
-                            "RIGHT" => FACE_RIGHT,
-                            _ => FACE_LEFT,
-                        };
-                        return Some(Task::done(Message::ViewCubeSnapWorld(
-                            crate::scene::CubeRegion::Face(face),
-                        )));
+                    // Standard orientation presets: the world views -VIEW sets,
+                    // with the orthographic UCS while UCSORTHO is on. These
+                    // names take precedence over a same-named saved view.
+                    "TOP" | "FRONT" | "BACK" | "LEFT" | "RIGHT" | "BOTTOM" | "SWISO" | "SEISO"
+                    | "NEISO" | "NWISO" => {
+                        return Some(self.apply_view_preset(&sub));
                     }
-                    "ISO" | "ISOMETRIC" | "SWISO" => {
-                        return Some(Task::done(Message::ViewCubeHome));
-                    }
+                    // ISO alone is the south-west one.
+                    "ISO" | "ISOMETRIC" => return Some(self.apply_view_preset("SWISO")),
                     // VIEW <name> shortcut for restore
                     _ => {
                         let name = sub.clone();
                         let found = self.tabs[i].scene.document.views.get(&name).cloned();
                         if let Some(v) = found {
                             self.tabs[i].scene.restore_named_view(&v);
+                            self.apply_view_render_mode(i, &v);
                             self.command_line
                                 .push_output(crate::tf!("View '{}' restored.", v.name).as_ref());
                         } else {
@@ -880,7 +985,7 @@ impl OpenCADStudio {
             // ── DimStyle management ───────────────────────────────────────
             // TABLESTYLE — Table Style Manager.
             cmd if cmd == "TABLESTYLE" || cmd == "TS" || cmd.starts_with("TABLESTYLE ") => {
-                use codec::objects::{ObjectType, TableStyle};
+                use document::objects::{ObjectType, TableStyle};
                 let raw_rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
                 let parts: Vec<&str> = raw_rest.split_whitespace().collect();
                 let sub = parts.first().map(|s| s.to_uppercase()).unwrap_or_default();
@@ -903,34 +1008,41 @@ impl OpenCADStudio {
                             .map(|s| {
                                 crate::tf!(
                                     "{}  (h_margin:{:.2} v_margin:{:.2})",
-                                    s.name, s.horizontal_margin, s.vertical_margin
-                                ).into_owned()
+                                    s.name,
+                                    s.horizontal_margin,
+                                    s.vertical_margin
+                                )
+                                .into_owned()
                             })
                             .collect();
                         if styles.is_empty() {
-                            self.command_line.push_output(crate::t!("No table styles.").as_ref());
-                        } else {
                             self.command_line
-                                .push_output(crate::tf!("TableStyles:\n  {}", styles.join("\n  ")).as_ref());
+                                .push_output(crate::t!("No table styles.").as_ref());
+                        } else {
+                            self.command_line.push_output(
+                                crate::tf!("TableStyles:\n  {}", styles.join("\n  ")).as_ref(),
+                            );
                         }
                     }
                     "NEW" | "N" => {
                         let name = parts.get(1).copied().unwrap_or("").to_string();
                         if name.is_empty() {
-                            self.command_line.push_error(crate::t!("Usage: TABLESTYLE NEW <name>").as_ref());
+                            self.command_line
+                                .push_error(crate::t!("Usage: TABLESTYLE NEW <name>").as_ref());
                         } else {
                             let doc = &self.tabs[i].scene.document;
                             let exists = doc.objects.values().any(|o| {
                                 matches!(o, ObjectType::TableStyle(s) if s.name.eq_ignore_ascii_case(&name))
                             });
                             if exists {
-                                self.command_line
-                                    .push_error(crate::tf!("TABLESTYLE: '{}' already exists.", name).as_ref());
+                                self.command_line.push_error(
+                                    crate::tf!("TABLESTYLE: '{}' already exists.", name).as_ref(),
+                                );
                             } else {
                                 self.push_undo_snapshot(i, "TABLESTYLE NEW");
                                 let mut style = TableStyle::standard();
                                 style.name = name.clone();
-                                let nh = codec::Handle::new(
+                                let nh = document::Handle::new(
                                     self.tabs[i].scene.document.next_handle(),
                                 );
                                 style.handle = nh;
@@ -940,14 +1052,177 @@ impl OpenCADStudio {
                                     .objects
                                     .insert(nh, ObjectType::TableStyle(style));
                                 self.tabs[i].dirty = true;
-                                self.command_line
-                                    .push_output(crate::tf!("TABLESTYLE: '{}' created.", name).as_ref());
+                                self.command_line.push_output(
+                                    crate::tf!("TABLESTYLE: '{}' created.", name).as_ref(),
+                                );
                             }
                         }
                     }
+                    "SET" | "S" => {
+                        let name = parts.get(1).copied().unwrap_or("").to_string();
+                        if name.is_empty() {
+                            self.command_line.push_error(
+                                crate::t!(
+                                    "Usage: TABLESTYLE SET <name> [<property> <value>]"
+                                )
+                                .as_ref(),
+                            );
+                        } else {
+                            let doc = &self.tabs[i].scene.document;
+                            let handle = doc.objects.iter().find_map(|(handle, object)| {
+                                match object {
+                                    ObjectType::TableStyle(s)
+                                        if s.name.eq_ignore_ascii_case(&name) =>
+                                    {
+                                        Some(*handle)
+                                    }
+                                    _ => None,
+                                }
+                            });
+                            let Some(handle) = handle else {
+                                self.command_line.push_error(
+                                    crate::tf!("TABLESTYLE: no table style named '{name}'.")
+                                        .as_ref(),
+                                );
+                                return Some(Task::none());
+                            };
+                            if parts.len() < 4 {
+                                self.push_undo_snapshot(i, "TABLESTYLE SET");
+                                let doc = &mut self.tabs[i].scene.document;
+                                let style_name = match doc.objects.get(&handle) {
+                                    Some(ObjectType::TableStyle(s)) => s.name.clone(),
+                                    _ => name.clone(),
+                                };
+                                doc.header.current_table_style_name = style_name.clone();
+                                self.tabs[i].dirty = true;
+                                self.command_line.push_output(
+                                    crate::tf!("Table style set to '{style_name}'.").as_ref(),
+                                );
+                                return Some(Task::none());
+                            }
+                            // `SET <name> <property> <value>` authors the
+                            // style itself: margins, text, row visibility and
+                            // the annotative flag, the properties the style
+                            // manager edits.
+                            enum Change {
+                                HorizontalMargin(f64),
+                                VerticalMargin(f64),
+                                BothMargins(f64),
+                                TextHeight(f64),
+                                TextStyle(String, Option<document::Handle>),
+                                Title(bool),
+                                Header(bool),
+                                Annotative(bool),
+                            }
+                            let property = parts[2].to_ascii_lowercase().replace(['_', '-'], "");
+                            let value = parts[3];
+                            let number = |minimum: f64| {
+                                value
+                                    .parse::<f64>()
+                                    .ok()
+                                    .filter(|v| v.is_finite() && *v >= minimum)
+                            };
+                            let flag = |value: &str| {
+                                match value.to_ascii_uppercase().as_str() {
+                                    "1" | "YES" | "TRUE" | "ON" => Some(true),
+                                    "0" | "NO" | "FALSE" | "OFF" => Some(false),
+                                    _ => None,
+                                }
+                            };
+                            let change = match property.as_str() {
+                                "hmargin" | "horizontalmargin" => {
+                                    number(0.0).map(Change::HorizontalMargin)
+                                }
+                                "vmargin" | "verticalmargin" => {
+                                    number(0.0).map(Change::VerticalMargin)
+                                }
+                                "margin" | "cellmargin" => number(0.0).map(Change::BothMargins),
+                                "textheight" | "height" => number(0.0).map(Change::TextHeight),
+                                "textstyle" | "style" => {
+                                    self.tabs[i].scene.document.text_styles.get(value).map(
+                                        |text_style| {
+                                            Change::TextStyle(
+                                                text_style.name.clone(),
+                                                Some(text_style.handle),
+                                            )
+                                        },
+                                    )
+                                }
+                                "title" | "titlerow" => flag(value).map(Change::Title),
+                                "header" | "headerrow" => flag(value).map(Change::Header),
+                                "annotative" => flag(value).map(Change::Annotative),
+                                _ => {
+                                    self.command_line.push_error(
+                                        crate::tf!(
+                                            "TABLESTYLE: unknown property '{property}'. Try: hmargin vmargin margin textheight textstyle title header annotative"
+                                        )
+                                        .as_ref(),
+                                    );
+                                    return Some(Task::none());
+                                }
+                            };
+                            let Some(change) = change else {
+                                self.command_line.push_error(
+                                    crate::tf!(
+                                        "TABLESTYLE: '{value}' is not a valid value for {property}."
+                                    )
+                                    .as_ref(),
+                                );
+                                return Some(Task::none());
+                            };
+                            self.push_undo_snapshot(i, "TABLESTYLE SET");
+                            let doc = &mut self.tabs[i].scene.document;
+                            let Some(ObjectType::TableStyle(style)) = doc.objects.get_mut(&handle)
+                            else {
+                                return Some(Task::none());
+                            };
+                            let summary = match change {
+                                Change::HorizontalMargin(margin) => {
+                                    style.horizontal_margin = margin;
+                                    crate::tf!("horizontal margin = {margin:.3}")
+                                }
+                                Change::VerticalMargin(margin) => {
+                                    style.vertical_margin = margin;
+                                    crate::tf!("vertical margin = {margin:.3}")
+                                }
+                                Change::BothMargins(margin) => {
+                                    style.set_margins(margin);
+                                    crate::tf!("cell margin = {margin:.3}")
+                                }
+                                Change::TextHeight(height) => {
+                                    style.set_all_text_heights(height);
+                                    crate::tf!("text height = {height:.3}")
+                                }
+                                Change::TextStyle(text_style, text_handle) => {
+                                    style.set_all_text_styles(&text_style, text_handle);
+                                    crate::tf!("text style = {text_style}")
+                                }
+                                Change::Title(visible) => {
+                                    style.set_title_visible(visible);
+                                    crate::tf!("title row = {}", if visible { "shown" } else { "hidden" })
+                                }
+                                Change::Header(visible) => {
+                                    style.set_header_visible(visible);
+                                    crate::tf!("header row = {}", if visible { "shown" } else { "hidden" })
+                                }
+                                Change::Annotative(annotative) => {
+                                    style.annotative = annotative;
+                                    crate::tf!("annotative = {}", u8::from(annotative))
+                                }
+                            };
+                            self.tabs[i]
+                                .scene
+                                .invalidate_object_style_dependencies(&[handle]);
+                            self.tabs[i].dirty = true;
+                            self.command_line.push_output(
+                                crate::tf!("TABLESTYLE: '{name}': {summary}.").as_ref(),
+                            );
+                        }
+                    }
                     _ => {
-                        self.command_line
-                            .push_error(crate::t!("Usage: TABLESTYLE [LIST|NEW <name>]").as_ref());
+                        self.command_line.push_error(
+                            crate::t!("Usage: TABLESTYLE [LIST|NEW <name>|SET <name>]").as_ref(),
+                        );
                     }
                 }
             }
@@ -960,7 +1235,7 @@ impl OpenCADStudio {
             //   MLSTYLE SET <name>     — set current multiline style
             //   MLSTYLE DEL <name>     — delete a style (not Standard)
             cmd if cmd == "MLSTYLE" || cmd.starts_with("MLSTYLE ") => {
-                use codec::objects::{MLineStyle, ObjectType};
+                use document::objects::{MLineStyle, ObjectType};
                 let raw_rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
                 let parts: Vec<&str> = raw_rest.split_whitespace().collect();
                 let sub = parts.first().map(|s| s.to_uppercase()).unwrap_or_default();
@@ -987,29 +1262,33 @@ impl OpenCADStudio {
                             })
                             .collect();
                         if styles.is_empty() {
-                            self.command_line.push_output(crate::t!("No multiline styles.").as_ref());
-                        } else {
                             self.command_line
-                                .push_output(crate::tf!("MLineStyles:\n  {}", styles.join("\n  ")).as_ref());
+                                .push_output(crate::t!("No multiline styles.").as_ref());
+                        } else {
+                            self.command_line.push_output(
+                                crate::tf!("MLineStyles:\n  {}", styles.join("\n  ")).as_ref(),
+                            );
                         }
                     }
                     "NEW" | "N" => {
                         let name = parts.get(1).copied().unwrap_or("").to_string();
                         if name.is_empty() {
-                            self.command_line.push_error(crate::t!("Usage: MLSTYLE NEW <name>").as_ref());
+                            self.command_line
+                                .push_error(crate::t!("Usage: MLSTYLE NEW <name>").as_ref());
                         } else {
                             let doc = &self.tabs[i].scene.document;
                             let exists = doc.objects.values().any(|o| {
                                 matches!(o, ObjectType::MLineStyle(s) if s.name.eq_ignore_ascii_case(&name))
                             });
                             if exists {
-                                self.command_line
-                                    .push_error(crate::tf!("MLSTYLE: '{}' already exists.", name).as_ref());
+                                self.command_line.push_error(
+                                    crate::tf!("MLSTYLE: '{}' already exists.", name).as_ref(),
+                                );
                             } else {
                                 self.push_undo_snapshot(i, "MLSTYLE NEW");
                                 let mut style = MLineStyle::standard();
                                 style.name = name.clone();
-                                let nh = codec::Handle::new(
+                                let nh = document::Handle::new(
                                     self.tabs[i].scene.document.next_handle(),
                                 );
                                 style.handle = nh;
@@ -1019,15 +1298,17 @@ impl OpenCADStudio {
                                     .objects
                                     .insert(nh, ObjectType::MLineStyle(style));
                                 self.tabs[i].dirty = true;
-                                self.command_line
-                                    .push_output(crate::tf!("MLSTYLE: '{}' created.", name).as_ref());
+                                self.command_line.push_output(
+                                    crate::tf!("MLSTYLE: '{}' created.", name).as_ref(),
+                                );
                             }
                         }
                     }
                     "SET" | "S" => {
                         let name = parts.get(1).copied().unwrap_or("").to_string();
                         if name.is_empty() {
-                            self.command_line.push_error(crate::t!("Usage: MLSTYLE SET <name>").as_ref());
+                            self.command_line
+                                .push_error(crate::t!("Usage: MLSTYLE SET <name>").as_ref());
                         } else {
                             let doc = &self.tabs[i].scene.document;
                             let exists = doc.objects.values().any(|o| {
@@ -1037,21 +1318,23 @@ impl OpenCADStudio {
                                 self.push_undo_snapshot(i, "MLSTYLE SET");
                                 self.tabs[i].scene.document.header.multiline_style = name.clone();
                                 self.tabs[i].dirty = true;
-                                self.command_line.push_output(crate::tf!(
-                                    "MLSTYLE: current style set to '{}'.",
-                                    name
-                                ).as_ref());
+                                self.command_line.push_output(
+                                    crate::tf!("MLSTYLE: current style set to '{}'.", name)
+                                        .as_ref(),
+                                );
                             } else {
-                                self.command_line
-                                    .push_error(crate::tf!("MLSTYLE: '{}' not found.", name).as_ref());
+                                self.command_line.push_error(
+                                    crate::tf!("MLSTYLE: '{}' not found.", name).as_ref(),
+                                );
                             }
                         }
                     }
                     "DEL" | "DELETE" => {
                         let name = parts.get(1).copied().unwrap_or("").to_string();
                         if name.is_empty() || name.eq_ignore_ascii_case("Standard") {
-                            self.command_line
-                                .push_error(crate::t!("Cannot delete the Standard style.").as_ref());
+                            self.command_line.push_error(
+                                crate::t!("Cannot delete the Standard style.").as_ref(),
+                            );
                         } else {
                             let doc = &self.tabs[i].scene.document;
                             let handle = doc.objects.iter().find_map(|(&h, o)| {
@@ -1069,17 +1352,21 @@ impl OpenCADStudio {
                                 self.push_undo_snapshot(i, "MLSTYLE DEL");
                                 self.tabs[i].scene.document.objects.remove(&h);
                                 self.tabs[i].dirty = true;
-                                self.command_line
-                                    .push_output(crate::tf!("MLSTYLE: '{}' deleted.", name).as_ref());
+                                self.command_line.push_output(
+                                    crate::tf!("MLSTYLE: '{}' deleted.", name).as_ref(),
+                                );
                             } else {
-                                self.command_line
-                                    .push_error(crate::tf!("MLSTYLE: '{}' not found.", name).as_ref());
+                                self.command_line.push_error(
+                                    crate::tf!("MLSTYLE: '{}' not found.", name).as_ref(),
+                                );
                             }
                         }
                     }
                     _ => {
-                        self.command_line
-                            .push_error(crate::t!("Usage: MLSTYLE [LIST|NEW <name>|SET <name>|DEL <name>]").as_ref());
+                        self.command_line.push_error(
+                            crate::t!("Usage: MLSTYLE [LIST|NEW <name>|SET <name>|DEL <name>]")
+                                .as_ref(),
+                        );
                     }
                 }
             }
@@ -1089,10 +1376,10 @@ impl OpenCADStudio {
                 || cmd.starts_with("DIMSTYLE ")
                 || cmd.starts_with("DDIM ") =>
             {
-                use codec::tables::DimStyle;
+                use document::tables::DimStyle;
                 let raw_rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
                 let parts: Vec<&str> = raw_rest.split_whitespace().collect();
-                let sub = parts.get(0).map(|s| s.to_uppercase()).unwrap_or_default();
+                let sub = parts.first().map(|s| s.to_uppercase()).unwrap_or_default();
                 match sub.as_str() {
                     // No sub-command or "DIALOG" → open the DimStyle Manager dialog
                     "" | "DIALOG" | "UI" => {
@@ -1104,22 +1391,29 @@ impl OpenCADStudio {
                             .document
                             .dim_styles
                             .iter()
-                            .map(|s| crate::tf!("{}(txt:{:.2} asz:{:.2})", s.name, s.dimtxt, s.dimasz).into_owned())
+                            .map(|s| {
+                                crate::tf!("{}(txt:{:.2} asz:{:.2})", s.name, s.dimtxt, s.dimasz)
+                                    .into_owned()
+                            })
                             .collect();
                         if styles.is_empty() {
-                            self.command_line.push_output(crate::t!("No dim styles defined.").as_ref());
-                        } else {
                             self.command_line
-                                .push_output(crate::tf!("DimStyles: {}", styles.join(", ")).as_ref());
+                                .push_output(crate::t!("No dim styles defined.").as_ref());
+                        } else {
+                            self.command_line.push_output(
+                                crate::tf!("DimStyles: {}", styles.join(", ")).as_ref(),
+                            );
                         }
                     }
                     "NEW" | "N" => {
                         let name = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
                         if name.is_empty() {
-                            self.command_line.push_error(crate::t!("Usage: DIMSTYLE NEW <name>").as_ref());
-                        } else if self.tabs[i].scene.document.dim_styles.contains(&name) {
                             self.command_line
-                                .push_error(crate::tf!("DIMSTYLE: '{}' already exists.", name).as_ref());
+                                .push_error(crate::t!("Usage: DIMSTYLE NEW <name>").as_ref());
+                        } else if self.tabs[i].scene.document.dim_styles.contains(&name) {
+                            self.command_line.push_error(
+                                crate::tf!("DIMSTYLE: '{}' already exists.", name).as_ref(),
+                            );
                         } else {
                             let undo = self.begin_dim_style_undo(
                                 i,
@@ -1197,32 +1491,43 @@ impl OpenCADStudio {
                                     }
                                 }
                                 self.tabs[i].dirty = true;
-                                self.tabs[i].scene
+                                self.tabs[i]
+                                    .scene
                                     .invalidate_dim_style_dependencies(&style_name);
                                 self.commit_dim_style_undo(i, undo);
-                                self.command_line.push_output(crate::tf!(
-                                    "DIMSTYLE: '{style_name}'.{prop} = {val:.3}"
-                                ).as_ref());
+                                self.command_line.push_output(
+                                    crate::tf!("DIMSTYLE: '{style_name}'.{prop} = {val:.3}")
+                                        .as_ref(),
+                                );
                             } else {
-                                self.command_line
-                                    .push_error(crate::tf!("DIMSTYLE: '{}' not found.", style_name).as_ref());
+                                self.command_line.push_error(
+                                    crate::tf!("DIMSTYLE: '{}' not found.", style_name).as_ref(),
+                                );
                             }
                         } else {
-                            self.command_line
-                                .push_error(crate::t!("Usage: DIMSTYLE SET <name> <property> <value>").as_ref());
+                            self.command_line.push_error(
+                                crate::t!("Usage: DIMSTYLE SET <name> <property> <value>").as_ref(),
+                            );
                         }
                     }
                     _ => {
                         self.command_line.push_info(
-                            crate::t!("Usage: DIMSTYLE LIST | NEW <name> | SET <name> <prop> <val>").as_ref(),
+                            crate::t!(
+                                "Usage: DIMSTYLE LIST | NEW <name> | SET <name> <prop> <val>"
+                            )
+                            .as_ref(),
                         );
                     }
                 }
             }
 
             // ── MLeader Style management ──────────────────────────────────
+            // The multi-line editor opened by the style window's Default text.
+            "_MLEADERSTYLE_TEXT" => {
+                return Some(self.mleader_style_text_back());
+            }
             cmd if cmd == "MLEADERSTYLE" || cmd.starts_with("MLEADERSTYLE ") => {
-                use codec::objects::{MultiLeaderStyle, ObjectType};
+                use document::objects::{MultiLeaderStyle, ObjectType};
                 let raw_rest = cmd.trim_start_matches("MLEADERSTYLE").trim();
                 let parts: Vec<&str> = raw_rest.split_whitespace().collect();
                 let sub = parts.first().map(|s| s.to_uppercase()).unwrap_or_default();
@@ -1231,6 +1536,18 @@ impl OpenCADStudio {
                         return Some(Task::done(Message::MLeaderStyleDialogOpen));
                     }
                     "LIST" | "?" => {
+                        let used: std::collections::HashMap<document::Handle, usize> = self.tabs[i]
+                            .scene
+                            .document
+                            .entities()
+                            .filter_map(|entity| match entity {
+                                document::EntityType::MultiLeader(leader) => leader.style_handle,
+                                _ => None,
+                            })
+                            .fold(std::collections::HashMap::new(), |mut counts, handle| {
+                                *counts.entry(handle).or_insert(0) += 1;
+                                counts
+                            });
                         let styles: Vec<String> = self.tabs[i]
                             .scene
                             .document
@@ -1238,10 +1555,17 @@ impl OpenCADStudio {
                             .values()
                             .filter_map(|o| {
                                 if let ObjectType::MultiLeaderStyle(s) = o {
-                                    Some(crate::tf!(
-                                        "{}(txt:{:.2} asz:{:.2})",
-                                        s.name, s.text_height, s.arrowhead_size
-                                    ).into_owned())
+                                    Some(
+                                        crate::tf!(
+                                            "{}(txt:{:.2} asz:{:.2} landing:{:.2} used:{})",
+                                            s.name,
+                                            s.text_height,
+                                            s.arrowhead_size,
+                                            s.landing_distance,
+                                            used.get(&s.handle).copied().unwrap_or(0)
+                                        )
+                                        .into_owned(),
+                                    )
                                 } else {
                                     None
                                 }
@@ -1249,129 +1573,270 @@ impl OpenCADStudio {
                             .collect();
                         let current = &self.tabs[i].active_mleader_style;
                         if styles.is_empty() {
-                            self.command_line
-                                .push_output(crate::tf!("MLeader styles: (none)  active: {current}").as_ref());
+                            self.command_line.push_output(
+                                crate::tf!("MLeader styles: (none)  active: {current}").as_ref(),
+                            );
                         } else {
-                            self.command_line.push_output(crate::tf!(
-                                "MLeader styles: {}  active: {current}",
-                                styles.join(", ")
-                            ).as_ref());
+                            self.command_line.push_output(
+                                crate::tf!(
+                                    "MLeader styles: {}  active: {current}",
+                                    styles.join(", ")
+                                )
+                                .as_ref(),
+                            );
                         }
                     }
                     "NEW" | "N" => {
                         let name = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
+                        let options: Vec<(String, String)> = parts[2..]
+                            .chunks(2)
+                            .map(|pair| {
+                                (
+                                    pair.first().unwrap_or(&"").to_lowercase(),
+                                    pair.get(1).unwrap_or(&"").to_string(),
+                                )
+                            })
+                            .collect();
                         if name.is_empty() {
-                            self.command_line
-                                .push_error(crate::t!("Usage: MLEADERSTYLE NEW <name>").as_ref());
+                            self.command_line.push_error(
+                                crate::t!("Usage: MLEADERSTYLE NEW <name> [property value …]")
+                                    .as_ref(),
+                            );
+                        } else if !parts[2..].len().is_multiple_of(2) {
+                            self.command_line.push_error(
+                                crate::t!("MLEADERSTYLE: name each option and its value in pairs, e.g. NEW NOTE-2.5 TEXT 2.5 ARROW CLOSED.").as_ref(),
+                            );
+                        } else if parts[2..]
+                            .chunks(2)
+                            .any(|pair| pair.get(1).is_none_or(|value| value.trim().is_empty()))
+                        {
+                            self.command_line.push_error(
+                                crate::t!("MLEADERSTYLE: an option is missing its value.").as_ref(),
+                            );
                         } else {
                             let already_exists = self.tabs[i].scene.document.objects.values().any(
-                                |o| matches!(o, ObjectType::MultiLeaderStyle(s) if s.name == name),
+                                |o| matches!(o, ObjectType::MultiLeaderStyle(s) if s.name.eq_ignore_ascii_case(&name)),
                             );
                             if already_exists {
-                                self.command_line.push_error(crate::tf!(
-                                    "MLEADERSTYLE: '{}' already exists.",
-                                    name
-                                ).as_ref());
+                                self.command_line.push_error(
+                                    crate::tf!("MLEADERSTYLE: '{}' already exists.", name).as_ref(),
+                                );
                             } else {
                                 let handle = self.tabs[i].scene.document.allocate_handle();
                                 let mut style = MultiLeaderStyle::new(&name);
+                                style.description = name.clone();
                                 style.handle = handle;
                                 self.tabs[i]
                                     .scene
                                     .document
                                     .objects
                                     .insert(handle, ObjectType::MultiLeaderStyle(style));
+                                crate::app::style_ops::sync_mleaderstyle_dictionary(
+                                    &mut self.tabs[i].scene.document,
+                                );
                                 self.push_undo_snapshot(i, "MLEADERSTYLE NEW");
+                                let mut applied_options = Vec::new();
+                                for (prop, value) in &options {
+                                    match self.set_mleader_style_property(i, &name, prop, value) {
+                                        Ok(_) => applied_options.push(prop.clone()),
+                                        Err(why) => {
+                                            self.command_line.push_error(
+                                                crate::tf!("MLEADERSTYLE: {why}").as_ref(),
+                                            );
+                                            return Some(Task::none());
+                                        }
+                                    }
+                                }
                                 self.tabs[i].dirty = true;
-                                self.command_line
-                                    .push_output(crate::tf!("MLEADERSTYLE: '{}' created.", name).as_ref());
+                                self.command_line.push_output(
+                                    crate::tf!(
+                                        "MLEADERSTYLE: '{}' created{}{}.",
+                                        name,
+                                        if applied_options.is_empty() {
+                                            ""
+                                        } else {
+                                            " with "
+                                        },
+                                        applied_options.join(", ")
+                                    )
+                                    .as_ref(),
+                                );
                             }
                         }
                     }
                     "SET" | "S" => {
                         // MLEADERSTYLE SET <name> <property> <value>
-                        // Properties: text_height arrowhead_size landing_distance landing_gap
+                        // Properties: text_height arrowhead_size landing_distance
+                        // landing_gap scale arrowhead
                         let style_name = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
-                        let prop = parts.get(2).map(|s| s.to_lowercase()).unwrap_or_default();
+                        let prop = parts.get(2).map(|s| s.trim()).unwrap_or("").to_string();
                         let val_str = parts.get(3).map(|s| s.trim()).unwrap_or("");
-                        if let Ok(val) = val_str.parse::<f64>() {
-                            let style_entry = self.tabs[i]
-                                .scene
-                                .document
-                                .objects
-                                .values_mut()
-                                .find_map(|o| {
-                                    if let ObjectType::MultiLeaderStyle(s) = o {
-                                        if s.name == style_name {
-                                            Some(s)
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                });
-                            if let Some(s) = style_entry {
-                                match prop.as_str() {
-                                    "text_height" | "textheight" | "txth" => {
-                                        s.text_height = val;
-                                    }
-                                    "arrowhead_size" | "arrowsize" | "asz" => {
-                                        s.arrowhead_size = val;
-                                    }
-                                    "landing_distance" | "landing" | "dogleg" => {
-                                        s.landing_distance = val;
-                                    }
-                                    "landing_gap" | "gap" => {
-                                        s.landing_gap = val;
-                                    }
-                                    _ => {
-                                        self.command_line.push_error(crate::tf!(
-                                            "MLEADERSTYLE: unknown property '{}'. Try: text_height arrowhead_size landing_distance landing_gap", prop
-                                        ).as_ref());
-                                        return Some(Task::none());
-                                    }
-                                }
-                                self.push_undo_snapshot(i, "MLEADERSTYLE SET");
-                                self.tabs[i].dirty = true;
-                                self.command_line.push_output(crate::tf!(
-                                    "MLEADERSTYLE: '{style_name}'.{prop} = {val:.3}"
-                                ).as_ref());
-                            } else {
-                                self.command_line.push_error(crate::tf!(
-                                    "MLEADERSTYLE: '{}' not found.",
-                                    style_name
-                                ).as_ref());
-                            }
+                        if style_name.is_empty() || prop.is_empty() || val_str.is_empty() {
+                            self.command_line.push_error(
+                                crate::t!("Usage: MLEADERSTYLE SET <name> <property> <value>")
+                                    .as_ref(),
+                            );
+                        } else if mleader_style_by_name(&self.tabs[i].scene.document, &style_name)
+                            .is_none()
+                        {
+                            self.command_line.push_error(
+                                crate::tf!("MLEADERSTYLE: '{}' not found.", style_name).as_ref(),
+                            );
                         } else {
-                            self.command_line
-                                .push_error(crate::t!("Usage: MLEADERSTYLE SET <name> <property> <value>").as_ref());
+                            self.push_undo_snapshot(i, "MLEADERSTYLE SET");
+                            match self.set_mleader_style_property(i, &style_name, &prop, val_str) {
+                                Ok(updated) => {
+                                    self.tabs[i].dirty = true;
+                                    self.command_line.push_output(
+                                        crate::tf!(
+                                            "MLEADERSTYLE: '{style_name}'.{prop} = {val_str} ({updated} multileader(s) updated)."
+                                        )
+                                        .as_ref(),
+                                    );
+                                }
+                                Err(why) => self
+                                    .command_line
+                                    .push_error(crate::tf!("MLEADERSTYLE: {why}").as_ref()),
+                            }
+                        }
+                    }
+                    "APPLY" | "A" => {
+                        // MLEADERSTYLE APPLY <name> [ALL]
+                        // Without ALL the current selection is restyled.
+                        let style_name = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
+                        let all = parts
+                            .get(2)
+                            .is_some_and(|word| word.eq_ignore_ascii_case("ALL"));
+                        let Some(style) =
+                            mleader_style_by_name(&self.tabs[i].scene.document, &style_name)
+                        else {
+                            self.command_line.push_error(
+                                crate::tf!("MLEADERSTYLE: '{}' not found.", style_name).as_ref(),
+                            );
+                            return Some(Task::none());
+                        };
+                        let handles: Vec<document::Handle> = if all {
+                            mleader_handles(&self.tabs[i].scene.document)
+                        } else {
+                            self.tabs[i]
+                                .scene
+                                .selected_entities()
+                                .into_iter()
+                                .map(|(handle, _)| handle)
+                                .filter(|handle| {
+                                    matches!(
+                                        self.tabs[i].scene.document.get_entity(*handle),
+                                        Some(document::EntityType::MultiLeader(_))
+                                    )
+                                })
+                                .collect()
+                        };
+                        if handles.is_empty() {
+                            self.command_line.push_info(
+                                crate::t!(
+                                    "MLEADERSTYLE: select multileaders first, or add ALL to restyle every one."
+                                )
+                                .as_ref(),
+                            );
+                            return Some(Task::none());
+                        }
+                        self.push_undo_snapshot(i, "MLEADERSTYLE APPLY");
+                        let mut changed_handles = Vec::new();
+                        for &handle in &handles {
+                            if crate::scene::annotative::apply_mleader_style_to_object(
+                                &mut self.tabs[i].scene.document,
+                                handle,
+                                &style,
+                            ) {
+                                changed_handles.push(handle);
+                            }
+                        }
+                        let applied = changed_handles.len();
+                        self.invalidate_property_targets_or_blocks(i, &changed_handles);
+                        self.tabs[i].dirty = true;
+                        self.command_line.push_output(
+                            crate::tf!(
+                                "MLEADERSTYLE: applied '{}' to {applied} multileader(s).",
+                                style.name
+                            )
+                            .as_ref(),
+                        );
+                    }
+                    "INFO" | "STATUS" | "READ" => {
+                        // MLEADERSTYLE INFO [ALL]
+                        let all = parts
+                            .get(1)
+                            .is_some_and(|word| word.eq_ignore_ascii_case("ALL"));
+                        let handles: Vec<document::Handle> = if all {
+                            mleader_handles(&self.tabs[i].scene.document)
+                        } else {
+                            self.tabs[i]
+                                .scene
+                                .selected_entities()
+                                .into_iter()
+                                .map(|(handle, _)| handle)
+                                .filter(|handle| {
+                                    matches!(
+                                        self.tabs[i].scene.document.get_entity(*handle),
+                                        Some(document::EntityType::MultiLeader(_))
+                                    )
+                                })
+                                .collect()
+                        };
+                        if handles.is_empty() {
+                            self.command_line.push_info(
+                                crate::t!(
+                                    "MLEADERSTYLE: select multileaders first, or add ALL to read every one."
+                                )
+                                .as_ref(),
+                            );
+                            return Some(Task::none());
+                        }
+                        for handle in handles {
+                            let style = match self.tabs[i].scene.document.get_entity(handle) {
+                                Some(document::EntityType::MultiLeader(leader)) => {
+                                    mleader_style_name(
+                                        &self.tabs[i].scene.document,
+                                        leader.style_handle,
+                                    )
+                                }
+                                _ => continue,
+                            };
+                            self.command_line.push_output(
+                                crate::tf!("MLEADER {:x}: {style}", handle.value()).as_ref(),
+                            );
                         }
                     }
                     "CURRENT" | "C" | "ACTIVE" => {
                         let name = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
                         if name.is_empty() {
-                            self.command_line.push_output(crate::tf!(
-                                "Current MLeader style: {}",
-                                self.tabs[i].active_mleader_style
-                            ).as_ref());
+                            self.command_line.push_output(
+                                crate::tf!(
+                                    "Current MLeader style: {}",
+                                    self.tabs[i].active_mleader_style
+                                )
+                                .as_ref(),
+                            );
                         } else {
-                            let exists = name == "Standard" || self.tabs[i].scene.document.objects.values()
-                                .any(|o| matches!(o, ObjectType::MultiLeaderStyle(s) if s.name == name));
+                            let exists = name.eq_ignore_ascii_case("Standard")
+                                || mleader_style_by_name(&self.tabs[i].scene.document, &name)
+                                    .is_some();
                             if exists {
                                 self.tabs[i].active_mleader_style = name.clone();
-                                self.command_line.push_output(crate::tf!(
-                                    "MLEADERSTYLE: current style set to '{name}'."
-                                ).as_ref());
+                                self.command_line.push_output(
+                                    crate::tf!("MLEADERSTYLE: current style set to '{name}'.")
+                                        .as_ref(),
+                                );
                             } else {
-                                self.command_line
-                                    .push_error(crate::tf!("MLEADERSTYLE: '{}' not found.", name).as_ref());
+                                self.command_line.push_error(
+                                    crate::tf!("MLEADERSTYLE: '{}' not found.", name).as_ref(),
+                                );
                             }
                         }
                     }
                     _ => {
                         self.command_line.push_info(
-                            crate::t!("Usage: MLEADERSTYLE LIST | NEW <name> | SET <name> <prop> <val> | CURRENT [<name>]").as_ref()
+                            crate::t!("Usage: MLEADERSTYLE LIST | NEW <name> [prop value …] | SET <name> <prop> <val> | APPLY <name> [ALL] | INFO [ALL] | CURRENT [<name>]").as_ref()
                         );
                     }
                 }
@@ -1389,7 +1854,7 @@ impl OpenCADStudio {
                     ("STYLE", cmd.trim_start_matches("STYLE").trim())
                 };
                 let parts: Vec<&str> = rest.splitn(3, ' ').collect();
-                let sub = parts.get(0).map(|s| s.to_uppercase()).unwrap_or_default();
+                let sub = parts.first().map(|s| s.to_uppercase()).unwrap_or_default();
                 match sub.as_str() {
                     "" | "DIALOG" | "UI" => {
                         return Some(Task::done(Message::TextStyleDialogOpen));
@@ -1407,25 +1872,30 @@ impl OpenCADStudio {
                                     s.font_file,
                                     s.width_factor,
                                     s.oblique_angle.to_degrees()
-                                ).into_owned()
+                                )
+                                .into_owned()
                             })
                             .collect();
                         if styles.is_empty() {
-                            self.command_line.push_output(crate::t!("No text styles defined.").as_ref());
-                        } else {
                             self.command_line
-                                .push_output(crate::tf!("Text styles: {}", styles.join(" | ")).as_ref());
+                                .push_output(crate::t!("No text styles defined.").as_ref());
+                        } else {
+                            self.command_line.push_output(
+                                crate::tf!("Text styles: {}", styles.join(" | ")).as_ref(),
+                            );
                         }
                     }
                     "SET" | "S" => {
                         // STYLE SET <name> — set active text style (for future text commands)
                         let name = parts.get(1).map(|s| s.trim()).unwrap_or("");
                         if self.tabs[i].scene.document.text_styles.get(name).is_some() {
-                            self.command_line
-                                .push_output(crate::tf!("{prefix}: active style set to '{name}'.").as_ref());
+                            self.command_line.push_output(
+                                crate::tf!("{prefix}: active style set to '{name}'.").as_ref(),
+                            );
                         } else {
-                            self.command_line
-                                .push_error(crate::tf!("{prefix}: style '{name}' not found.").as_ref());
+                            self.command_line.push_error(
+                                crate::tf!("{prefix}: style '{name}' not found.").as_ref(),
+                            );
                         }
                     }
                     "NEW" | "N" => {
@@ -1434,20 +1904,22 @@ impl OpenCADStudio {
                             self.command_line
                                 .push_error(crate::tf!("Usage: {prefix} NEW <name>").as_ref());
                         } else if self.tabs[i].scene.document.text_styles.contains(&name) {
-                            self.command_line
-                                .push_error(crate::tf!("{prefix}: style '{name}' already exists.").as_ref());
+                            self.command_line.push_error(
+                                crate::tf!("{prefix}: style '{name}' already exists.").as_ref(),
+                            );
                         } else {
                             let undo = self.begin_text_style_undo(
                                 i,
                                 "STYLE NEW",
                                 std::slice::from_ref(&name),
                             );
-                            let style = codec::tables::TextStyle::new(&name);
+                            let style = document::tables::TextStyle::new(&name);
                             let _ = self.tabs[i].scene.document.text_styles.add(style);
                             self.tabs[i].dirty = true;
                             self.commit_text_style_undo(i, undo);
-                            self.command_line
-                                .push_output(crate::tf!("{prefix}: style '{name}' created.").as_ref());
+                            self.command_line.push_output(
+                                crate::tf!("{prefix}: style '{name}' created.").as_ref(),
+                            );
                         }
                     }
                     "FONT" | "F" => {
@@ -1455,8 +1927,9 @@ impl OpenCADStudio {
                         let style_name = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
                         let font = parts.get(2).map(|s| s.trim()).unwrap_or("").to_string();
                         if style_name.is_empty() || font.is_empty() {
-                            self.command_line
-                                .push_error(crate::tf!("Usage: {prefix} FONT <style> <font_file>").as_ref());
+                            self.command_line.push_error(
+                                crate::tf!("Usage: {prefix} FONT <style> <font_file>").as_ref(),
+                            );
                         } else {
                             let undo = self.begin_text_style_undo(
                                 i,
@@ -1464,20 +1937,23 @@ impl OpenCADStudio {
                                 std::slice::from_ref(&style_name),
                             );
                             if let Some(style) =
-                            self.tabs[i].scene.document.text_styles.get_mut(&style_name)
-                        {
+                                self.tabs[i].scene.document.text_styles.get_mut(&style_name)
+                            {
                                 style.font_file = font.clone();
-                            self.tabs[i].dirty = true;
+                                self.tabs[i].dirty = true;
                                 self.tabs[i]
                                     .scene
                                     .invalidate_text_style_dependencies(&style_name);
                                 self.commit_text_style_undo(i, undo);
-                            self.command_line.push_output(crate::tf!(
-                                "{prefix}: '{style_name}' font set to '{font}'."
-                            ).as_ref());
-                        } else {
-                            self.command_line
-                                .push_error(crate::tf!("{prefix}: style '{style_name}' not found.").as_ref());
+                                self.command_line.push_output(
+                                    crate::tf!("{prefix}: '{style_name}' font set to '{font}'.")
+                                        .as_ref(),
+                                );
+                            } else {
+                                self.command_line.push_error(
+                                    crate::tf!("{prefix}: style '{style_name}' not found.")
+                                        .as_ref(),
+                                );
                             }
                         }
                     }
@@ -1500,17 +1976,22 @@ impl OpenCADStudio {
                                     .scene
                                     .invalidate_text_style_dependencies(&style_name);
                                 self.commit_text_style_undo(i, undo);
-                                self.command_line.push_output(crate::tf!(
-                                    "{prefix}: '{style_name}' width factor set to {factor:.3}."
-                                ).as_ref());
+                                self.command_line.push_output(
+                                    crate::tf!(
+                                        "{prefix}: '{style_name}' width factor set to {factor:.3}."
+                                    )
+                                    .as_ref(),
+                                );
                             } else {
-                                self.command_line.push_error(crate::tf!(
-                                    "{prefix}: style '{style_name}' not found."
-                                ).as_ref());
+                                self.command_line.push_error(
+                                    crate::tf!("{prefix}: style '{style_name}' not found.")
+                                        .as_ref(),
+                                );
                             }
                         } else {
-                            self.command_line
-                                .push_error(crate::tf!("Usage: {prefix} WIDTH <style> <factor>").as_ref());
+                            self.command_line.push_error(
+                                crate::tf!("Usage: {prefix} WIDTH <style> <factor>").as_ref(),
+                            );
                         }
                     }
                     "OBLIQUE" => {
@@ -1532,18 +2013,23 @@ impl OpenCADStudio {
                                     .scene
                                     .invalidate_text_style_dependencies(&style_name);
                                 self.commit_text_style_undo(i, undo);
-                                self.command_line.push_output(crate::tf!(
-                                    "{prefix}: '{style_name}' oblique angle set to {deg:.1}°."
-                                ).as_ref());
+                                self.command_line.push_output(
+                                    crate::tf!(
+                                        "{prefix}: '{style_name}' oblique angle set to {deg:.1}°."
+                                    )
+                                    .as_ref(),
+                                );
                             } else {
-                                self.command_line.push_error(crate::tf!(
-                                    "{prefix}: style '{style_name}' not found."
-                                ).as_ref());
+                                self.command_line.push_error(
+                                    crate::tf!("{prefix}: style '{style_name}' not found.")
+                                        .as_ref(),
+                                );
                             }
                         } else {
-                            self.command_line.push_error(crate::tf!(
-                                "Usage: {prefix} OBLIQUE <style> <angle_degrees>"
-                            ).as_ref());
+                            self.command_line.push_error(
+                                crate::tf!("Usage: {prefix} OBLIQUE <style> <angle_degrees>")
+                                    .as_ref(),
+                            );
                         }
                     }
                     _ => {
@@ -1568,7 +2054,7 @@ impl OpenCADStudio {
     /// mean, because a few pixels of cursor travel cover a long way in
     /// world space.
     fn open_sketch(&mut self, i: usize) {
-        let opened_with: std::collections::HashSet<codec::Handle> = self.tabs[i]
+        let opened_with: std::collections::HashSet<document::Handle> = self.tabs[i]
             .scene
             .document
             .entities()
@@ -1576,7 +2062,7 @@ impl OpenCADStudio {
             .collect();
         self.tabs[i].sketch_count += 1;
         let name = format!("Sketch{}", self.tabs[i].sketch_count);
-        self.tabs[i].sketch_session = Some(crate::app::document::SketchSession {
+        self.tabs[i].sketch_session = Some(crate::app::tab_document::SketchSession {
             name: name.clone(),
             previous_ucs: self.tabs[i].active_ucs.clone(),
             previous_snap_enabled: self.snapper.snap_enabled,
@@ -1601,7 +2087,7 @@ impl OpenCADStudio {
                 .push_error(crate::t!("No sketch is open.").as_ref());
             return;
         };
-        let created: Vec<codec::Handle> = self.tabs[i]
+        let created: Vec<document::Handle> = self.tabs[i]
             .scene
             .document
             .entities()
@@ -1612,9 +2098,8 @@ impl OpenCADStudio {
         self.snapper.snap_enabled = session.previous_snap_enabled;
         self.commit_active_ucs_change(i, "FINISHSKETCH");
         if created.is_empty() {
-            self.command_line.push_output(
-                crate::tf!("{} closed; nothing was drawn.", session.name).as_ref(),
-            );
+            self.command_line
+                .push_output(crate::tf!("{} closed; nothing was drawn.", session.name).as_ref());
         } else {
             let count = created.len();
             self.tabs[i].prev_selection = created;
@@ -1629,7 +2114,88 @@ impl OpenCADStudio {
         }
     }
 
-    fn plan_snap(&mut self, i: usize, r_ucs: glam::Mat4) {
+    /// Set one multileader-style property and restyle every multileader that
+    /// uses the style, so a changed arrow, text height or landing shows up in
+    /// existing annotations rather than only in the next one drawn.
+    fn set_mleader_style_property(
+        &mut self,
+        i: usize,
+        style_name: &str,
+        prop: &str,
+        value: &str,
+    ) -> Result<usize, String> {
+        use document::objects::ObjectType;
+        let handle = self.tabs[i]
+            .scene
+            .document
+            .objects
+            .values()
+            .find_map(|object| match object {
+                ObjectType::MultiLeaderStyle(style)
+                    if style.name.eq_ignore_ascii_case(style_name) =>
+                {
+                    Some(style.handle)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| crate::tf!("'{style_name}' not found.").to_string())?;
+        let prop = prop.to_ascii_lowercase();
+        match prop.as_str() {
+            "arrowhead" | "arrow" | "arrowhead_block" => {
+                let canonical = match value.to_ascii_uppercase().as_str() {
+                    "FILLED" | "CLOSEDFILLED" | "CLOSED-FILLED" | "." => "",
+                    _ => crate::entities::arrowheads::typed_standard_block(value)
+                        .unwrap_or(value),
+                };
+                let block = crate::entities::arrowheads::resolve(
+                    &mut self.tabs[i].scene.document,
+                    canonical,
+                )
+                .ok_or_else(|| {
+                    crate::tf!("unknown arrowhead '{value}'.").to_string()
+                })?;
+                if let Some(ObjectType::MultiLeaderStyle(style)) =
+                    self.tabs[i].scene.document.objects.get_mut(&handle)
+                {
+                    style.arrowhead_handle = if block.is_null() { None } else { Some(block) };
+                }
+            }
+            "text_height" | "textheight" | "txth" | "text" | "txt" | "arrowhead_size"
+            | "arrowsize" | "asz" | "landing_distance" | "landing" | "dogleg" | "landing_gap"
+            | "gap" | "scale" | "scale_factor" => {
+                let parsed = value.parse::<f64>().map_err(|_| {
+                    crate::tf!("'{prop}' takes a number, not '{value}'.").to_string()
+                })?;
+                if let Some(ObjectType::MultiLeaderStyle(style)) =
+                    self.tabs[i].scene.document.objects.get_mut(&handle)
+                {
+                    match prop.as_str() {
+                        "text_height" | "textheight" | "txth" | "text" | "txt" => {
+                            style.text_height = parsed
+                        }
+                        "arrowhead_size" | "arrowsize" | "asz" => style.arrowhead_size = parsed,
+                        "landing_distance" | "landing" | "dogleg" => {
+                            style.landing_distance = parsed
+                        }
+                        "landing_gap" | "gap" => style.landing_gap = parsed,
+                        _ => style.scale_factor = parsed,
+                    }
+                }
+            }
+            _ => {
+                return Err(crate::tf!(
+                    "unknown property '{prop}'. Try: text_height arrowhead_size landing_distance landing_gap scale arrowhead"
+                )
+                .to_string())
+            }
+        }
+        Ok(reapply_mleader_style(
+            &mut self.tabs[i].scene.document,
+            handle,
+        ))
+    }
+
+    pub(in crate::app) fn plan_snap(&mut self, i: usize, r_ucs: glam::Mat4) {
         let eye_dir = r_ucs.transform_vector3(
             crate::scene::CubeRegion::Face(crate::scene::pipeline::viewcube::FACE_TOP)
                 .snap_direction(),
@@ -1647,5 +2213,126 @@ impl OpenCADStudio {
                 .snap_to_face(eye_dir, r_ucs);
         }
         self.tabs[i].scene.camera_generation += 1;
+    }
+}
+
+/// One multileader style by name, case-insensitively, as a clone so the
+/// caller can mutate the document without holding a borrow into it.
+fn mleader_style_by_name(
+    doc: &document::Document,
+    name: &str,
+) -> Option<document::objects::MultiLeaderStyle> {
+    doc.objects.values().find_map(|object| match object {
+        document::objects::ObjectType::MultiLeaderStyle(style)
+            if style.name.eq_ignore_ascii_case(name) =>
+        {
+            Some(style.clone())
+        }
+        _ => None,
+    })
+}
+
+/// The name a multileader's style handle stands for; a null or dangling
+/// handle is the built-in standard.
+fn mleader_style_name(doc: &document::Document, handle: Option<document::Handle>) -> String {
+    let Some(handle) = handle else {
+        return "Standard".to_string();
+    };
+    match doc.objects.get(&handle) {
+        Some(document::objects::ObjectType::MultiLeaderStyle(style)) => style.name.clone(),
+        _ => "Standard".to_string(),
+    }
+}
+
+/// Every multileader in the drawing.
+fn mleader_handles(doc: &document::Document) -> Vec<document::Handle> {
+    doc.entities()
+        .filter(|entity| matches!(entity, document::EntityType::MultiLeader(_)))
+        .map(|entity| entity.common().handle)
+        .collect()
+}
+
+/// Push the current style settings onto every multileader that uses it.
+fn reapply_mleader_style(doc: &mut document::Document, style_handle: document::Handle) -> usize {
+    let Some(style) = doc
+        .objects
+        .get(&style_handle)
+        .and_then(|object| match object {
+            document::objects::ObjectType::MultiLeaderStyle(style) => Some(style.clone()),
+            _ => None,
+        })
+    else {
+        return 0;
+    };
+    let handles: Vec<document::Handle> = doc
+        .entities()
+        .filter(|entity| {
+            matches!(
+                entity,
+                document::EntityType::MultiLeader(leader)
+                    if leader.style_handle == Some(style_handle)
+            )
+        })
+        .map(|entity| entity.common().handle)
+        .collect();
+    handles
+        .into_iter()
+        .filter(|handle| {
+            crate::scene::annotative::apply_mleader_style_to_object(doc, *handle, &style)
+        })
+        .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::OpenCADStudio;
+
+    fn run(app: &mut OpenCADStudio, line: &str) {
+        let result = app.automation_op(&serde_json::json!({"op": "run", "cmd": line}).to_string());
+        assert_eq!(result["status"], "completed", "{line}: {result}");
+    }
+
+    fn layers(app: &OpenCADStudio) -> Vec<document::tables::Layer> {
+        let doc = &app.tabs[app.active_tab].scene.document;
+        doc.layers.iter().cloned().collect()
+    }
+
+    fn entities(app: &OpenCADStudio) -> usize {
+        app.tabs[app.active_tab].scene.document.entities().count()
+    }
+
+    /// Each option of `LAYER` is one undo step: UNDO puts the layer table
+    /// back and leaves the step before it (a line) alone, and REDO puts the
+    /// change back.
+    #[test]
+    fn each_layer_option_is_one_undo_step() {
+        for (setup, option) in [
+            ("", "LAYER NEW Doors"),
+            ("-LAYER OFF Walls ", "LAYER ON Walls"),
+            ("", "LAYER OFF Walls"),
+            ("", "LAYER FREEZE Walls"),
+            ("-LAYER FREEZE Walls ", "LAYER THAW Walls"),
+            ("", "LAYER LOCK Walls"),
+            ("-LAYER LOCK Walls ", "LAYER UNLOCK Walls"),
+            ("", "LAYER COLOR 1 Walls"),
+        ] {
+            let mut app = OpenCADStudio::new_for_test();
+            app.automation_op(r#"{"op":"new"}"#);
+            run(&mut app, "-LAYER NEW Walls");
+            if !setup.is_empty() {
+                run(&mut app, setup);
+            }
+            run(&mut app, "LINE 0,0 10,0 ");
+            let before = layers(&app);
+            run(&mut app, option);
+            let after = layers(&app);
+            assert_ne!(after, before, "{option} changed no layer");
+
+            app.undo_active_tab();
+            assert_eq!(layers(&app), before, "{option}: UNDO");
+            assert_eq!(entities(&app), 1, "{option}: UNDO took back the line");
+            app.redo_active_tab();
+            assert_eq!(layers(&app), after, "{option}: REDO");
+        }
     }
 }

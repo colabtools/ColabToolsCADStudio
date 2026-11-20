@@ -1,13 +1,17 @@
 use super::*;
 
 impl OpenCADStudio {
-    pub(super) fn handle_mview_create(&mut self, viewport: codec::entities::Viewport, preserve_view: bool) {
+    pub(super) fn handle_mview_create(
+        &mut self,
+        viewport: document::entities::Viewport,
+        preserve_view: bool,
+    ) {
         let i = self.active_tab;
-        let saved_view = preserve_view.then(|| {
+        let saved_view = preserve_view.then_some({
             (
-                viewport.view_target.clone(),
-                viewport.view_direction.clone(),
-                viewport.view_center.clone(),
+                viewport.view_target,
+                viewport.view_direction,
+                viewport.view_center,
                 viewport.view_height,
                 viewport.custom_scale,
                 viewport.lens_length,
@@ -17,9 +21,9 @@ impl OpenCADStudio {
         });
         let label = self.history_label_from_active_cmd(i, "MVIEW");
         let pending = self.begin_undo(i, label, 1, true);
-        let handle = self.commit_entity_handle(codec::EntityType::Viewport(viewport));
+        let handle = self.commit_entity_handle(document::EntityType::Viewport(Box::new(viewport)));
         if let (Some(handle), Some(saved)) = (handle, saved_view) {
-            if let Some(codec::EntityType::Viewport(viewport)) =
+            if let Some(document::EntityType::Viewport(viewport)) =
                 self.tabs[i].scene.document.get_entity_mut(handle)
             {
                 viewport.view_target = saved.0;
@@ -51,28 +55,32 @@ impl OpenCADStudio {
     pub(super) fn handle_vpclip(
         &mut self,
         viewport: Handle,
-        boundary: Option<codec::EntityType>,
+        boundary: Option<document::EntityType>,
         boundary_handle: Handle,
     ) {
         let i = self.active_tab;
         self.tabs[i].scene.clear_preview_wire();
         self.tabs[i].active_cmd = None;
         self.tabs[i].snap_result = None;
-        let Some(codec::EntityType::Viewport(vp)) = self.tabs[i].scene.document.get_entity(viewport).cloned()
+        let Some(document::EntityType::Viewport(vp)) =
+            self.tabs[i].scene.document.get_entity(viewport).cloned()
         else {
             return;
         };
         if boundary.is_none() && !boundary_handle.is_null() {
             let scene = &self.tabs[i].scene;
             let closed = scene.entity_belongs_to_current_layout(boundary_handle)
-                && scene.document.get_entity(boundary_handle).is_some_and(|entity| match entity {
-                    codec::EntityType::Circle(_) => true,
-                    codec::EntityType::Ellipse(ellipse) => ellipse.is_full(),
-                    codec::EntityType::LwPolyline(polyline) => polyline.is_closed,
-                    codec::EntityType::Polyline(polyline) => polyline.is_closed(),
-                    codec::EntityType::Polyline2D(polyline) => polyline.is_closed(),
-                    _ => false,
-                });
+                && scene
+                    .document
+                    .get_entity(boundary_handle)
+                    .is_some_and(|entity| match entity {
+                        document::EntityType::Circle(_) => true,
+                        document::EntityType::Ellipse(ellipse) => ellipse.is_full(),
+                        document::EntityType::LwPolyline(polyline) => polyline.is_closed,
+                        document::EntityType::Polyline(polyline) => polyline.is_closed(),
+                        document::EntityType::Polyline2D(polyline) => polyline.is_closed(),
+                        _ => false,
+                    });
             if !closed {
                 self.command_line
                     .push_error(crate::t!("Object is not a closed curve.").as_ref());
@@ -90,6 +98,7 @@ impl OpenCADStudio {
         let mut vp = vp;
         if clip.is_null() {
             vp.clip_boundary_handle = Handle::NULL;
+            vp.status.non_rectangular_clipping = false;
         } else {
             let (lo, hi) = clip_boundary_extents(scene, clip)
                 .map(|(lo, hi)| (glam::DVec2::from(lo), glam::DVec2::from(hi)))
@@ -99,24 +108,31 @@ impl OpenCADStudio {
                 if created {
                     scene.erase_entities(&[clip]);
                 }
-                self.command_line
-                    .push_error(crate::t!("MVIEW: the clipping boundary has no usable area.").as_ref());
+                self.command_line.push_error(
+                    crate::t!("MVIEW: the clipping boundary has no usable area.").as_ref(),
+                );
                 return;
             }
             // Model units per paper unit; the view centre follows the paper
-            // centre so the model does not move on the sheet.
-            let scale = if vp.height.abs() > 1e-12 { vp.view_height / vp.height } else { 1.0 };
+            // centre so the model does not move on the sheet. The view centre
+            // is in display coordinates, whose axes are the sheet's, so a
+            // twisted view takes the sheet delta as it is.
+            let scale = if vp.height.abs() > 1e-12 {
+                vp.view_height / vp.height
+            } else {
+                1.0
+            };
             let center = (lo + hi) * 0.5;
             let (dx, dy) = (center.x - vp.center.x, center.y - vp.center.y);
-            let (s, c) = (-vp.twist_angle).sin_cos();
-            vp.view_center.x += (dx * c - dy * s) * scale;
-            vp.view_center.y += (dx * s + dy * c) * scale;
+            vp.view_center.x += dx * scale;
+            vp.view_center.y += dy * scale;
             vp.center.x = center.x;
             vp.center.y = center.y;
             vp.width = hi.x - lo.x;
             vp.height = hi.y - lo.y;
             vp.view_height = vp.height * scale;
             vp.clip_boundary_handle = clip;
+            vp.status.non_rectangular_clipping = true;
             if let Some(entity) = scene.document.get_entity_mut(clip) {
                 let common = entity.common_mut();
                 if !common.reactors.contains(&viewport) {
@@ -125,7 +141,7 @@ impl OpenCADStudio {
             }
         }
         if let Some(entity) = scene.document.get_entity_mut(viewport) {
-            *entity = codec::EntityType::Viewport(vp);
+            *entity = document::EntityType::Viewport(vp);
         }
         if !old.is_null() && old != clip {
             scene.erase_entities(&[old]);
@@ -142,7 +158,7 @@ impl OpenCADStudio {
 
     pub(super) fn handle_mview_create_clipped(
         &mut self,
-        boundary: Option<codec::EntityType>,
+        boundary: Option<document::EntityType>,
         boundary_handle: Handle,
     ) -> Option<Task<Message>> {
         let i = self.active_tab;
@@ -153,12 +169,12 @@ impl OpenCADStudio {
                     .document
                     .get_entity(boundary_handle)
                     .is_some_and(|entity| match entity {
-                        codec::EntityType::Circle(_) => true,
-                        codec::EntityType::Ellipse(ellipse) => ellipse.is_full(),
-                        codec::EntityType::LwPolyline(polyline) => polyline.is_closed,
-                        codec::EntityType::Polyline(polyline) => polyline.is_closed(),
-                        codec::EntityType::Polyline2D(polyline) => polyline.is_closed(),
-                        codec::EntityType::Polyline3D(polyline) => polyline.flags.closed,
+                        document::EntityType::Circle(_) => true,
+                        document::EntityType::Ellipse(ellipse) => ellipse.is_full(),
+                        document::EntityType::LwPolyline(polyline) => polyline.is_closed,
+                        document::EntityType::Polyline(polyline) => polyline.is_closed(),
+                        document::EntityType::Polyline2D(polyline) => polyline.is_closed(),
+                        document::EntityType::Polyline3D(polyline) => polyline.flags.closed,
                         _ => false,
                     });
             if !valid {
@@ -221,14 +237,16 @@ impl OpenCADStudio {
             return Some(Task::none());
         }
 
-        let mut viewport = codec::entities::Viewport::new();
+        let mut viewport = document::entities::Viewport::new();
         viewport.center =
-            codec::types::Vector3::new((min_x + max_x) / 2.0, (min_y + max_y) / 2.0, 0.0);
+            document::types::Vector3::new((min_x + max_x) / 2.0, (min_y + max_y) / 2.0, 0.0);
         viewport.width = max_x - min_x;
         viewport.height = max_y - min_y;
         viewport.id = 2;
         viewport.clip_boundary_handle = clip_handle;
-        let viewport_handle = self.commit_entity_handle(codec::EntityType::Viewport(viewport));
+        viewport.status.non_rectangular_clipping = !clip_handle.is_null();
+        let viewport_handle =
+            self.commit_entity_handle(document::EntityType::Viewport(Box::new(viewport)));
         if let Some(viewport_handle) = viewport_handle {
             if !created_boundary {
                 let before = self.tabs[i]
@@ -353,7 +371,7 @@ impl OpenCADStudio {
         let mut thawed_count = 0usize;
 
         // Collect target viewport handles
-        let target_handles: Vec<Handle> = if vp_handle == codec::Handle::NULL {
+        let target_handles: Vec<Handle> = if vp_handle == document::Handle::NULL {
             // All viewports in current layout block
             let block_handle = self.tabs[i].scene.current_layout_block_handle_pub();
             self.tabs[i]
@@ -362,7 +380,7 @@ impl OpenCADStudio {
                 .entities()
                 .filter(|e| {
                     e.common().owner_handle == block_handle
-                        && matches!(e, codec::EntityType::Viewport(_))
+                        && matches!(e, document::EntityType::Viewport(_))
                 })
                 .map(|e| e.common().handle)
                 .collect()
@@ -371,7 +389,7 @@ impl OpenCADStudio {
         };
 
         for &target_handle in &target_handles {
-            if let Some(codec::EntityType::Viewport(vp)) =
+            if let Some(document::EntityType::Viewport(vp)) =
                 self.tabs[i].scene.document.get_entity_mut(target_handle)
             {
                 for h in &freeze_handles {
@@ -418,7 +436,173 @@ impl OpenCADStudio {
         }
     }
 
-    pub(super) fn handle_zoom_to_window(&mut self, p1: glam::DVec3, p2: glam::DVec3) {
+    pub(super) fn handle_vp_layer_override(
+        &mut self,
+        vp_handle: Handle,
+        layer: &str,
+        channel: crate::command::VpOverrideChannel,
+        value: &str,
+    ) {
+        use crate::command::VpOverrideChannel;
+        use document::objects::{KnownXRecordKind as Kind, XRecordValue as Value};
+
+        let i = self.active_tab;
+        let Some(layer_handle) = self.tabs[i]
+            .scene
+            .document
+            .layers
+            .iter()
+            .find(|l| l.name.eq_ignore_ascii_case(layer))
+            .map(|l| l.handle)
+        else {
+            self.command_line.push_error(
+                crate::tf!("VPLAYER: no layer named \"{layer}\".").as_ref(),
+            );
+            return;
+        };
+
+        let target_handles: Vec<Handle> = if vp_handle == document::Handle::NULL {
+            let block_handle = self.tabs[i].scene.current_layout_block_handle_pub();
+            self.tabs[i]
+                .scene
+                .document
+                .entities()
+                .filter(|e| {
+                    e.common().owner_handle == block_handle
+                        && matches!(e, document::EntityType::Viewport(_))
+                })
+                .map(|e| e.common().handle)
+                .collect()
+        } else {
+            vec![vp_handle]
+        };
+        if target_handles.is_empty() {
+            self.command_line.push_error(
+                crate::t!("VPLAYER: no viewport to apply the override to.").as_ref(),
+            );
+            return;
+        }
+
+        // Validate once before starting undo: all values must parse before
+        // anything is written.
+        let valid = match channel {
+            VpOverrideChannel::Color => parse_override_color(value)
+                .and_then(|color| crate::scene::view::render::pack_layer_override_color(&color))
+                .is_some(),
+            VpOverrideChannel::Linetype => self.tabs[i]
+                .scene
+                .document
+                .line_types
+                .iter()
+                .any(|lt| lt.name.eq_ignore_ascii_case(value)),
+            VpOverrideChannel::Alpha => value
+                .trim_end_matches('%')
+                .trim()
+                .parse::<f64>()
+                .map(|p| (0.0..=90.0).contains(&p))
+                .unwrap_or(false),
+            VpOverrideChannel::Lineweight => !value.trim().is_empty(),
+        };
+        if !valid {
+            self.command_line.push_error(
+                crate::tf!(
+                    "VPLAYER: \"{}\" is not valid — nothing was written.",
+                    value
+                )
+                .as_ref(),
+            );
+            return;
+        }
+
+        self.push_undo_snapshot(i, "VPLAYER");
+        let mut changed = 0;
+        for target_handle in &target_handles {
+            let ok = match channel {
+                VpOverrideChannel::Color => {
+                    let Some(color) = parse_override_color(value) else {
+                        continue;
+                    };
+                    let Some(packed) = crate::scene::view::render::pack_layer_override_color(&color)
+                    else {
+                        continue;
+                    };
+                    self.tabs[i].scene.document.set_layer_viewport_override(
+                        layer_handle,
+                        Kind::LayerViewportColorOverride,
+                        *target_handle,
+                        Value::Int32(packed),
+                    )
+                }
+                VpOverrideChannel::Linetype => {
+                    let Some(line_type) = self
+                        .tabs[i]
+                        .scene
+                        .document
+                        .line_types
+                        .iter()
+                        .find(|lt| lt.name.eq_ignore_ascii_case(value))
+                        .map(|lt| lt.handle)
+                    else {
+                        continue;
+                    };
+                    self.tabs[i].scene.document.set_layer_viewport_override(
+                        layer_handle,
+                        Kind::LayerViewportLinetypeOverride,
+                        *target_handle,
+                        Value::Handle(line_type),
+                    )
+                }
+                VpOverrideChannel::Lineweight => {
+                    use document::types::LineWeight;
+                    let line_weight = match value.trim() {
+                        "ByLayer" => LineWeight::ByLayer,
+                        "ByBlock" => LineWeight::ByBlock,
+                        "Default" => LineWeight::Default,
+                        other => other
+                            .trim_end_matches("mm")
+                            .trim()
+                            .parse::<f64>()
+                            .map(|mm| LineWeight::Value((mm * 100.0).round() as i16))
+                            .unwrap_or(LineWeight::ByBlock),
+                    };
+                    self.tabs[i].scene.document.set_layer_viewport_override(
+                        layer_handle,
+                        Kind::LayerViewportLineweightOverride,
+                        *target_handle,
+                        Value::Int32(line_weight.value() as i32),
+                    )
+                }
+                VpOverrideChannel::Alpha => {
+                    let percent = value.trim_end_matches('%').trim().parse::<f64>().unwrap_or(0.0);
+                    let alpha = (percent * 2.55).round() as u32;
+                    let packed = 0x0200_0000u32 | (255 - alpha);
+                    self.tabs[i].scene.document.set_layer_viewport_override(
+                        layer_handle,
+                        Kind::LayerViewportAlphaOverride,
+                        *target_handle,
+                        Value::Int32(packed as i32),
+                    )
+                }
+            };
+            if ok {
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.tabs[i].dirty = true;
+            self.tabs[i].scene.bump_geometry();
+            let doc_layers = self.tabs[i].scene.document.layers.clone();
+            let vp_info = self.tabs[i].scene.viewport_list();
+            self.tabs[i]
+                .layers
+                .sync_with_viewports(&doc_layers, vp_info);
+            self.command_line.push_info(
+                crate::tf!("VPLAYER: override written for {changed} viewport(s).").as_ref(),
+            );
+        }
+    }
+
+    pub(in crate::app) fn handle_zoom_to_window(&mut self, p1: glam::DVec3, p2: glam::DVec3) {
         let i = self.active_tab;
         self.tabs[i].active_cmd = None;
         self.tabs[i].snap_result = None;
@@ -431,11 +615,64 @@ impl OpenCADStudio {
             .push_output(crate::t!("Zoom Window").as_ref());
     }
 
+    /// MVSETUP Scale viewports: each picked layout viewport shows the model
+    /// at `factor` paper units per model unit. One undo step.
+    pub(in crate::app) fn handle_scale_viewports(&mut self, handles: Vec<Handle>, factor: f64) {
+        let i = self.active_tab;
+        self.tabs[i].active_cmd = None;
+        self.tabs[i].snap_result = None;
+        let handles: Vec<Handle> = handles
+            .into_iter()
+            .filter(|handle| {
+                matches!(
+                    self.tabs[i].scene.document.get_entity(*handle),
+                    Some(document::EntityType::Viewport(viewport)) if viewport.id > 1
+                )
+            })
+            .collect();
+        if handles.is_empty() {
+            return;
+        }
+        self.push_undo_snapshot(i, "MVSETUP");
+        for handle in handles {
+            self.tabs[i]
+                .scene
+                .set_viewport_scale_factor_for(handle, factor);
+        }
+        self.tabs[i].dirty = true;
+    }
+
+    /// Turn the active view about its line of sight so the drawing shows
+    /// `twist` radians counter-clockwise from its untwisted orientation.
+    pub(in crate::app) fn handle_twist_view(&mut self, twist: f64) {
+        let i = self.active_tab;
+        self.tabs[i].scene.remember_current_view();
+        let set = |camera: &mut crate::scene::view::camera::Camera| {
+            // The drawing turns one way when the camera rolls the other.
+            camera.roll_by(-twist as f32 - camera.roll());
+        };
+        if self.tabs[i].scene.active_viewport.is_some() {
+            self.tabs[i].scene.mutate_active_viewport_camera(set);
+        } else {
+            set(&mut self.tabs[i].scene.camera.borrow_mut());
+        }
+        self.tabs[i].scene.camera_generation += 1;
+        if let Some(prompt) = self.tabs[i].active_cmd.as_ref().map(|c| c.prompt()) {
+            self.command_line.push_info(&prompt);
+        }
+    }
+
     pub(super) fn handle_set_plot_window(&mut self, p1: glam::DVec3, p2: glam::DVec3) {
         let i = self.active_tab;
         let layout_name = self.tabs[i].scene.current_layout.clone();
         if layout_name == "Model" {
-            // Model space: remember the window (world X/Y) for the plot dialog.
+            // Model space: remember the window, in the view's own axes, for
+            // the plot dialog.
+            let (sin, cos) = (-self.model_plot_twist()).sin_cos();
+            let turn = |p: glam::DVec3| {
+                glam::DVec2::new(cos * p.x - sin * p.y, sin * p.x + cos * p.y)
+            };
+            let (p1, p2) = (turn(p1), turn(p2));
             let x0 = p1.x.min(p2.x);
             let y0 = p1.y.min(p2.y);
             let x1 = p1.x.max(p2.x);
@@ -487,14 +724,30 @@ impl OpenCADStudio {
     }
 }
 
+/// Parse a colour argument for a VPLAYER override. Accepts the named
+/// palette ("Red", "ByLayer", …), a bare ACI index, "Color N" and an
+/// "R,G,B" triple, matching how the command line parses colours elsewhere.
+fn parse_override_color(text: &str) -> Option<document::types::Color> {
+    crate::entities::table::parse_cell_color(text).or_else(|| {
+        text.trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|n| (1..=255).contains(n))
+            .map(document::types::Color::Index)
+    })
+}
+
 /// Paper-space extents of a viewport clip boundary: exact for lines, arcs
 /// and circles (bulges included), else from its outline.
-fn clip_boundary_extents(scene: &crate::scene::Scene, clip: Handle) -> Option<([f64; 2], [f64; 2])> {
+fn clip_boundary_extents(
+    scene: &crate::scene::Scene,
+    clip: Handle,
+) -> Option<([f64; 2], [f64; 2])> {
     let exact = scene
         .document
         .get_entity(clip)
         .and_then(crate::entities::curve::entity_curve_xy)
-        .and_then(|curve| kernel::geom2d::analytic_curve_bounds(&[curve]));
+        .and_then(|curve| ocs_geom::geom2d::analytic_curve_bounds(&[curve]));
     if exact.is_some() {
         return exact;
     }

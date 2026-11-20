@@ -1,12 +1,18 @@
 // ID command — report coordinates of a picked point.
 
-use glam::DVec3;
 use crate::t;
+use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult, WorkingPlane};
 
 pub struct IdCommand {
     plane: WorkingPlane,
+}
+
+impl Default for IdCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IdCommand {
@@ -38,13 +44,7 @@ impl CadCommand for IdCommand {
         let x_s = crate::entities::common::format_length(x);
         let y_s = crate::entities::common::format_length(y);
         let z_s = crate::entities::common::format_length(z);
-        let msg = t!(
-            "X = %{x},  Y = %{y},  Z = %{z}",
-            x = x_s,
-            y = y_s,
-            z = z_s
-        )
-        .into_owned();
+        let msg = t!("X = %{x},  Y = %{y},  Z = %{z}", x = x_s, y = y_s, z = z_s).into_owned();
         CmdResult::Measurement(msg)
     }
 
@@ -53,6 +53,5 @@ impl CadCommand for IdCommand {
     }
 }
 
-
 // ── Autocomplete registry ─────────────────────────────────
-inventory::submit!(crate::command::CommandRegistration { names: &["ID"] });  // IdCommand
+inventory::submit!(crate::command::CommandRegistration { names: &["ID"] }); // IdCommand

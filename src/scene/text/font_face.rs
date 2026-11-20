@@ -42,8 +42,9 @@ pub enum Face {
     /// A real compiled .SHX stroke font on disk (glyphs keyed by char code).
     Shx {
         path: String,
-        /// (above + below) / above — baseline step relative to cap height.
-        line: f32,
+        /// The drawing's legacy code page, used only by shape-file-encoded
+        /// glyphs; Unicode unifonts ignore it.
+        code_page: String,
         /// Space advance (9-unit).
         word: f32,
     },
@@ -62,6 +63,35 @@ pub enum Face {
 /// [`Face::with_big_font`]); a control character no font name contains.
 pub const BIG_FONT_SEP: char = '\u{1}';
 
+/// Separator between a resolved SHX path and its drawing's legacy code page.
+/// Keeping this in the resolved font identity also keeps SDF cache entries for
+/// the same path under different drawing code pages apart.
+pub const CODE_PAGE_SEP: char = '\u{2}';
+
+/// What an SHX font shows for a character it has no glyph for: the system
+/// stand-in glyph, taking only the room of the font's own `?` (measured:
+/// `₺` in txt is drawn in full yet advances and measures 5 × 10 at height
+/// 10 like `?`, so the next character overlaps it). Without a stand-in the
+/// `?` itself is drawn. A full-width character keeps the stand-in as it is
+/// (a missing big font); spaces and invisible marks stay blank.
+fn shx_missing_glyph(path: &str, ch: char) -> Option<Arc<Glyph>> {
+    let invisible = ch.is_whitespace()
+        || ch.is_control()
+        || matches!(ch, '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}');
+    if invisible || ttf_glyph::is_full_width(ch) {
+        return None;
+    }
+    let mark = shx::font_glyph(path, '?' as u16)?;
+    Some(match ttf_glyph::fallback_glyph(ch) {
+        Some(stand_in) => Arc::new(Glyph {
+            strokes: stand_in.strokes.clone(),
+            advance: mark.advance,
+            fill_tris: stand_in.fill_tris.clone(),
+        }),
+        None => mark,
+    })
+}
+
 impl Face {
     /// Resolve a style's font name to a concrete face. Embedded stroke fonts
     /// take priority; only otherwise-unknown names try the system fonts.
@@ -78,27 +108,37 @@ impl Face {
                 face
             };
         }
+        // TrueType styled families use the same control character as their
+        // style suffix, so only an actual SHX path introduces a code page.
+        let (font_name, code_page) = font_name
+            .split_once(CODE_PAGE_SEP)
+            .filter(|(path, _)| path.to_ascii_lowercase().ends_with(".shx"))
+            .map_or((font_name, "ANSI_1252"), |(path, page)| (path, page));
         // A resolvable on-disk .SHX font renders its real stroke glyphs; the
         // LFF substitutes only cover names we can't load.
         if font_name.to_ascii_lowercase().ends_with(".shx")
-            && std::path::Path::new(font_name).is_file()
+            && shx::file_on_disk(font_name)
+            && shx::font_metrics(font_name).is_some()
         {
-            if let Some((above, below)) = shx::font_metrics(font_name) {
-                let word = shx::font_glyph(font_name, ' ' as u16)
-                    .map(|g| g.advance)
-                    .filter(|a| *a > 0.0)
-                    .unwrap_or(4.5);
-                return Face::Shx {
-                    path: font_name.to_string(),
-                    line: ((above + below) / above) as f32,
-                    word,
-                };
-            }
+            // Keep the sign: right-to-left fonts (SOSA, XARB) move the pen
+            // left for a space just as for their letters.
+            let word = shx::font_glyph(font_name, ' ' as u16)
+                .map(|g| g.advance)
+                .filter(|a| *a != 0.0)
+                .unwrap_or(4.5);
+            return Face::Shx {
+                path: font_name.to_string(),
+                code_page: code_page.to_string(),
+                word,
+            };
         }
         let is_builtin = lff::is_builtin(font_name);
-        let has_sys = sysfont::has_family(font_name);
+        // A missing `.shx` file draws with a stroke substitute, never with a
+        // TrueType face of a similar name (measured).
+        let has_sys = !lff::is_shx_name(font_name) && sysfont::has_family(font_name);
         if !is_builtin && has_sys {
-            let canonical = sysfont::canonical_family_name(font_name).unwrap_or_else(|| font_name.to_string());
+            let canonical =
+                sysfont::canonical_family_name(font_name).unwrap_or_else(|| font_name.to_string());
             let word = ttf_glyph::glyph(&canonical, ' ')
                 .map(|g| g.advance)
                 // Fall back to a sensible blank-width if the font has no space.
@@ -110,6 +150,17 @@ impl Face {
             };
         }
         Face::Lff(lff::get_font(font_name))
+    }
+
+    /// Attach the drawing's legacy code page to an on-disk SHX face. Apply
+    /// this before [`with_big_font`](Self::with_big_font), so the paired primary
+    /// face retains it when resolved.
+    pub fn with_code_page(path: &str, code_page: &str) -> String {
+        if code_page.trim().is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}{CODE_PAGE_SEP}{code_page}")
+        }
     }
 
     /// The `font_name` string that pairs `primary` with the big font at
@@ -132,7 +183,10 @@ impl Face {
             Face::Ttf { family, .. } => ttf_glyph::glyph(family, ch)
                 .or_else(|| ttf_glyph::fallback_glyph(ch))
                 .map(GlyphRef::Owned),
-            Face::Shx { path, .. } => shx::font_glyph(path, ch as u16)
+            Face::Shx {
+                path, code_page, ..
+            } => shx::font_char_glyph(path, ch, code_page)
+                .or_else(|| shx_missing_glyph(path, ch))
                 .map(GlyphRef::Owned)
                 .or_else(|| ttf_glyph::fallback_glyph(ch).map(GlyphRef::Owned)),
             Face::WithBig { primary, big } => {
@@ -142,6 +196,53 @@ impl Face {
                     }
                 }
                 primary.glyph(ch)
+            }
+        }
+    }
+
+    /// `ch`'s glyph from this face itself, without the TrueType fallback
+    /// [`glyph`](Self::glyph) reaches for when the face lacks it.
+    pub fn own_glyph(&self, ch: char) -> Option<GlyphRef<'_>> {
+        match self {
+            Face::Lff(f) => f.glyph(ch).map(GlyphRef::Borrowed),
+            Face::Ttf { family, .. } => ttf_glyph::glyph(family, ch).map(GlyphRef::Owned),
+            Face::Shx {
+                path, code_page, ..
+            } => shx::font_char_glyph(path, ch, code_page).map(GlyphRef::Owned),
+            Face::WithBig { primary, .. } => primary.own_glyph(ch),
+        }
+    }
+
+    /// The TrueType face [`glyph`](Self::glyph) takes `ch`'s outline from, or
+    /// `None` when that glyph is a stroke (LFF / SHX / big-font) glyph. Follows
+    /// the exact dispatch of `glyph` so an exporter that embeds the face draws
+    /// the same glyph the screen shows.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn glyph_source(&self, ch: char) -> Option<ttf_glyph::GlyphSource> {
+        match self {
+            Face::Lff(f) => match f.glyph(ch) {
+                Some(_) => None,
+                None => ttf_glyph::fallback_source(ch),
+            },
+            Face::Ttf { family, .. } => match ttf_glyph::glyph(family, ch) {
+                Some(_) => ttf_glyph::glyph_source(family, ch),
+                None => ttf_glyph::fallback_source(ch),
+            },
+            Face::Shx {
+                path, code_page, ..
+            } => {
+                match shx::font_char_glyph(path, ch, code_page)
+                    .or_else(|| shx_missing_glyph(path, ch))
+                {
+                    Some(_) => None,
+                    None => ttf_glyph::fallback_source(ch),
+                }
+            }
+            Face::WithBig { primary, big } => {
+                if ttf_glyph::is_full_width(ch) && shx::bigfont_glyph(big, ch).is_some() {
+                    return None;
+                }
+                primary.glyph_source(ch)
             }
         }
     }
@@ -197,13 +298,30 @@ impl Face {
         }
     }
 
+    /// Depth of the descender below the baseline as a fraction of the text
+    /// height (the cap height). Bottom-justified text sits this far above its
+    /// alignment point whatever its characters: an SHX font's header
+    /// `below / above`, a TrueType face's descender over its cap height, and a
+    /// third (the stroke fonts' `2 / 6`) for the embedded stroke fonts.
+    pub fn descent_ratio(&self) -> f32 {
+        match self {
+            Face::Shx { path, .. } => shx::font_metrics(path)
+                .map(|(above, below)| (below / above) as f32)
+                .unwrap_or(1.0 / 3.0),
+            Face::Ttf { family, .. } => ttf_glyph::descent_ratio(family).unwrap_or(1.0 / 3.0),
+            Face::Lff(_) => 1.0 / 3.0,
+            Face::WithBig { primary, .. } => primary.descent_ratio(),
+        }
+    }
+
     /// Line-spacing factor (1.0 = one cap height between baselines as scaled by
-    /// the caller). TTF uses the neutral 1.0; LFF carries its font's value.
+    /// the caller). TTF and SHX use the neutral 1.0 — an SHX font's
+    /// above/below metrics don't widen the baseline step; LFF carries its
+    /// font's value.
     pub fn line_spacing(&self) -> f32 {
         match self {
             Face::Lff(f) => f.line_spacing,
-            Face::Ttf { .. } => 1.0,
-            Face::Shx { line, .. } => *line,
+            Face::Ttf { .. } | Face::Shx { .. } => 1.0,
             Face::WithBig { primary, .. } => primary.line_spacing(),
         }
     }
@@ -227,8 +345,7 @@ mod tests {
             .find(|f| ttf_glyph::glyph(f, 'A').is_some())
             .expect("a system family with an 'A'");
         assert!(matches!(Face::resolve(fam), Face::Ttf { .. }));
-        let (strokes, _) =
-            lff::tessellate_text_ex([0.0, 0.0], 10.0, 0.0, 1.0, 0.0, fam, "ABC");
+        let (strokes, _) = lff::tessellate_text_ex([0.0, 0.0], 10.0, 0.0, 1.0, 0.0, fam, "ABC");
         assert!(!strokes.is_empty(), "TTF run produced no strokes");
     }
 
@@ -236,6 +353,30 @@ mod tests {
     fn shx_name_stays_lff() {
         assert!(matches!(Face::resolve("txt"), Face::Lff(_)));
         assert!(matches!(Face::resolve("romans.shx"), Face::Lff(_)));
+    }
+
+    // `txt`/`monotxt` are the DXF *stroke* text fonts. An installed TrueType
+    // face that happens to share the name (e.g. "Txt Regular") is not that
+    // font and must never stand in for it, so the stroke substitute is drawn
+    // on every machine. The #1764 escape hatch (an installed copy of a real
+    // TrueType alias such as ISOCPEUR draws that face) stays for aliases that
+    // genuinely name one.
+    #[test]
+    fn stroke_aliases_ignore_a_same_named_true_type_face() {
+        for name in &["txt", "TXT", "monotxt", "MONOTXT"] {
+            assert!(
+                matches!(Face::resolve(name), Face::Lff(_)),
+                "{name} must resolve to the embedded stroke font"
+            );
+        }
+        // A stroke face still supplies its own Latin glyphs.
+        assert!(Face::resolve("txt").glyph('A').is_some());
+        // ISOCPEUR keeps the #1764 behaviour: Lff stand-in, or the installed
+        // TrueType face when one is present.
+        assert!(matches!(
+            Face::resolve("isocpeur"),
+            Face::Lff(_) | Face::Ttf { .. }
+        ));
     }
 
     #[test]
@@ -282,7 +423,7 @@ mod tests {
             eprintln!("no system fonts; skipping");
             return;
         }
-        
+
         // Arial and Cambria are typical on Windows/Mac/Linux
         for test_name in &["arial", "ARIAL", "ARIALN", "cambria"] {
             let resolved = Face::resolve(test_name);
@@ -290,14 +431,18 @@ mod tests {
                 Face::Ttf { family, .. } => {
                     assert!(
                         family == "Arial" || family == "Arial Narrow" || family == "Cambria",
-                        "Resolved to unexpected family name: {}", family
+                        "Resolved to unexpected family name: {}",
+                        family
                     );
                 }
                 Face::Lff(_) => {
                     // It's possible some test environments don't have Arial or Cambria,
                     // but if they are present in sysfont::families() (or we can fallback),
                     // they should resolve to Ttf. If they aren't installed, Lff fallback is accepted.
-                    eprintln!("Font {} resolved to Lff (probably not installed)", test_name);
+                    eprintln!(
+                        "Font {} resolved to Lff (probably not installed)",
+                        test_name
+                    );
                 }
                 Face::Shx { .. } | Face::WithBig { .. } => {
                     // A system TTF name never resolves to an SHX shape font
@@ -308,7 +453,21 @@ mod tests {
         }
     }
 
-
+    #[test]
+    fn styled_ttf_names_keep_their_style_suffix() {
+        let Some(styled) = sysfont::families().into_iter().find_map(|family| {
+            let styled = format!("{family}{}bi", sysfont::STYLE_SEP);
+            sysfont::has_family(&styled).then_some(styled)
+        }) else {
+            eprintln!("no styled system font; skipping");
+            return;
+        };
+        let Face::Ttf { family, .. } = Face::resolve(&styled) else {
+            panic!("styled system family must remain a TrueType face");
+        };
+        let (_, bold, italic) = sysfont::split_style(&family);
+        assert!(bold && italic, "style suffix lost from {family:?}");
+    }
 
     #[test]
     fn big_font_pairing_routes_ideographs_and_leaves_latin_alone() {

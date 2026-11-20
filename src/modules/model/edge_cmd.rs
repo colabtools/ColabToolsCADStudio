@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use codec::Handle;
-use kernel::brep::{Body, EdgeKey, FaceKey};
+use document::Handle;
 use glam::DVec3;
+use ocs_solid::model::Brep;
 
 use crate::command::{
     CadCommand, CmdOption, CmdResult, DynAnchor, DynFieldSpec, DynGuide, DynRole, DynSpec,
@@ -46,16 +46,16 @@ enum EdgeStep {
 pub struct SolidEdgeCommand {
     operation: EdgeOperation,
     target: Option<Handle>,
-    bodies: Vec<(Handle, Body)>,
+    bodies: Vec<(Handle, Brep)>,
     handle: Option<Handle>,
-    selected_edges: Vec<EdgeKey>,
-    base_face: Option<FaceKey>,
-    selection_batches: Vec<(Vec<EdgeKey>, DVec3)>,
+    selected_edges: Vec<u32>,
+    base_face: Option<u32>,
+    selection_batches: Vec<(Vec<u32>, DVec3)>,
     selection_mode: EdgeSelectionMode,
     step: EdgeStep,
     value_return: EdgeStep,
     expression_return: EdgeStep,
-    loop_candidates: Vec<(FaceKey, Vec<EdgeKey>)>,
+    loop_candidates: Vec<(u32, Vec<u32>)>,
     loop_index: usize,
     last_pick: Option<DVec3>,
     default_value: f64,
@@ -69,7 +69,7 @@ impl SolidEdgeCommand {
     pub fn new(
         operation: EdgeOperation,
         target: Option<Handle>,
-        bodies: Vec<(Handle, Body)>,
+        bodies: Vec<(Handle, Brep)>,
         preview_color: [f32; 4],
     ) -> Self {
         Self {
@@ -101,7 +101,7 @@ impl SolidEdgeCommand {
 
     pub fn new_chamfer(
         target: Option<Handle>,
-        bodies: Vec<(Handle, Body)>,
+        bodies: Vec<(Handle, Brep)>,
         preview_color: [f32; 4],
         distances: (f64, f64),
     ) -> Self {
@@ -115,13 +115,13 @@ impl SolidEdgeCommand {
         (self.default_value, self.other_value)
     }
 
-    fn body(&self, handle: Handle) -> Option<&Body> {
+    fn body(&self, handle: Handle) -> Option<&Brep> {
         self.bodies
             .iter()
             .find_map(|(candidate, body)| (*candidate == handle).then_some(body))
     }
 
-    fn active_body(&self) -> Option<(Handle, &Body)> {
+    fn active_body(&self) -> Option<(Handle, &Brep)> {
         let handle = self.handle?;
         self.body(handle).map(|body| (handle, body))
     }
@@ -133,7 +133,7 @@ impl SolidEdgeCommand {
             && self.body(handle).is_some()
     }
 
-    fn add_batch(&mut self, edges: Vec<EdgeKey>, anchor: DVec3) -> bool {
+    fn add_batch(&mut self, edges: Vec<u32>, anchor: DVec3) -> bool {
         let batch = edges
             .into_iter()
             .filter(|edge| !self.selected_edges.contains(edge))
@@ -146,19 +146,19 @@ impl SolidEdgeCommand {
         true
     }
 
-    fn current_loop(&self) -> Option<&[EdgeKey]> {
+    fn current_loop(&self) -> Option<&[u32]> {
         self.loop_candidates
             .get(self.loop_index)
             .map(|(_, edges)| edges.as_slice())
     }
 
-    fn current_loop_face(&self) -> Option<FaceKey> {
+    fn current_loop_face(&self) -> Option<u32> {
         self.loop_candidates
             .get(self.loop_index)
             .map(|(face, _)| *face)
     }
 
-    fn preview_edges(&self) -> Vec<EdgeKey> {
+    fn preview_edges(&self) -> Vec<u32> {
         let mut edges = self.selected_edges.clone();
         if self.step == EdgeStep::LoopConfirm {
             if let Some(loop_edges) = self.current_loop() {
@@ -186,11 +186,7 @@ impl SolidEdgeCommand {
         )
     }
 
-    fn preview_for_values(
-        &self,
-        value: f64,
-        other_value: f64,
-    ) -> Option<(Handle, Vec<WireModel>)> {
+    fn preview_for_values(&self, value: f64, other_value: f64) -> Option<(Handle, Vec<WireModel>)> {
         if !self.preview_active() {
             return None;
         }
@@ -200,8 +196,8 @@ impl SolidEdgeCommand {
         }
         let (handle, body) = self.active_body()?;
         let result = match self.operation {
-            EdgeOperation::Fillet => kernel::brep::fillet_edges(body, &edges, value).ok()?,
-            EdgeOperation::Chamfer => kernel::brep::chamfer_edges(
+            EdgeOperation::Fillet => ocs_solid::model::fillet(body, &edges, value).ok()?,
+            EdgeOperation::Chamfer => ocs_solid::model::chamfer(
                 body,
                 &edges,
                 self.base_face.or_else(|| self.current_loop_face())?,
@@ -210,12 +206,8 @@ impl SolidEdgeCommand {
             )
             .ok()?,
         };
-        let mut wires = crate::scene::model::solid_model::grip_preview_wires(
-            &result,
-            handle,
-            [0; 2],
-            false,
-        );
+        let mut wires =
+            crate::scene::model::solid_model::grip_preview_wires(&result, handle, [0; 2], false);
         for wire in &mut wires {
             wire.color = self.preview_color;
             wire.name = format!("{}-{}-PREVIEW", handle.value(), self.name());
@@ -223,14 +215,48 @@ impl SolidEdgeCommand {
         (!wires.is_empty()).then_some((handle, wires))
     }
 
+    /// The chamfer's base surface, outlined like a hovered face, so the face
+    /// Distance1 is measured on shows while edges and distances are given.
+    fn base_face_wires(&self) -> Vec<WireModel> {
+        if self.operation != EdgeOperation::Chamfer {
+            return Vec::new();
+        }
+        let (Some(face), Some((handle, body))) = (
+            self.base_face.or_else(|| self.current_loop_face()),
+            self.active_body(),
+        ) else {
+            return Vec::new();
+        };
+        crate::scene::model::solid_model::face_outline(body, face)
+            .into_iter()
+            .map(|points| {
+                let mut wire = WireModel::solid_f64(
+                    format!("{}-CHAMFER-BASE", handle.value()),
+                    points,
+                    WireModel::HOVER,
+                    false,
+                );
+                wire.set_fixed_screen_width(2.0);
+                wire
+            })
+            .collect()
+    }
+
     fn rebuild_preview(&mut self) {
         self.preview_wires.clear();
         self.preview_hidden.clear();
-        if let Some((handle, wires)) =
-            self.preview_for_values(self.default_value, self.other_value)
+        if let Some((handle, wires)) = self.preview_for_values(self.default_value, self.other_value)
         {
             self.preview_wires = wires;
-            self.preview_hidden.push(handle);
+            // While edges are still being picked the source stays drawn: a
+            // hidden solid leaves the pick meshes, so the next edge could not
+            // be selected (#1625). The preview overlays it until confirmed.
+            if !matches!(
+                self.step,
+                EdgeStep::Selecting | EdgeStep::PickingLoop | EdgeStep::LoopConfirm
+            ) {
+                self.preview_hidden.push(handle);
+            }
         }
     }
 
@@ -359,11 +385,13 @@ impl CadCommand for SolidEdgeCommand {
             (_, EdgeStep::PreviewConfirm, _) => {
                 crate::t!("Press Enter to accept the fillet or [Radius]:").into_owned()
             }
-            (_, EdgeStep::Radius, _) if self.value_return == EdgeStep::PreviewConfirm => crate::tf!(
-                "Specify Radius or [Expression] <{:.4}>:",
-                self.default_value
-            )
-            .into_owned(),
+            (_, EdgeStep::Radius, _) if self.value_return == EdgeStep::PreviewConfirm => {
+                crate::tf!(
+                    "Specify Radius or [Expression] <{:.4}>:",
+                    self.default_value
+                )
+                .into_owned()
+            }
             (_, EdgeStep::Radius, _) => crate::tf!(
                 "Enter fillet radius or [Expression] <{:.4}>:",
                 self.default_value
@@ -376,18 +404,15 @@ impl CadCommand for SolidEdgeCommand {
 
     fn options(&self) -> Vec<CmdOption> {
         match (self.operation, self.step, self.selection_mode) {
-            (EdgeOperation::Chamfer, EdgeStep::Selecting, _) => vec![
-                CmdOption::new("Loop", "L"),
-                CmdOption::new("Distance", "D"),
-            ],
-            (EdgeOperation::Chamfer, EdgeStep::PickingLoop, _) => vec![
-                CmdOption::new("Edge", "E"),
-                CmdOption::new("Distance", "D"),
-            ],
-            (EdgeOperation::Chamfer, EdgeStep::LoopConfirm, _) => vec![
-                CmdOption::new("Accept", "A"),
-                CmdOption::new("Next", "N"),
-            ],
+            (EdgeOperation::Chamfer, EdgeStep::Selecting, _) => {
+                vec![CmdOption::new("Loop", "L"), CmdOption::new("Distance", "D")]
+            }
+            (EdgeOperation::Chamfer, EdgeStep::PickingLoop, _) => {
+                vec![CmdOption::new("Edge", "E"), CmdOption::new("Distance", "D")]
+            }
+            (EdgeOperation::Chamfer, EdgeStep::LoopConfirm, _) => {
+                vec![CmdOption::new("Accept", "A"), CmdOption::new("Next", "N")]
+            }
             (EdgeOperation::Chamfer, EdgeStep::PreviewConfirm, _) => {
                 vec![CmdOption::new("Distance", "D")]
             }
@@ -401,19 +426,17 @@ impl CadCommand for SolidEdgeCommand {
                 CmdOption::new("Loop", "L"),
                 CmdOption::new("Radius", "R"),
             ],
-            (EdgeOperation::Fillet, EdgeStep::Selecting, EdgeSelectionMode::Chain) => vec![
-                CmdOption::new("Edge", "E"),
-                CmdOption::new("Radius", "R"),
-            ],
+            (EdgeOperation::Fillet, EdgeStep::Selecting, EdgeSelectionMode::Chain) => {
+                vec![CmdOption::new("Edge", "E"), CmdOption::new("Radius", "R")]
+            }
             (EdgeOperation::Fillet, EdgeStep::PickingLoop, _) => vec![
                 CmdOption::new("Edge", "E"),
                 CmdOption::new("Chain", "C"),
                 CmdOption::new("Radius", "R"),
             ],
-            (EdgeOperation::Fillet, EdgeStep::LoopConfirm, _) => vec![
-                CmdOption::new("Accept", "A"),
-                CmdOption::new("Next", "N"),
-            ],
+            (EdgeOperation::Fillet, EdgeStep::LoopConfirm, _) => {
+                vec![CmdOption::new("Accept", "A"), CmdOption::new("Next", "N")]
+            }
             (EdgeOperation::Fillet, EdgeStep::PreviewConfirm, _) => {
                 vec![CmdOption::new("Radius", "R")]
             }
@@ -444,10 +467,9 @@ impl CadCommand for SolidEdgeCommand {
         if !self.pick_allowed(handle) {
             return CmdResult::NeedPoint;
         }
-        let Some(seed) = self
-            .body(handle)
-            .and_then(|body| crate::scene::model::solid_model::nearest_edge(body, point.to_array()))
-        else {
+        let Some(seed) = self.body(handle).and_then(|body| {
+            crate::scene::model::solid_model::nearest_edge(body, point.to_array())
+        }) else {
             return CmdResult::NeedPoint;
         };
         self.handle = Some(handle);
@@ -457,8 +479,7 @@ impl CadCommand for SolidEdgeCommand {
             self.loop_candidates = edge_loops(self.body(handle).expect("pick body exists"), seed);
             if self.operation == EdgeOperation::Chamfer {
                 if let Some(base_face) = self.base_face {
-                    self.loop_candidates
-                        .retain(|(face, _)| *face == base_face);
+                    self.loop_candidates.retain(|(face, _)| *face == base_face);
                 }
             }
             self.loop_index = 0;
@@ -473,15 +494,18 @@ impl CadCommand for SolidEdgeCommand {
 
         if self.operation == EdgeOperation::Chamfer {
             if self.base_face.is_none() {
-                self.base_face = self.body(handle).and_then(|body| {
-                    nearest_edge_face(body, seed, point.to_array())
-                });
+                self.base_face = self
+                    .body(handle)
+                    .and_then(|body| nearest_edge_face(body, seed, point.to_array()));
             }
             let Some(base_face) = self.base_face else {
                 return CmdResult::NeedPoint;
             };
-            if !edge_belongs_to_face(self.body(handle).expect("pick body exists"), seed, base_face)
-            {
+            if !edge_belongs_to_face(
+                self.body(handle).expect("pick body exists"),
+                seed,
+                base_face,
+            ) {
                 return CmdResult::NeedPoint;
             }
             self.add_batch(vec![seed], point);
@@ -491,7 +515,9 @@ impl CadCommand for SolidEdgeCommand {
 
         let edges = match self.selection_mode {
             EdgeSelectionMode::Edge => vec![seed],
-            EdgeSelectionMode::Chain => edge_chain(self.body(handle).expect("pick body exists"), seed),
+            EdgeSelectionMode::Chain => {
+                edge_chain(self.body(handle).expect("pick body exists"), seed)
+            }
         };
         self.add_batch(edges, point);
         self.rebuild_preview();
@@ -565,7 +591,7 @@ impl CadCommand for SolidEdgeCommand {
                     }
                 }
                 EdgeStep::Expression => {
-                    let value = crate::app::expr_eval::eval_number(text)?;
+                    let value = crate::entities::expr_eval::eval_number(text)?;
                     self.step = self.expression_return;
                     self.accept_distance(value)
                 }
@@ -626,7 +652,7 @@ impl CadCommand for SolidEdgeCommand {
                 self.accept_radius(value)
             }
             EdgeStep::Expression => {
-                let value = crate::app::expr_eval::eval_number(text)?;
+                let value = crate::entities::expr_eval::eval_number(text)?;
                 self.accept_radius(value)
             }
             EdgeStep::ChamferDistance1 | EdgeStep::ChamferDistance2 => None,
@@ -675,7 +701,11 @@ impl CadCommand for SolidEdgeCommand {
         }
         let (batch, _) = self.selection_batches.pop()?;
         for edge in batch {
-            if let Some(index) = self.selected_edges.iter().position(|candidate| *candidate == edge) {
+            if let Some(index) = self
+                .selected_edges
+                .iter()
+                .position(|candidate| *candidate == edge)
+            {
                 self.selected_edges.remove(index);
             }
         }
@@ -683,10 +713,7 @@ impl CadCommand for SolidEdgeCommand {
             self.handle = None;
             self.base_face = None;
         }
-        self.last_pick = self
-            .selection_batches
-            .last()
-            .map(|(_, anchor)| *anchor);
+        self.last_pick = self.selection_batches.last().map(|(_, anchor)| *anchor);
         self.step = EdgeStep::Selecting;
         self.rebuild_preview();
         Some(CmdResult::NeedPoint)
@@ -731,8 +758,8 @@ impl CadCommand for SolidEdgeCommand {
             self.step,
             EdgeStep::Radius | EdgeStep::ChamferDistance1 | EdgeStep::ChamferDistance2
         )
-            .then(|| self.last_pick.map(|pick| cursor.distance(pick)))
-            .flatten()
+        .then(|| self.last_pick.map(|pick| cursor.distance(pick)))
+        .flatten()
     }
 
     fn on_preview_wires(&mut self, cursor: DVec3) -> Vec<WireModel> {
@@ -757,7 +784,9 @@ impl CadCommand for SolidEdgeCommand {
                 }
             }
         }
-        self.preview_wires.clone()
+        let mut wires = self.preview_wires.clone();
+        wires.extend(self.base_face_wires());
+        wires
     }
 
     fn preview_hidden_handles(&self) -> &[Handle] {
@@ -765,24 +794,20 @@ impl CadCommand for SolidEdgeCommand {
     }
 }
 
-fn edge_loops(body: &Body, seed: EdgeKey) -> Vec<(FaceKey, Vec<EdgeKey>)> {
-    let Some(edge) = body.edges.get(seed) else {
+fn edge_loops(body: &Brep, seed: u32) -> Vec<(u32, Vec<u32>)> {
+    let Some(edge) = body.edges.get(seed as usize) else {
         return Vec::new();
     };
     let mut candidates = Vec::new();
-    for coedge_key in &edge.coedges {
-        let Some(coedge) = body.coedges.get(*coedge_key) else {
+    for edge_use in &edge.uses {
+        let Some(face) = body.faces.get(edge_use.face as usize) else {
             continue;
         };
-        let Some(edge_loop) = body.loops.get(coedge.owner) else {
+        let Some(ocs_solid::model::r::Loop::Edges { edges }) = face.loops.get(edge_use.r#loop as usize)
+        else {
             continue;
         };
-        let edges = edge_loop
-            .coedges
-            .iter()
-            .filter_map(|key| body.coedges.get(*key).map(|coedge| coedge.edge))
-            .collect::<Vec<_>>();
-        let candidate = (edge_loop.owner, edges);
+        let candidate = (edge_use.face, edges.iter().map(|oriented| oriented.edge).collect::<Vec<_>>());
         if !candidate.1.is_empty() && !candidates.contains(&candidate) {
             candidates.push(candidate);
         }
@@ -790,30 +815,15 @@ fn edge_loops(body: &Body, seed: EdgeKey) -> Vec<(FaceKey, Vec<EdgeKey>)> {
     candidates
 }
 
-fn edge_belongs_to_face(body: &Body, edge: EdgeKey, face: FaceKey) -> bool {
-    body.edges.get(edge).is_some_and(|edge| {
-        edge.coedges.iter().any(|coedge| {
-            body.coedges
-                .get(*coedge)
-                .and_then(|coedge| body.loops.get(coedge.owner))
-                .is_some_and(|edge_loop| edge_loop.owner == face)
-        })
-    })
+fn edge_belongs_to_face(body: &Brep, edge: u32, face: u32) -> bool {
+    body.edges
+        .get(edge as usize)
+        .is_some_and(|edge| edge.uses.iter().any(|edge_use| edge_use.face == face))
 }
 
-fn nearest_edge_face(body: &Body, edge: EdgeKey, point: [f64; 3]) -> Option<FaceKey> {
-    let edge = body.edges.get(edge)?;
-    edge.coedges
-        .iter()
-        .filter_map(|coedge| {
-            let edge_loop = body.loops.get(body.coedges.get(*coedge)?.owner)?;
-            let face = body.faces.get(edge_loop.owner)?;
-            let surface = body.surfaces.get(face.surface)?;
-            let distance = surface.distance_to(point).abs();
-            distance.is_finite().then_some((edge_loop.owner, distance))
-        })
-        .min_by(|first, second| first.1.total_cmp(&second.1))
-        .map(|(face, _)| face)
+fn nearest_edge_face(body: &Brep, edge: u32, point: [f64; 3]) -> Option<u32> {
+    let faces = body.edges.get(edge as usize)?.uses.iter().map(|edge_use| edge_use.face).collect::<Vec<_>>();
+    ocs_solid::model::nearest_face(body, &faces, point).map(|(face, _)| face)
 }
 
 fn positive_default(value: f64) -> f64 {
@@ -824,31 +834,25 @@ fn positive_default(value: f64) -> f64 {
     }
 }
 
-fn edge_chain(body: &Body, seed: EdgeKey) -> Vec<EdgeKey> {
+fn edge_chain(body: &Brep, seed: u32) -> Vec<u32> {
     let mut chain = vec![seed];
     let mut next = 0;
     while next < chain.len() {
         let current_key = chain[next];
         next += 1;
-        let Some(current) = body.edges.get(current_key) else {
+        let Some(current) = body.edges.get(current_key as usize) else {
             continue;
         };
-        for vertex in [current.start, current.end] {
+        for vertex in current.vertices {
             let Some(current_tangent) = edge_tangent_from_vertex(body, current_key, vertex) else {
                 continue;
             };
-            for candidate_key in body.edge_keys() {
-                if chain.contains(&candidate_key) {
+            for (candidate_key, candidate) in body.edges.iter().enumerate() {
+                let candidate_key = candidate_key as u32;
+                if chain.contains(&candidate_key) || !candidate.vertices.contains(&vertex) {
                     continue;
                 }
-                let Some(candidate) = body.edges.get(candidate_key) else {
-                    continue;
-                };
-                if candidate.start != vertex && candidate.end != vertex {
-                    continue;
-                }
-                let Some(candidate_tangent) =
-                    edge_tangent_from_vertex(body, candidate_key, vertex)
+                let Some(candidate_tangent) = edge_tangent_from_vertex(body, candidate_key, vertex)
                 else {
                     continue;
                 };
@@ -861,26 +865,23 @@ fn edge_chain(body: &Body, seed: EdgeKey) -> Vec<EdgeKey> {
     chain
 }
 
-fn edge_tangent_from_vertex(
-    body: &Body,
-    edge_key: EdgeKey,
-    vertex: kernel::brep::VertexKey,
-) -> Option<DVec3> {
-    let edge = body.edges.get(edge_key)?;
-    let curve = body.curves.get(edge.curve)?;
-    let span = edge.end_parameter - edge.start_parameter;
+fn edge_tangent_from_vertex(body: &Brep, edge_key: u32, vertex: u32) -> Option<DVec3> {
+    let edge = body.edges.get(edge_key as usize)?;
+    let [low, high] = edge.interval;
+    let span = high - low;
     if !span.is_finite() || span.abs() <= f64::EPSILON {
         return None;
     }
     let step = span * 1.0e-6;
-    let (at, inside) = if edge.start == vertex {
-        (edge.start_parameter, edge.start_parameter + step)
-    } else if edge.end == vertex {
-        (edge.end_parameter, edge.end_parameter - step)
+    let (at, inside) = if edge.vertices[0] == vertex {
+        (low, low + step)
+    } else if edge.vertices[1] == vertex {
+        (high, high - step)
     } else {
         return None;
     };
-    let tangent = DVec3::from(curve.point_at(inside)) - DVec3::from(curve.point_at(at));
+    let point = |t| ocs_solid::geometry::point_on(edge.parameters(), t).map(DVec3::from);
+    let tangent = point(inside)? - point(at)?;
     (tangent.length_squared() > 0.0 && tangent.is_finite()).then(|| tangent.normalize())
 }
 

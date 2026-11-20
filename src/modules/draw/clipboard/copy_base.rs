@@ -3,12 +3,18 @@
 // The command only collects the base point; the host performs the copy when it
 // receives the dispatched `COPYBASE_AT <x> <y> <z>` token.
 
-use glam::DVec3;
 use crate::t;
+use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult};
 
 pub struct CopyBaseCommand;
+
+impl Default for CopyBaseCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CopyBaseCommand {
     pub fn new() -> Self {

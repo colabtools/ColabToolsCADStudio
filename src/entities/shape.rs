@@ -5,16 +5,18 @@
 // but apply the SHAPE's own rotation / oblique / width factor so the marker
 // gives a rough indication of the glyph orientation.
 
-use codec::entities::Shape;
 use crate::t;
+use document::entities::Shape;
 
-use crate::command::EntityTransform;
-use crate::entities::common::{edit_angle_prop as edit_angle, edit_prop as edit, ro_prop as ro, square_grip};
-use crate::entities::traits::{Grippable, PropertyEditable, Transformable, RenderConvertible};
+use crate::entities::common::{
+    edit_angle_prop as edit_angle, edit_prop as edit, ro_prop as ro, square_grip,
+};
+use crate::entities::traits::{Grippable, PropertyEditable, RenderConvertible, Transformable};
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{RenderEntity, RenderObject};
-use crate::scene::model::object::{GripApply, GripDef, PropSection, Property, PropValue};
-use crate::scene::view::transform;
+use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::model::wire_model::SnapHint;
+use crate::scene::view::transform;
 
 // ── Marker geometry ───────────────────────────────────────────────────────────
 
@@ -62,7 +64,7 @@ fn shape_marker(
 /// absolute paths are the norm in traded files).
 fn shx_polylines(
     shape: &Shape,
-    document: &codec::CadDocument,
+    document: &document::Document,
 ) -> Option<crate::scene::text::shx::ShapePolylines> {
     let base = document
         .source_path
@@ -74,12 +76,12 @@ fn shx_polylines(
     // Resolve the glyph from one style's shape (.shx) file, preferring the
     // shape NUMBER but falling back to the NAME — a DXF SHAPE carries only the
     // name (code 2), so its `shape_number` is 0.
-    let try_style = |style: &codec::tables::TextStyle| {
+    let try_style = |style: &document::tables::TextStyle| {
         let font = style.font_file.trim();
         if font.is_empty() {
             return None;
         }
-        let resolved = crate::io::resolve_image_file(font, base)?;
+        let resolved = crate::io::linetypes::find_shape_file(font, base)?;
         if let Ok(num) = u16::try_from(shape.shape_number) {
             if num != 0 {
                 if let Some(p) = crate::scene::text::shx::shape_polylines(&resolved, num) {
@@ -130,7 +132,7 @@ fn shx_polylines(
 }
 
 impl RenderConvertible for Shape {
-    fn to_render(&self, _document: &codec::CadDocument) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         // SHAPE insertion point is OCS (planar entity) — map through the
         // arbitrary axis so a mirrored shape's marker lands where it renders.
         let (ox, oy, oz) = crate::scene::view::transform::ocs_point_to_wcs(
@@ -232,14 +234,14 @@ impl Grippable for Shape {
         if grip_id == 0 {
             match apply {
                 GripApply::Translate(d) => {
-                    self.insertion_point.x += d.x as f64;
-                    self.insertion_point.y += d.y as f64;
-                    self.insertion_point.z += d.z as f64;
+                    self.insertion_point.x += d.x;
+                    self.insertion_point.y += d.y;
+                    self.insertion_point.z += d.z;
                 }
                 GripApply::Absolute(p) => {
-                    self.insertion_point.x = p.x as f64;
-                    self.insertion_point.y = p.y as f64;
-                    self.insertion_point.z = p.z as f64;
+                    self.insertion_point.x = p.x;
+                    self.insertion_point.y = p.y;
+                    self.insertion_point.z = p.z;
                 }
             }
         }
@@ -258,7 +260,11 @@ impl PropertyEditable for Shape {
             title: t!("Geometry").into_owned(),
             props: vec![
                 ro(t!("Name").as_ref(), "shp_name", self.shape_name.clone()),
-                ro(t!("Number").as_ref(), "shp_number", self.shape_number.to_string()),
+                ro(
+                    t!("Number").as_ref(),
+                    "shp_number",
+                    self.shape_number.to_string(),
+                ),
                 Property {
                     label: t!("Style").into_owned(),
                     field: "shp_style",
@@ -267,14 +273,26 @@ impl PropertyEditable for Shape {
                         options: text_style_names.to_vec(),
                     },
                 },
-                ro(t!("Style Handle").as_ref(), "shp_style_handle", style_handle_display),
+                ro(
+                    t!("Style Handle").as_ref(),
+                    "shp_style_handle",
+                    style_handle_display,
+                ),
                 edit(t!("Insert X").as_ref(), "shp_ix", self.insertion_point.x),
                 edit(t!("Insert Y").as_ref(), "shp_iy", self.insertion_point.y),
                 edit(t!("Insert Z").as_ref(), "shp_iz", self.insertion_point.z),
                 edit(t!("Size").as_ref(), "shp_sz", self.size),
-                edit_angle(t!("Rotation").as_ref(), "shp_rot", self.rotation.to_degrees()),
+                edit_angle(
+                    t!("Rotation").as_ref(),
+                    "shp_rot",
+                    self.rotation.to_degrees(),
+                ),
                 edit(t!("Width Factor").as_ref(), "shp_xs", self.relative_x_scale),
-                edit_angle(t!("Oblique Angle").as_ref(), "shp_ob", self.oblique_angle.to_degrees()),
+                edit_angle(
+                    t!("Oblique Angle").as_ref(),
+                    "shp_ob",
+                    self.oblique_angle.to_degrees(),
+                ),
                 edit(t!("Normal X").as_ref(), "shp_nx", self.normal.x),
                 edit(t!("Normal Y").as_ref(), "shp_ny", self.normal.y),
                 edit(t!("Normal Z").as_ref(), "shp_nz", self.normal.z),
@@ -311,12 +329,16 @@ impl PropertyEditable for Shape {
 impl Transformable for Shape {
     fn apply_transform(&mut self, t: &EntityTransform) {
         transform::apply_standard_entity_transform(self, t, |entity, p1, p2| {
-            transform::reflect_xy_point(
-                &mut entity.insertion_point.x,
-                &mut entity.insertion_point.y,
-                p1,
-                p2,
+            // The codec mirror flips the rotation, oblique angle and x scale
+            // with the insertion point; MIRRTEXT off restores them afterwards.
+            let mut wrapped = document::entities::EntityType::Shape(entity.clone());
+            wrapped.mirror(
+                document::types::Vector3::new(p1.x, p1.y, p1.z),
+                document::types::Vector3::new(p2.x, p2.y, p2.z),
             );
+            if let document::entities::EntityType::Shape(mirrored) = wrapped {
+                *entity = mirrored;
+            }
         });
     }
 }

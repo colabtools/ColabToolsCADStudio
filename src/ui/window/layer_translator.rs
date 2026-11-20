@@ -31,7 +31,7 @@ pub struct State {
 
 fn muted(theme: &Theme) -> iced::widget::text::Style {
     iced::widget::text::Style {
-        color: Some(theme.palette().background.base.text.scale_alpha(0.6)),
+        color: Some(crate::ui::style::readable::muted_text(theme)),
     }
 }
 
@@ -150,9 +150,7 @@ pub fn view_window<'a>(
             .on_press_maybe(can_map.then_some(Message::LayerTranslatorMap))
             .padding([4, 10]),
         button(text(t!("Map same")).size(12))
-            .on_press_maybe(
-                (!state.targets.is_empty()).then_some(Message::LayerTranslatorMapSame)
-            )
+            .on_press_maybe((!state.targets.is_empty()).then_some(Message::LayerTranslatorMapSame))
             .padding([4, 10]),
         Space::new().width(Fill),
         loaded,

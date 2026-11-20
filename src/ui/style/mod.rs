@@ -1,32 +1,41 @@
+pub mod anno_object_scale;
+pub mod chrome;
+pub mod common;
 pub mod dimstyle;
+pub(crate) mod editor_table;
+pub mod form;
+pub mod fusion_theme;
+pub mod kit_metrics;
+pub mod linetype;
 pub mod mleaderstyle;
 pub mod mlstyle;
 pub mod plotstyle;
-pub mod textstyle;
-pub mod tablestyle;
 pub mod point_style;
-pub mod style_list;
+pub mod readable;
+pub mod ribbon_metrics;
 pub mod scale_manager;
-pub mod anno_object_scale;
+pub mod start_metrics;
+pub mod studio_theme;
+pub mod style_list;
 pub mod style_manager;
-pub mod common;
-pub mod form;
-pub mod fusion_theme;
+pub mod tablestyle;
+pub mod text;
+pub mod text_metrics;
+pub mod textstyle;
 
 #[cfg(test)]
 mod common_tests {
-    // RED: this test must fail until `common::muted_style` exists and is byte-identical
-    // to the 7 local copies (alpha 0.68). It also documents the btn_s divergence.
+    // `common::muted_style` replaced 7 byte-identical local copies. It was the
+    // text at 0.68 alpha; it is now the opaque, readable muted text. It also
+    // documents the btn_s divergence.
     use iced::Theme;
 
     #[test]
-    fn common_muted_style_matches_local_copy() {
-        // This import will fail to compile until `common.rs` exists → RED
+    fn common_muted_style_is_the_readable_muted_text() {
         let style = crate::ui::style::common::muted_style(&Theme::Dark);
-        let expected = iced::widget::text::Style {
-            color: Some(Theme::Dark.palette().background.base.text.scale_alpha(0.68)),
-        };
-        assert_eq!(style.color, expected.color);
+        let expected = crate::ui::style::readable::muted_text(&Theme::Dark);
+        assert_eq!(style.color, Some(expected));
+        assert_eq!(expected.a, 1.0, "muted text is opaque");
     }
 
     #[test]
@@ -36,6 +45,25 @@ mod common_tests {
         assert_eq!(a.color, b.color);
     }
 
+    /// The green, orange and red the text style windows write in read as
+    /// body text on the light and the dark theme.
+    #[test]
+    fn a_readable_accent_reaches_body_text_contrast_in_both_themes() {
+        use crate::ui::style::common::{readable_accent, wcag_contrast};
+        for theme in [Theme::Light, Theme::Dark] {
+            let palette = theme.palette();
+            let bg = palette.background.base.color;
+            for accent in [
+                palette.success.base.color,
+                palette.warning.base.color,
+                palette.danger.base.color,
+            ] {
+                let color = readable_accent(accent, bg, palette.background.base.text);
+                assert!(wcag_contrast(color, bg) >= 4.5, "{theme}: {color:?}");
+            }
+        }
+    }
+
     #[test]
     fn btn_s_bodies_documented_as_divergent() {
         // The two `btn_s` locals are NOT byte-identical (plotstyle vs style_manager).
@@ -43,6 +71,9 @@ mod common_tests {
         // It passes only after we have proven the divergence; before that it would be
         // meaningless. We keep it as documentation.
         let divergent = true;
-        assert!(divergent, "btn_s in plotstyle.rs:41 and style_manager.rs:299 differ — do not dedup");
+        assert!(
+            divergent,
+            "btn_s in plotstyle.rs:41 and style_manager.rs:299 differ — do not dedup"
+        );
     }
 }

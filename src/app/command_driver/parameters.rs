@@ -32,31 +32,9 @@ impl OpenCADStudio {
         parameters: Vec<String>,
     ) {
         if !dimensions.is_empty() {
-            self.tabs[i].scene.erase_entities(&dimensions);
+            self.tabs[i].scene.erase_constraint_owned(&dimensions);
         }
-        let unused: Vec<String> = parameters
-            .into_iter()
-            .filter(|name| {
-                !self.tabs[i]
-                    .scene
-                    .parametric_constraints
-                    .iter()
-                    .flat_map(|set| set.constraints.iter())
-                    .any(|constraint| {
-                        matches!(
-                            &constraint.driving_param,
-                            Some(crate::scene::named_parameters::DrivingValue::Named(used))
-                                if used == name
-                        )
-                    })
-            })
-            .collect();
-        if !unused.is_empty() {
-            self.tabs[i].scene.record_undo_named_parameters_before();
-            for name in &unused {
-                self.tabs[i].scene.named_parameters_mut().remove(name);
-            }
-        }
+        self.tabs[i].scene.drop_unread_named_parameters(parameters);
     }
 
     /// `Dynamic` or `Annotational`, the DCFORM setting.
@@ -129,10 +107,7 @@ impl OpenCADStudio {
             self.command_line.push_error(&error.to_string());
             return;
         }
-        if !table
-            .resolve(&target)
-            .is_ok_and(|value| value.is_finite())
-        {
+        if !table.resolve(&target).is_ok_and(|value| value.is_finite()) {
             self.command_line.push_error("Invalid expression.");
             return;
         }
@@ -171,7 +146,12 @@ impl OpenCADStudio {
 
     /// Renames a parameter everywhere: the table, the expressions that use
     /// it and the constraints it drives.
-    pub(crate) fn rename_parameter(&mut self, i: usize, old: &str, new: &str) -> Result<(), String> {
+    pub(crate) fn rename_parameter(
+        &mut self,
+        i: usize,
+        old: &str,
+        new: &str,
+    ) -> Result<(), String> {
         use crate::scene::named_parameters::{is_reserved_name, is_valid_name, DrivingValue};
         let table = self.tabs[i].scene.named_parameters().clone();
         let Some(source) = table.get(old).map(|parameter| parameter.source.clone()) else {
@@ -181,7 +161,9 @@ impl OpenCADStudio {
             return Err(format!("Invalid parameter name {new}."));
         }
         let mut renamed = table.clone();
-        renamed.set(new, &source).map_err(|error| error.to_string())?;
+        renamed
+            .set(new, &source)
+            .map_err(|error| error.to_string())?;
         for parameter in table.iter() {
             if parameter.name == old {
                 continue;
@@ -221,7 +203,8 @@ impl OpenCADStudio {
                 .record_undo_parametric_constraints_before(scope, before);
             let set = self.tabs[i].scene.parametric_constraint_set_mut(scope);
             for constraint in &mut set.constraints {
-                if matches!(&constraint.driving_param, Some(DrivingValue::Named(name)) if name == old) {
+                if matches!(&constraint.driving_param, Some(DrivingValue::Named(name)) if name == old)
+                {
                     constraint.driving_param = Some(DrivingValue::Named(new.to_string()));
                 }
             }
@@ -417,6 +400,7 @@ impl OpenCADStudio {
         let pending = self.begin_undo(i, "Apply named parameters", touched.len(), true);
         self.tabs[i].scene.record_undo_named_parameters_before();
         self.tabs[i].scene.named_parameters = table;
+        self.tabs[i].scene.refresh_expression_sweeps();
         self.tabs[i].dirty = true;
         if !touched.is_empty() {
             let changes: Vec<(Handle, crate::scene::ChangeKind)> = touched
@@ -448,6 +432,7 @@ impl OpenCADStudio {
     /// table, so unlike that whole-table Apply this can cheaply scope the
     /// re-solve to just the entities that actually reference it.
     fn resolve_named_parameter_edit(&mut self, i: usize, name: &str) {
+        self.tabs[i].scene.refresh_expression_sweeps();
         let readers: Vec<&crate::scene::parametric_constraints::ParametricConstraint> = self
             .tabs[i]
             .scene
@@ -475,6 +460,15 @@ impl OpenCADStudio {
                 )
             })
             .collect();
+        // Editing a corner turns a side and leaves both lengths alone, as
+        // applying it does. Retention covers every entity the scope solves,
+        // so it is only safe when all this parameter drives is a two-side
+        // corner: a radius would be pinned to its current size, and the
+        // three-point form needs the solver free to resize.
+        let retain_sizes = self.constraint_solve_mode
+            && readers
+                .iter()
+                .all(|c| c.kind == crate::scene::parametric_constraints::ConstraintKind::Angle);
         self.tabs[i].dirty = true;
         if touched.is_empty() {
             self.tabs[i].scene.sync_native_parametric_graph();
@@ -486,7 +480,7 @@ impl OpenCADStudio {
             .collect();
         self.tabs[i]
             .scene
-            .bump_entities_with_parametric_policy(&changes, &anchors, false);
+            .bump_entities_with_parametric_policy(&changes, &anchors, retain_sizes);
     }
 
     /// Commits one field of one Parameters-section row (Properties panel) —
@@ -725,7 +719,7 @@ impl OpenCADStudio {
                     };
                     if annotational {
                         entity.as_entity_mut().set_layer(active_layer.clone());
-                        entity.common_mut().color = codec::types::Color::ByLayer;
+                        entity.common_mut().color = document::types::Color::ByLayer;
                         // The dynamic form's screen-size and horizontal-text
                         // overrides go; the style draws it.
                         for code in [
@@ -744,7 +738,7 @@ impl OpenCADStudio {
                         entity
                             .as_entity_mut()
                             .set_layer(DYNAMIC_DIMENSION_LAYER.to_string());
-                        entity.common_mut().color = codec::types::Color::Rgb {
+                        entity.common_mut().color = document::types::Color::Rgb {
                             r: 103,
                             g: 109,
                             b: 118,
@@ -899,23 +893,24 @@ impl OpenCADStudio {
         Task::none()
     }
 
-    pub(super) fn apply_continuous_constraints(&mut self, i: usize, new_handles: &[codec::Handle]) {
-        let supported_creation = self.tabs[i]
-            .active_cmd
-            .as_ref()
-            .is_some_and(|command| {
-                matches!(
-                    command.name(),
-                    "LINE"
-                        | "PLINE"
-                        | "POLYLINE"
-                        | "RECTANG"
-                        | "RECTANGLE"
-                        | "POLYGON"
-                        | "CIRCLE"
-                        | "ARC"
-                )
-            });
+    pub(super) fn apply_continuous_constraints(
+        &mut self,
+        i: usize,
+        new_handles: &[document::Handle],
+    ) {
+        let supported_creation = self.tabs[i].active_cmd.as_ref().is_some_and(|command| {
+            matches!(
+                command.name(),
+                "LINE"
+                    | "PLINE"
+                    | "POLYLINE"
+                    | "RECTANG"
+                    | "RECTANGLE"
+                    | "POLYGON"
+                    | "CIRCLE"
+                    | "ARC"
+            )
+        });
         if supported_creation {
             self.apply_inferred_constraints(i, new_handles);
         }
@@ -924,7 +919,7 @@ impl OpenCADStudio {
     pub(in crate::app) fn apply_inferred_constraints(
         &mut self,
         i: usize,
-        changed_handles: &[codec::Handle],
+        changed_handles: &[document::Handle],
     ) {
         if !self.constraint_infer || changed_handles.is_empty() {
             return;

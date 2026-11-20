@@ -195,17 +195,21 @@ pub(crate) mod windows_impl {
 
     #[repr(C)]
     struct ISpellCheckerFactoryVtbl {
-        query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
         add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
         release: unsafe extern "system" fn(*mut c_void) -> u32,
-        get_supported_languages: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        get_supported_languages:
+            unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
         is_supported: unsafe extern "system" fn(*mut c_void, *const u16, *mut BOOL) -> HRESULT,
-        create_spell_checker: unsafe extern "system" fn(*mut c_void, *const u16, *mut *mut c_void) -> HRESULT,
+        create_spell_checker:
+            unsafe extern "system" fn(*mut c_void, *const u16, *mut *mut c_void) -> HRESULT,
     }
 
     #[repr(C)]
     struct ISpellCheckerVtbl {
-        query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
         add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
         release: unsafe extern "system" fn(*mut c_void) -> u32,
         get_language_tag: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> HRESULT,
@@ -222,7 +226,8 @@ pub(crate) mod windows_impl {
 
     #[repr(C)]
     struct IEnumSpellingErrorVtbl {
-        query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
         add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
         release: unsafe extern "system" fn(*mut c_void) -> u32,
         next: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
@@ -230,7 +235,8 @@ pub(crate) mod windows_impl {
 
     #[repr(C)]
     struct ISpellingErrorVtbl {
-        query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
         add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
         release: unsafe extern "system" fn(*mut c_void) -> u32,
         get_start_index: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
@@ -241,7 +247,8 @@ pub(crate) mod windows_impl {
 
     #[repr(C)]
     struct IEnumStringVtbl {
-        query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
         add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
         release: unsafe extern "system" fn(*mut c_void) -> u32,
         next: unsafe extern "system" fn(*mut c_void, u32, *mut *mut u16, *mut u32) -> HRESULT,
@@ -266,7 +273,10 @@ pub(crate) mod windows_impl {
     }
 
     fn to_wide(s: &str) -> Vec<u16> {
-        std::ffi::OsStr::new(s).encode_wide().chain(Some(0)).collect()
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(Some(0))
+            .collect()
     }
 
     unsafe fn from_wide_ptr(ptr: *mut u16) -> String {
@@ -288,14 +298,19 @@ pub(crate) mod windows_impl {
         language: String,
     }
 
-    // Windows COM objects created with CLSCTX_INPROC_SERVER are safe to invoke from our control thread.
+    // The spell-checker factory is free-threaded (registry ThreadingModel
+    // "Free") and we initialise the MTA, so the checker can be called from any
+    // thread and its DLL stays loaded for the life of the process.
     unsafe impl Send for WindowsSpeller {}
     unsafe impl Sync for WindowsSpeller {}
 
     impl WindowsSpeller {
         pub fn new(lang_tag: &str) -> Option<Self> {
             unsafe {
-                CoInitializeEx(std::ptr::null(), 0);
+                // COINIT_MULTITHREADED: an STA would be torn down when this
+                // thread exits, unloading the DLL while other threads still
+                // hold checkers.
+                CoInitializeEx(std::ptr::null(), 2);
 
                 let mut factory_obj: *mut c_void = std::ptr::null_mut();
                 let hr = CoCreateInstance(
@@ -367,8 +382,8 @@ pub(crate) mod windows_impl {
 
                 let has_err_exact = has_spelling_error(checker_vtbl, self.checker_obj, &wide_text);
 
-                let is_all_caps = word.chars().any(char::is_alphabetic)
-                    && word == word.to_uppercase();
+                let is_all_caps =
+                    word.chars().any(char::is_alphabetic) && word == word.to_uppercase();
 
                 let mut is_misspelled = has_err_exact;
 
@@ -393,7 +408,11 @@ pub(crate) mod windows_impl {
                         wide_text.clone()
                     };
 
-                    if ((*checker_vtbl).suggest)(self.checker_obj, target_wide.as_ptr(), &mut enum_str) == 0
+                    if ((*checker_vtbl).suggest)(
+                        self.checker_obj,
+                        target_wide.as_ptr(),
+                        &mut enum_str,
+                    ) == 0
                         && !enum_str.is_null()
                     {
                         let enum_vtbl = *(enum_str as *const *const IEnumStringVtbl);
@@ -515,8 +534,8 @@ pub(crate) mod macos_impl {
             }
 
             unsafe {
-                let is_all_caps = word.chars().any(char::is_alphabetic)
-                    && word == word.to_uppercase();
+                let is_all_caps =
+                    word.chars().any(char::is_alphabetic) && word == word.to_uppercase();
 
                 let ns_word = NSString::from_str(word);
                 let range: objc2_foundation::NSRange = msg_send![
@@ -551,7 +570,11 @@ pub(crate) mod macos_impl {
 
                 let mut suggestions = Vec::new();
                 if is_misspelled && want_suggestions {
-                    let target_str = if is_all_caps { word.to_lowercase() } else { word.to_string() };
+                    let target_str = if is_all_caps {
+                        word.to_lowercase()
+                    } else {
+                        word.to_string()
+                    };
                     let ns_target = NSString::from_str(&target_str);
                     let word_len = target_str.encode_utf16().count();
                     let r = objc2_foundation::NSRange {
@@ -595,7 +618,7 @@ pub(crate) mod linux_impl {
     use std::collections::HashSet;
     use std::fs::File;
     use std::io::{BufRead, BufReader};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     const LINUX_DICT_DIRS: &[&str] = &[
         "/usr/share/hunspell",
@@ -645,7 +668,8 @@ pub(crate) mod linux_impl {
                 }
             }
 
-            let has_cli = is_command_in_path("hunspell") || is_command_in_path("aspell");
+            // Only hunspell is ever invoked (`check_via_cli`), so only it counts.
+            let has_cli = is_command_in_path("hunspell");
 
             if !found_any && !has_cli {
                 return None;
@@ -678,17 +702,22 @@ pub(crate) mod linux_impl {
 
             // If CLI hunspell is available, fallback to pipe check
             if self.has_cli_tool {
-                if let Some((valid, suggs)) = check_via_cli(word, &self.language, want_suggestions) {
+                if let Some((valid, suggs)) = check_via_cli(word, &self.language, want_suggestions)
+                {
                     return (valid, suggs);
                 }
             }
 
-            (!self.words.is_empty() && !self.words.contains(&clean), Vec::new())
+            // Not in the wordlist and no CLI answer: misspelled when there is
+            // a wordlist to judge by, unjudged (accepted) when there is none.
+            (self.words.is_empty(), Vec::new())
         }
     }
 
     fn load_wordlist(path: &Path, words: &mut HashSet<String>) -> bool {
-        let Ok(file) = File::open(path) else { return false };
+        let Ok(file) = File::open(path) else {
+            return false;
+        };
         let reader = BufReader::new(file);
         for line in reader.lines().flatten() {
             let entry = line.trim();
@@ -715,7 +744,11 @@ pub(crate) mod linux_impl {
         false
     }
 
-    fn check_via_cli(word: &str, lang: &str, want_suggestions: bool) -> Option<(bool, Vec<String>)> {
+    fn check_via_cli(
+        word: &str,
+        lang: &str,
+        want_suggestions: bool,
+    ) -> Option<(bool, Vec<String>)> {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
@@ -764,4 +797,41 @@ pub(crate) mod linux_impl {
 // ============================================================================
 mod fallback_impl {
     pub struct FallbackSpeller;
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::SystemSpeller;
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    thread_local! {
+        static HELD: RefCell<Option<SystemSpeller>> = const { RefCell::new(None) };
+    }
+
+    // The editor keeps its speller in a thread-local, so the checker is
+    // released as its thread exits. The speller lives in the process-wide
+    // MTA, so thread exit must not unload the spell-checker DLL out from
+    // under the next thread that uses it.
+    #[test]
+    fn speller_survives_com_unload_reload_cycles() {
+        const ROUNDS: usize = 64;
+        let completed = Arc::new(AtomicUsize::new(0));
+        for _ in 0..ROUNDS {
+            let completed = Arc::clone(&completed);
+            let handle = std::thread::spawn(move || {
+                HELD.with(|cell| {
+                    let mut cell = cell.borrow_mut();
+                    *cell = Some(SystemSpeller::new(None));
+                    let speller = cell.as_ref().expect("speller just made");
+                    let (ok, _) = speller.check_word("house", false);
+                    assert!(ok, "'house' must be judged correct");
+                });
+                completed.fetch_add(1, Ordering::Relaxed);
+            });
+            handle.join().expect("speller thread panicked");
+        }
+        assert_eq!(completed.load(Ordering::Relaxed), ROUNDS);
+    }
 }

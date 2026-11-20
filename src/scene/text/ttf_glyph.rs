@@ -9,8 +9,7 @@
 // engine uses**: a capital letter is 9 units tall with the baseline at y = 0.
 // That makes a TTF glyph a drop-in for an LFF one — the existing text layout
 // scales both by `height / 9.0`, so TTF and stroke text share one pipeline.
-// Cap height comes from the font's OS/2 table; if absent we approximate it as
-// 0.7 × units-per-em.
+// Cap height is the top of the capital A's box (see `capital_units`).
 //
 // Unlike LFF single-stroke glyphs, TTF contours are closed outlines (the glyph
 // boundary). Counters — the hole in "O" or "A" — come through as separate
@@ -18,7 +17,9 @@
 
 use crate::scene::text::lff::Glyph;
 use crate::scene::text::sysfont;
+use lru::LruCache;
 use rustc_hash::FxHashMap as HashMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use lyon_tessellation::math::point;
@@ -127,7 +128,7 @@ impl ttf_parser::OutlineBuilder for OutlineFlattener {
 
     fn close(&mut self) {
         // Close the ring back to its start so the wire forms a loop.
-        if self.cur.first().map_or(false, |f| *f != self.pos) {
+        if self.cur.first().is_some_and(|f| *f != self.pos) {
             self.cur.push(self.start);
         }
         self.flush();
@@ -175,7 +176,11 @@ fn hinter_for(
     use skrifa::outline::{Engine, HintingInstance, HintingOptions, Target};
     use skrifa::MetadataProvider;
 
-    if let Some(hit) = hint_cache().lock().unwrap().get(&key) {
+    if let Some(hit) = hint_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
         return hit.clone();
     }
     let outlines = font.outline_glyphs();
@@ -205,7 +210,10 @@ fn hinter_for(
     } else {
         None
     };
-    hint_cache().lock().unwrap().insert(key, built.clone());
+    hint_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, built.clone());
     built
 }
 
@@ -324,13 +332,13 @@ fn cache() -> &'static Mutex<GlyphCache> {
 /// cached per `(family, char)`.
 pub fn glyph(family: &str, ch: char) -> Option<Arc<Glyph>> {
     let key = (family.to_string(), ch);
-    if let Some(hit) = cache().lock().unwrap().get(&key) {
+    if let Some(hit) = cache().lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return hit.clone();
     }
 
     let built = sysfont::with_face_data(family, |data, index| {
         let face = ttf_parser::Face::parse(data, index).ok()?;
-        let gid = face.glyph_index(ch)?;
+        let gid = glyph_id(&face, ch)?;
         let k = cap_scale(&face);
 
         let advance = face.glyph_hor_advance(gid).unwrap_or(0) as f32 * k;
@@ -348,7 +356,10 @@ pub fn glyph(family: &str, ch: char) -> Option<Arc<Glyph>> {
     })
     .flatten();
 
-    cache().lock().unwrap().insert(key, built.clone());
+    cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, built.clone());
     built
 }
 
@@ -388,16 +399,242 @@ pub(crate) fn is_full_width(ch: char) -> bool {
     )
 }
 
-/// Font-unit → 9-unit-cap-height factor for a parsed face. Cap height comes
-/// from the OS/2 table; absent, we approximate it as 0.7 × units-per-em.
+/// Font-unit → 9-unit-cap-height factor for a parsed face (see
+/// [`capital_units`]).
 fn cap_scale(face: &ttf_parser::Face) -> f32 {
-    let upem = face.units_per_em() as f32;
-    let cap = face
-        .capital_height()
-        .filter(|&c| c > 0)
-        .map(|c| c as f32)
-        .unwrap_or(0.7 * upem);
-    CAP_UNITS / cap
+    CAP_UNITS / capital_units(face)
+}
+
+/// The glyph of `ch`. A symbol font maps its characters at U+F000 + code
+/// (the Symbol font's bullet `·` is U+F0B7), so a character of the first 256
+/// codes it has not at its own code is looked up there.
+pub(crate) fn glyph_id(face: &ttf_parser::Face, ch: char) -> Option<ttf_parser::GlyphId> {
+    face.glyph_index(ch).or_else(|| {
+        let code = u32::from(ch);
+        (code <= 0xFF).then_some(())?;
+        face.tables()
+            .cmap?
+            .subtables
+            .into_iter()
+            .find_map(|table| table.glyph_index(0xF000 + code))
+    })
+}
+
+/// The font units a TrueType text height spans, as the reference measures
+/// it: the top of the capital A's box (Times New Roman's apex rises above
+/// its OS/2 cap height, MS Gothic's box above its outline), else the OS/2
+/// cap height, else 0.7 em. A symbol font's A sits at U+F041.
+pub(crate) fn capital_units(face: &ttf_parser::Face) -> f32 {
+    face.glyph_index('A')
+        .or_else(|| {
+            face.tables()
+                .cmap?
+                .subtables
+                .into_iter()
+                .find_map(|table| table.glyph_index(0xF041))
+        })
+        .and_then(|id| face.glyph_bounding_box(id))
+        .map(|bounds| f32::from(bounds.y_max))
+        .filter(|height| *height > 0.0)
+        .or_else(|| face.capital_height().filter(|&c| c > 0).map(f32::from))
+        .unwrap_or(0.7 * face.units_per_em() as f32)
+}
+
+/// Shaping without pair kerning or optional ligatures: the reference sets
+/// TrueType TEXT and MTEXT from each character's own glyph and advance
+/// (`fi` stays an f and an i).
+fn unkerned() -> cosmic_text::FontFeatures {
+    let mut features = cosmic_text::FontFeatures::new();
+    features.disable(cosmic_text::FeatureTag::KERNING);
+    features.disable(cosmic_text::FeatureTag::STANDARD_LIGATURES);
+    features.disable(cosmic_text::FeatureTag::CONTEXTUAL_LIGATURES);
+    features
+}
+
+/// The face's descender depth over its cap height (see [`cap_scale`]).
+pub fn descent_ratio(family: &str) -> Option<f32> {
+    sysfont::with_face_data(family, |data, index| {
+        let face = ttf_parser::Face::parse(data, index).ok()?;
+        let depth = (face.descender() as f32).abs() * cap_scale(&face) / CAP_UNITS;
+        (depth > 0.0).then_some(depth)
+    })
+    .flatten()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GlyphTopologyKey {
+    font: cosmic_text::fontdb::ID,
+    weight: u16,
+    face_index: u32,
+    glyph: u16,
+    scale: u32,
+}
+
+#[derive(Clone)]
+struct CachedTopology {
+    pt_count: usize,
+    indices: Option<Arc<[u32]>>,
+}
+
+fn glyph_topology_cache() -> &'static Mutex<LruCache<GlyphTopologyKey, CachedTopology>> {
+    static CACHE: OnceLock<Mutex<LruCache<GlyphTopologyKey, CachedTopology>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(4096).expect("nonzero cache capacity"),
+        ))
+    })
+}
+
+fn contour_point_count(contours: &[Vec<[f32; 2]>]) -> usize {
+    contours
+        .iter()
+        .filter(|c| c.len() >= 3)
+        .map(|c| c.len())
+        .sum()
+}
+
+fn triangulate_contours_cached(key: GlyphTopologyKey, contours: &[Vec<[f32; 2]>]) -> Vec<[f32; 2]> {
+    if contours.is_empty() {
+        return Vec::new();
+    }
+    let pt_count = contour_point_count(contours);
+    if pt_count == 0 {
+        return Vec::new();
+    }
+
+    if let Some(cached) = glyph_topology_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        match cached.indices {
+            None => return triangulate_contours(contours),
+            Some(indices) if cached.pt_count == pt_count => {
+                thread_local! {
+                    static FLAT_PTS: std::cell::RefCell<Vec<[f32; 2]>> =
+                        const { std::cell::RefCell::new(Vec::new()) };
+                }
+                return FLAT_PTS.with(|cell| {
+                    let mut flat = cell.borrow_mut();
+                    flat.clear();
+                    flat.reserve(pt_count);
+                    for c in contours {
+                        if c.len() >= 3 {
+                            flat.extend_from_slice(c);
+                        }
+                    }
+                    let mut tris = Vec::with_capacity(indices.len());
+                    for &idx in indices.iter() {
+                        tris.push(flat[idx as usize]);
+                    }
+                    tris
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    let mut builder = Path::builder();
+    for contour in contours {
+        if contour.len() < 3 {
+            continue;
+        }
+        builder.begin(point(contour[0][0], contour[0][1]));
+        for p in &contour[1..] {
+            builder.line_to(point(p[0], p[1]));
+        }
+        builder.end(true);
+    }
+    let path = builder.build();
+
+    thread_local! {
+        static TESS_SCRATCH: std::cell::RefCell<(
+            FillTessellator,
+            VertexBuffers<[f32; 2], u32>,
+            Vec<[u32; 2]>,
+            Vec<u32>,
+        )> = std::cell::RefCell::new((
+            FillTessellator::new(),
+            VertexBuffers::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+
+    let (tris, topo) = TESS_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let (tessellator, geometry, flat_bits, vert_to_flat) = &mut *scratch;
+        geometry.clear();
+        if tessellator
+            .tessellate_path(
+                &path,
+                &FillOptions::default().with_fill_rule(FillRule::NonZero),
+                &mut BuffersBuilder::new(geometry, |vertex: FillVertex| {
+                    vertex.position().to_array()
+                }),
+            )
+            .is_err()
+        {
+            return (Vec::new(), None);
+        }
+
+        let mut tris = Vec::with_capacity(geometry.indices.len());
+        for &idx in &geometry.indices {
+            if let Some(&p) = geometry.vertices.get(idx as usize) {
+                tris.push(p);
+            }
+        }
+
+        let mut topo_indices: Option<Arc<[u32]>> = None;
+        if geometry.vertices.len() <= pt_count {
+            flat_bits.clear();
+            flat_bits.reserve(pt_count);
+            for c in contours {
+                if c.len() >= 3 {
+                    for &[x, y] in c {
+                        flat_bits.push([x.to_bits(), y.to_bits()]);
+                    }
+                }
+            }
+            vert_to_flat.clear();
+            vert_to_flat.reserve(geometry.vertices.len());
+            let mut all_matched = true;
+            for &[vx, vy] in &geometry.vertices {
+                let target = [vx.to_bits(), vy.to_bits()];
+                if let Some(pos) = flat_bits.iter().position(|&b| b == target) {
+                    vert_to_flat.push(pos as u32);
+                } else {
+                    all_matched = false;
+                    break;
+                }
+            }
+            if all_matched {
+                let mapped: Vec<u32> = geometry
+                    .indices
+                    .iter()
+                    .map(|&idx| vert_to_flat[idx as usize])
+                    .collect();
+                topo_indices = Some(Arc::from(mapped));
+            }
+        }
+
+        (
+            tris,
+            Some(CachedTopology {
+                pt_count,
+                indices: topo_indices,
+            }),
+        )
+    });
+
+    if let Some(cached) = topo {
+        glyph_topology_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(key, cached);
+    }
+    tris
 }
 
 fn triangulate_contours(contours: &[Vec<[f32; 2]>]) -> Vec<[f32; 2]> {
@@ -418,32 +655,162 @@ fn triangulate_contours(contours: &[Vec<[f32; 2]>]) -> Vec<[f32; 2]> {
     }
     let path = builder.build();
 
-    let mut geometry: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
-    let mut tessellator = FillTessellator::new();
-    // TrueType outlines use the nonzero winding rule; lyon's default even-odd
-    // rule mis-fills glyphs whose contours overlap. On a tessellation failure
-    // the glyph falls back to an empty fill silently — per-glyph logging would
-    // otherwise spam stderr once per character for a malformed font.
-    if tessellator
-        .tessellate_path(
-            &path,
-            &FillOptions::default().with_fill_rule(FillRule::NonZero),
-            &mut BuffersBuilder::new(&mut geometry, |vertex: FillVertex| {
-                vertex.position().to_array()
-            }),
-        )
-        .is_err()
-    {
-        return Vec::new();
+    thread_local! {
+        static TESS_SCRATCH: std::cell::RefCell<(FillTessellator, VertexBuffers<[f32; 2], u32>)> =
+            std::cell::RefCell::new((FillTessellator::new(), VertexBuffers::new()));
     }
 
-    let mut tris = Vec::with_capacity(geometry.indices.len());
-    for &idx in &geometry.indices {
-        if let Some(&p) = geometry.vertices.get(idx as usize) {
-            tris.push(p);
+    TESS_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let (tessellator, geometry) = &mut *scratch;
+        geometry.clear();
+        // TrueType outlines use the nonzero winding rule; lyon's default even-odd
+        // rule mis-fills glyphs whose contours overlap. On a tessellation failure
+        // the glyph falls back to an empty fill silently — per-glyph logging would
+        // otherwise spam stderr once per character for a malformed font.
+        if tessellator
+            .tessellate_path(
+                &path,
+                &FillOptions::default().with_fill_rule(FillRule::NonZero),
+                &mut BuffersBuilder::new(geometry, |vertex: FillVertex| {
+                    vertex.position().to_array()
+                }),
+            )
+            .is_err()
+        {
+            return Vec::new();
         }
+
+        let mut tris = Vec::with_capacity(geometry.indices.len());
+        for &idx in &geometry.indices {
+            if let Some(&p) = geometry.vertices.get(idx as usize) {
+                tris.push(p);
+            }
+        }
+        tris
+    })
+}
+
+// ── Glyph source (for exporters that embed the font) ─────────────────────────
+
+/// One font file's bytes, shared by every glyph taken from it.
+#[derive(Debug)]
+pub struct FontBlob {
+    /// The whole font file (a collection keeps all its faces).
+    pub data: Vec<u8>,
+    /// Face index within `data` (0 for a plain .ttf/.otf).
+    pub index: u32,
+    /// Stable identity: byte length, face index, `head.checkSumAdjustment`.
+    pub id: (usize, u32, u32),
+}
+
+/// The TrueType face and glyph a filled glyph was outlined from.
+///
+/// The PDF exporter embeds `font` and draws the glyph as text instead of
+/// filling the tessellated outline: a glyph of a stroke-heavy CJK face
+/// (DFKai-SB) tessellates into hundreds of triangles, so a text-heavy sheet
+/// exported as hundreds of megabytes that viewers crawl through.
+#[derive(Clone, Debug)]
+pub struct GlyphSource {
+    pub font: Arc<FontBlob>,
+    pub gid: u16,
+    /// Font-unit -> 9-unit factor the outline was normalised with
+    /// ([`cap_scale`] or [`em_scale`]) -- the exporter needs it to place the
+    /// embedded glyph exactly over the outline's tile.
+    pub k: f32,
+    pub units_per_em: u16,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn face_key(data: &[u8], index: u32) -> Option<FaceKey> {
+    use skrifa::raw::TableProvider;
+    let font = skrifa::FontRef::from_index(data, index).ok()?;
+    let head = font.head().ok()?;
+    Some(FaceKey {
+        len: data.len(),
+        index,
+        checksum_adjustment: head.checksum_adjustment(),
+    })
+}
+
+/// Copy each font file once per process, however many glyphs come from it.
+#[cfg(not(target_arch = "wasm32"))]
+fn blob_for(data: &[u8], index: u32) -> Option<Arc<FontBlob>> {
+    static BLOBS: OnceLock<Mutex<HashMap<FaceKey, Arc<FontBlob>>>> = OnceLock::new();
+    let key = face_key(data, index)?;
+    let mut blobs = BLOBS
+        .get_or_init(|| Mutex::new(HashMap::default()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    Some(
+        blobs
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(FontBlob {
+                    data: data.to_vec(),
+                    index,
+                    id: (key.len, key.index, key.checksum_adjustment),
+                })
+            })
+            .clone(),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn source_for(
+    data: &[u8],
+    index: u32,
+    face: &ttf_parser::Face,
+    gid: ttf_parser::GlyphId,
+    k: f32,
+) -> Option<GlyphSource> {
+    Some(GlyphSource {
+        font: blob_for(data, index)?,
+        gid: gid.0,
+        k,
+        units_per_em: face.units_per_em(),
+    })
+}
+
+/// Source of [`glyph`]`(family, ch)`: same face, same glyph, same scale.
+/// Cached per `(family, char)`, like the glyph itself.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn glyph_source(family: &str, ch: char) -> Option<GlyphSource> {
+    type SourceCache = HashMap<(String, char), Option<GlyphSource>>;
+    static CACHE: OnceLock<Mutex<SourceCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::default()));
+    let key = (family.to_string(), ch);
+    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return hit.clone();
     }
-    tris
+    let built = sysfont::with_face_data(family, |data, index| {
+        let face = ttf_parser::Face::parse(data, index).ok()?;
+        let gid = glyph_id(&face, ch)?;
+        source_for(data, index, &face, gid, cap_scale(&face))
+    })
+    .flatten();
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, built.clone());
+    built
+}
+
+/// Source of [`fallback_glyph`]`(ch)`: the face the fallback search settles on.
+/// Cached per character, like the glyph itself.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fallback_source(ch: char) -> Option<GlyphSource> {
+    static CACHE: OnceLock<Mutex<HashMap<char, Option<GlyphSource>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::default()));
+    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&ch) {
+        return hit.clone();
+    }
+    let built = pick_fallback(ch, true).and_then(|(_, source)| source);
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(ch, built.clone());
+    built
 }
 
 // ── Shaping ────────────────────────────────────────────────────────────────
@@ -456,18 +823,426 @@ pub struct PlacedGlyph {
     pub fill_tris: Vec<[f32; 2]>,
 }
 
+/// Native runs share positioned geometry; web runs retain inline ownership.
+#[cfg(not(target_arch = "wasm32"))]
+pub type RunGlyph = Arc<PlacedGlyph>;
+/// Web font databases are per-run, so their glyphs are not shared globally.
+#[cfg(target_arch = "wasm32")]
+pub type RunGlyph = PlacedGlyph;
+
 /// A fully shaped run.
 pub struct ShapedRun {
-    pub glyphs: Vec<PlacedGlyph>,
+    pub glyphs: Vec<RunGlyph>,
     /// Total pen advance of the run (9-unit).
     pub advance: f32,
+    /// Every laid-out glyph (blank ones too) as the byte range of the text it
+    /// shows and its visual [left, right] pen cell, 9-unit.
+    pub cells: Vec<(usize, usize, f32, f32)>,
 }
 
-type ShapeCache = HashMap<(String, String), Option<Arc<ShapedRun>>>;
+// Native shaping uses one process-wide FontSystem, so its face IDs remain
+// meaningful between runs. Web creates a fresh database per run and must not
+// share by those IDs across databases.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PositionedGlyphKey {
+    font: fontdb::ID,
+    weight: u16,
+    face_index: u32,
+    glyph: u16,
+    scale: u32,
+    x: u32,
+    y: u32,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct PositionedGlyphCache {
+    entries: LruCache<PositionedGlyphKey, (Arc<PlacedGlyph>, usize)>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PositionedGlyphCache {
+    fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: LruCache::new(NonZeroUsize::new(max_entries).expect("nonzero cache capacity")),
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn get(&mut self, key: &PositionedGlyphKey) -> Option<Arc<PlacedGlyph>> {
+        self.entries.get(key).map(|(glyph, _)| glyph.clone())
+    }
+
+    fn insert(&mut self, key: PositionedGlyphKey, glyph: Arc<PlacedGlyph>) {
+        use std::mem::size_of;
+        let bytes = glyph.strokes.iter().fold(
+            size_of::<PositionedGlyphKey>()
+                .saturating_add(size_of::<PlacedGlyph>())
+                .saturating_add(2 * size_of::<usize>())
+                .saturating_add(
+                    glyph
+                        .strokes
+                        .capacity()
+                        .saturating_mul(size_of::<Vec<[f32; 2]>>()),
+                )
+                .saturating_add(
+                    glyph
+                        .fill_tris
+                        .capacity()
+                        .saturating_mul(size_of::<[f32; 2]>()),
+                ),
+            |total, contour| {
+                total.saturating_add(contour.capacity().saturating_mul(size_of::<[f32; 2]>()))
+            },
+        );
+        if bytes > self.max_bytes {
+            return;
+        }
+        if let Some((_, old_bytes)) = self.entries.pop(&key) {
+            self.bytes -= old_bytes;
+        }
+        while self.bytes > self.max_bytes - bytes {
+            let Some((_, (_, old_bytes))) = self.entries.pop_lru() else {
+                break;
+            };
+            self.bytes -= old_bytes;
+        }
+        if let Some((_, (_, old_bytes))) = self.entries.push(key, (glyph, bytes)) {
+            self.bytes -= old_bytes;
+        }
+        self.bytes += bytes;
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn positioned_glyph_cache() -> &'static Mutex<PositionedGlyphCache> {
+    static CACHE: OnceLock<Mutex<PositionedGlyphCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(PositionedGlyphCache::new(4096, 8 * 1024 * 1024)))
+}
+
+/// Each character's visual [left, right] cell (9-unit) in logical order:
+/// the cell of the glyph that shows it; a glyph showing several characters
+/// shares its cell among them in reading order.
+pub fn char_cells(run: &ShapedRun, text: &str) -> Vec<(f32, f32)> {
+    text.char_indices()
+        .map(|(byte, _)| {
+            let Some(&(start, end, x0, x1)) = run
+                .cells
+                .iter()
+                .find(|(start, end, _, _)| (*start..(*end).max(start + 1)).contains(&byte))
+            else {
+                return (0.0, 0.0);
+            };
+            let chars: Vec<usize> = text[start..end.min(text.len())]
+                .char_indices()
+                .map(|(i, _)| start + i)
+                .collect();
+            let (n, k) = (
+                chars.len().max(1),
+                chars.iter().position(|&b| b == byte).unwrap_or(0),
+            );
+            let rtl = text[start..end.min(text.len())]
+                .chars()
+                .any(crate::entities::text_support::is_rtl_char);
+            let slot = (x1 - x0) / n as f32;
+            let k = if rtl { n - 1 - k } else { k };
+            (x0 + slot * k as f32, x0 + slot * (k + 1) as f32)
+        })
+        .collect()
+}
+
+/// Left-to-right mark, shaped ahead of every run so its base direction is
+/// left to right; layout also uses it to close a right-to-left run.
+pub(crate) const LRM: char = '\u{200E}';
+
+// A shaped run owns positioned copies of every outline and fill triangle. A
+// drawing with thousands of distinct strings can otherwise retain those copies
+// for the entire process lifetime, even after its document has closed.
+const SHAPE_CACHE_MAX_ENTRIES: usize = 2048;
+const SHAPE_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShapeKey(String, String);
+
+trait ShapeKeyLookup {
+    fn as_pair(&self) -> (&str, &str);
+}
+
+impl ShapeKeyLookup for ShapeKey {
+    fn as_pair(&self) -> (&str, &str) {
+        (&self.0, &self.1)
+    }
+}
+
+impl ShapeKeyLookup for (&str, &str) {
+    fn as_pair(&self) -> (&str, &str) {
+        *self
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn ShapeKeyLookup + 'a> for ShapeKey {
+    fn borrow(&self) -> &(dyn ShapeKeyLookup + 'a) {
+        self
+    }
+}
+
+impl PartialEq for dyn ShapeKeyLookup + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_pair() == other.as_pair()
+    }
+}
+
+impl Eq for dyn ShapeKeyLookup + '_ {}
+
+impl std::hash::Hash for dyn ShapeKeyLookup + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_pair().hash(state);
+    }
+}
+
+struct CachedShape {
+    value: Option<Arc<ShapedRun>>,
+    estimated_bytes: usize,
+}
+
+struct ShapeCache {
+    entries: LruCache<ShapeKey, CachedShape>,
+    estimated_bytes: usize,
+    max_bytes: usize,
+}
+
+impl ShapeCache {
+    fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: LruCache::new(NonZeroUsize::new(max_entries).expect("nonzero cache capacity")),
+            estimated_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn get(&mut self, family: &str, text: &str) -> Option<Option<Arc<ShapedRun>>> {
+        let lookup: &dyn ShapeKeyLookup = &(family, text);
+        self.entries.get(lookup).map(|entry| entry.value.clone())
+    }
+
+    fn insert(&mut self, key: ShapeKey, value: Option<Arc<ShapedRun>>) {
+        let bytes = estimated_shape_bytes(&key, &value);
+        if bytes > self.max_bytes {
+            return;
+        }
+        if let Some(old) = self.entries.pop(&key) {
+            self.estimated_bytes -= old.estimated_bytes;
+        }
+        while self.estimated_bytes > self.max_bytes - bytes {
+            let Some((_, old)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.estimated_bytes -= old.estimated_bytes;
+        }
+        if let Some((_, old)) = self.entries.push(
+            key,
+            CachedShape {
+                value,
+                estimated_bytes: bytes,
+            },
+        ) {
+            self.estimated_bytes -= old.estimated_bytes;
+        }
+        self.estimated_bytes += bytes;
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.estimated_bytes = 0;
+    }
+}
+
+/// Estimate owned capacity, including keys and positioned outlines. Allocator
+/// bookkeeping and the cache's hash table are not included; the entry limit
+/// independently bounds its per-entry bookkeeping.
+fn estimated_shape_bytes(key: &ShapeKey, value: &Option<Arc<ShapedRun>>) -> usize {
+    use std::mem::size_of;
+    let mut bytes = size_of::<ShapeKey>()
+        .saturating_add(size_of::<CachedShape>())
+        .saturating_add(key.0.capacity())
+        .saturating_add(key.1.capacity());
+    if let Some(run) = value {
+        bytes = bytes
+            .saturating_add(size_of::<ShapedRun>())
+            .saturating_add(2 * size_of::<usize>())
+            .saturating_add(run.glyphs.capacity().saturating_mul(size_of::<RunGlyph>()))
+            .saturating_add(
+                run.cells
+                    .capacity()
+                    .saturating_mul(size_of::<(usize, usize, f32, f32)>()),
+            );
+        // Charge every referenced outline in full. Shared glyphs are therefore
+        // conservatively overcounted, keeping the run cache's bound safe.
+        for glyph in &run.glyphs {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                bytes = bytes
+                    .saturating_add(size_of::<PlacedGlyph>())
+                    .saturating_add(2 * size_of::<usize>());
+            }
+            bytes = bytes
+                .saturating_add(
+                    glyph
+                        .strokes
+                        .capacity()
+                        .saturating_mul(size_of::<Vec<[f32; 2]>>()),
+                )
+                .saturating_add(
+                    glyph
+                        .fill_tris
+                        .capacity()
+                        .saturating_mul(size_of::<[f32; 2]>()),
+                );
+            for contour in &glyph.strokes {
+                bytes =
+                    bytes.saturating_add(contour.capacity().saturating_mul(size_of::<[f32; 2]>()));
+            }
+        }
+    }
+    bytes
+}
 
 fn shape_cache() -> &'static Mutex<ShapeCache> {
     static CACHE: OnceLock<Mutex<ShapeCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::default()))
+    CACHE.get_or_init(|| {
+        Mutex::new(ShapeCache::new(
+            SHAPE_CACHE_MAX_ENTRIES,
+            SHAPE_CACHE_MAX_BYTES,
+        ))
+    })
+}
+
+#[cfg(test)]
+mod shape_cache_tests {
+    use super::*;
+
+    fn key(text: &str) -> ShapeKey {
+        ShapeKey("Arial".into(), text.into())
+    }
+
+    fn run() -> Arc<ShapedRun> {
+        Arc::new(ShapedRun {
+            glyphs: vec![PlacedGlyph {
+                strokes: vec![vec![[1.0, 2.0], [3.0, 4.0]]],
+                fill_tris: vec![[5.0, 6.0]],
+            }
+            .into()],
+            advance: 12.0,
+            cells: vec![(0, 1, 0.0, 12.0)],
+        })
+    }
+
+    #[test]
+    fn evicts_the_least_recently_used_entry_and_keeps_borrowed_runs_alive() {
+        let mut cache = ShapeCache::new(2, usize::MAX);
+        let first = run();
+        cache.insert(key("a"), Some(first.clone()));
+        cache.insert(key("b"), Some(run()));
+        assert!(Arc::ptr_eq(
+            &cache.get("Arial", "a").unwrap().unwrap(),
+            &first
+        ));
+        cache.insert(key("c"), Some(run()));
+        assert!(cache.get("Arial", "b").is_none());
+        assert!(cache.get("Arial", "a").is_some());
+        assert!(cache.get("Arial", "c").is_some());
+        assert_eq!(first.glyphs[0].strokes[0][0], [1.0, 2.0]);
+    }
+
+    #[test]
+    fn byte_budget_evicts_and_replacement_keeps_accounting_correct() {
+        let value = Some(run());
+        let bytes = estimated_shape_bytes(&key("a"), &value);
+        let mut cache = ShapeCache::new(10, bytes * 2);
+        cache.insert(key("a"), value.clone());
+        cache.insert(key("b"), value.clone());
+        cache.insert(key("c"), value);
+        assert!(cache.get("Arial", "a").is_none());
+        assert!(cache.estimated_bytes <= bytes * 2);
+        cache.insert(key("c"), None);
+        assert!(matches!(cache.get("Arial", "c"), Some(None)));
+        let expected: usize = cache
+            .entries
+            .iter()
+            .map(|(_, item)| item.estimated_bytes)
+            .sum();
+        assert_eq!(cache.estimated_bytes, expected);
+        cache.clear();
+        assert_eq!(cache.estimated_bytes, 0);
+        assert!(cache.get("Arial", "c").is_none());
+    }
+
+    #[test]
+    fn oversized_run_is_not_retained() {
+        let value = Some(run());
+        let bytes = estimated_shape_bytes(&key("a"), &value);
+        let mut cache = ShapeCache::new(2, bytes - 1);
+        cache.insert(key("a"), value);
+        assert!(cache.get("Arial", "a").is_none());
+        assert_eq!(cache.estimated_bytes, 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn positioned_glyph_cache_shares_exact_keys_and_evicts_safely() {
+        let mut cache = PositionedGlyphCache::new(2, usize::MAX);
+        let first_key = PositionedGlyphKey {
+            font: fontdb::ID::dummy(),
+            weight: 400,
+            face_index: 0,
+            glyph: 1,
+            scale: 1.0_f32.to_bits(),
+            x: 0.0_f32.to_bits(),
+            y: 0.0_f32.to_bits(),
+        };
+        let mut other_key = first_key;
+        other_key.x = 1.0_f32.to_bits();
+        let mut third_key = first_key;
+        third_key.glyph = 2;
+        let first = run().glyphs[0].clone();
+        cache.insert(first_key, first.clone());
+        assert!(Arc::ptr_eq(&cache.get(&first_key).unwrap(), &first));
+        assert!(cache.get(&other_key).is_none());
+        cache.insert(other_key, run().glyphs[0].clone());
+        assert!(cache.get(&first_key).is_some());
+        cache.insert(third_key, run().glyphs[0].clone());
+        assert!(cache.get(&other_key).is_none());
+        assert!(cache.get(&first_key).is_some());
+        cache.clear();
+        assert_eq!(cache.bytes, 0);
+        assert_eq!(first.strokes[0][0], [1.0, 2.0]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn positioned_glyph_cache_rejects_oversized_outlines() {
+        let mut cache = PositionedGlyphCache::new(1, 1);
+        let key = PositionedGlyphKey {
+            font: fontdb::ID::dummy(),
+            weight: 400,
+            face_index: 0,
+            glyph: 1,
+            scale: 0,
+            x: 0,
+            y: 0,
+        };
+        cache.insert(key, run().glyphs[0].clone());
+        assert!(cache.get(&key).is_none());
+        assert_eq!(cache.bytes, 0);
+    }
 }
 
 /// Pixel font size the layout runs at. Positions and outlines are normalized
@@ -497,13 +1272,22 @@ pub fn shape_run(family: &str, text: &str) -> Option<Arc<ShapedRun>> {
     if text.is_empty() {
         return None;
     }
-    let key = (family.to_string(), text.to_string());
-    if let Some(hit) = shape_cache().lock().unwrap().get(&key) {
-        return hit.clone();
+    if let Some(hit) = shape_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(family, text)
+    {
+        return hit;
     }
 
     let built = build_shaped(family, text).map(Arc::new);
-    shape_cache().lock().unwrap().insert(key, built.clone());
+    shape_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            ShapeKey(family.to_string(), text.to_string()),
+            built.clone(),
+        );
     built
 }
 
@@ -523,11 +1307,18 @@ fn fallback_cache() -> &'static Mutex<FallbackCache> {
 /// surrounding single-stroke text — accepted as the price of covering scripts
 /// no stroke font provides.
 pub fn fallback_glyph(ch: char) -> Option<Arc<Glyph>> {
-    if let Some(hit) = fallback_cache().lock().unwrap().get(&ch) {
+    if let Some(hit) = fallback_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&ch)
+    {
         return hit.clone();
     }
     let built = build_fallback(ch);
-    fallback_cache().lock().unwrap().insert(ch, built.clone());
+    fallback_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(ch, built.clone());
     built
 }
 
@@ -535,9 +1326,62 @@ pub fn fallback_glyph(ch: char) -> Option<Arc<Glyph>> {
 /// build calls this when a per-script font finishes loading: glyphs that
 /// resolved to `None` while the font was still in flight then get a real
 /// outline. (#141)
+type PrimaryMetricsCache = HashMap<String, Option<(f32, f32)>>;
+
+fn primary_metrics_cache() -> &'static Mutex<PrimaryMetricsCache> {
+    static CACHE: OnceLock<Mutex<PrimaryMetricsCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::default()))
+}
+
+fn cached_primary_metrics(family: &str) -> Option<(f32, f32)> {
+    if let Some(&hit) = primary_metrics_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(family)
+    {
+        return hit;
+    }
+    let computed = sysfont::with_face_data(family, |data, idx| {
+        let f = ttf_parser::Face::parse(data, idx).ok()?;
+        Some((f.units_per_em() as f32, capital_units(&f)))
+    })
+    .flatten();
+    primary_metrics_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(family.to_string(), computed);
+    computed
+}
+
 pub fn clear_fallback_cache() {
-    fallback_cache().lock().unwrap().clear();
-    shape_cache().lock().unwrap().clear();
+    fallback_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    shape_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    primary_metrics_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    #[cfg(not(target_arch = "wasm32"))]
+    positioned_glyph_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    #[cfg(not(target_arch = "wasm32"))]
+    glyph_topology_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    // Web only: the per-family outline cache can also hold stale `None`s —
+    // the family only became resolvable when the font joined the sysfont
+    // database (`register_web_font`). On desktop the font set never changes,
+    // so the cache is kept.
+    #[cfg(target_arch = "wasm32")]
+    cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
     #[cfg(target_arch = "wasm32")]
     crate::scene::text::sdf_atlas::reset_font_entries();
 }
@@ -572,7 +1416,18 @@ mod fallback_tests {
 /// no stroke font provides.
 #[cfg(not(target_arch = "wasm32"))]
 fn build_fallback(ch: char) -> Option<Arc<Glyph>> {
-    outline_from_fallback_face(ch).or_else(|| installed_family_glyph(ch))
+    pick_fallback(ch, false).map(|(glyph, _)| glyph)
+}
+
+/// The fallback glyph for `ch` together with the face it came from -- the
+/// same search for both, so the glyph drawn on screen and the font an
+/// exporter embeds can never disagree.
+///
+/// The source holds a copy of the whole font file, so it is built only when
+/// asked for (`with_source`, an exporter): drawing on screen never keeps one.
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_fallback(ch: char, with_source: bool) -> Option<(Arc<Glyph>, Option<GlyphSource>)> {
+    outline_from_fallback_face(ch, with_source).or_else(|| installed_family_glyph(ch, with_source))
 }
 
 /// Outline `ch` from a parsed face, in the 9-unit text space.
@@ -582,8 +1437,14 @@ fn build_fallback(ch: char) -> Option<Arc<Glyph>> {
 /// text height — so size the substitute by its em box. Everything else keeps the
 /// cap-height normalisation that lines it up with the Latin stroke glyphs.
 #[cfg(not(target_arch = "wasm32"))]
-fn outline_char(data: &[u8], index: u32, face: &ttf_parser::Face, ch: char) -> Option<Glyph> {
-    let gid = face.glyph_index(ch)?;
+fn outline_char(
+    data: &[u8],
+    index: u32,
+    face: &ttf_parser::Face,
+    ch: char,
+    with_source: bool,
+) -> Option<(Glyph, Option<GlyphSource>)> {
+    let gid = glyph_id(face, ch)?;
     let k = if is_full_width(ch) {
         em_scale(face)
     } else {
@@ -594,11 +1455,15 @@ fn outline_char(data: &[u8], index: u32, face: &ttf_parser::Face, ch: char) -> O
     outline_glyph_into(data, index, face, gid, &mut fl);
     fl.flush();
     let fill_tris = triangulate_contours(&fl.contours);
-    Some(Glyph {
+    let glyph = Glyph {
         strokes: fl.contours,
         advance,
         fill_tris,
-    })
+    };
+    let source = with_source
+        .then(|| source_for(data, index, face, gid, k))
+        .flatten();
+    Some((glyph, source))
 }
 
 /// Outline `ch` from the face cosmic-text picks for it: it knows the platform's
@@ -608,9 +1473,12 @@ fn outline_char(data: &[u8], index: u32, face: &ttf_parser::Face, ch: char) -> O
 /// does, for every character, because ttf-parser reads no contours out of it —
 /// so an empty outline is not an answer and the caller has to keep looking.
 #[cfg(not(target_arch = "wasm32"))]
-fn outline_from_fallback_face(ch: char) -> Option<Arc<Glyph>> {
+fn outline_from_fallback_face(
+    ch: char,
+    with_source: bool,
+) -> Option<(Arc<Glyph>, Option<GlyphSource>)> {
     use cosmic_text::{Attrs, Buffer, Metrics, Shaping};
-    let mut fs = font_system().lock().unwrap();
+    let mut fs = font_system().lock().unwrap_or_else(|e| e.into_inner());
     // Default family → cosmic's own fallback search chooses a covering font.
     let attrs = Attrs::new();
     let mut buf = Buffer::new(&mut fs, Metrics::new(SHAPE_FS, SHAPE_FS));
@@ -627,13 +1495,15 @@ fn outline_from_fallback_face(ch: char) -> Option<Arc<Glyph>> {
             let face_index = fs.db_mut().face(g.font_id).map(|f| f.index).unwrap_or(0);
             let font = fs.get_font(g.font_id, g.font_weight)?;
             let face = ttf_parser::Face::parse(font.data(), face_index).ok()?;
-            let Some(glyph) = outline_char(font.data(), face_index, &face, ch) else {
+            let Some((glyph, source)) =
+                outline_char(font.data(), face_index, &face, ch, with_source)
+            else {
                 continue;
             };
             if glyph.strokes.is_empty() && glyph.fill_tris.is_empty() {
                 continue;
             }
-            return Some(Arc::new(glyph));
+            return Some((Arc::new(glyph), source));
         }
     }
     None
@@ -645,19 +1515,22 @@ fn outline_from_fallback_face(ch: char) -> Option<Arc<Glyph>> {
 /// and covers neither Cyrillic nor Greek, however many fonts the machine has
 /// that do.
 #[cfg(not(target_arch = "wasm32"))]
-fn installed_family_glyph(ch: char) -> Option<Arc<Glyph>> {
+fn installed_family_glyph(
+    ch: char,
+    with_source: bool,
+) -> Option<(Arc<Glyph>, Option<GlyphSource>)> {
     crate::scene::text::sysfont::families()
         .iter()
         .find_map(|family| {
-            let glyph = sysfont::with_face_data(family, |data, index| {
+            let (glyph, source) = sysfont::with_face_data(family, |data, index| {
                 let face = ttf_parser::Face::parse(data, index).ok()?;
-                outline_char(data, index, &face, ch)
+                outline_char(data, index, &face, ch, with_source)
             })
             .flatten()?;
             // A face that yields no outline (the system font, a space) is not a
             // font that draws this character.
             (!glyph.strokes.is_empty() || !glyph.fill_tris.is_empty())
-                .then(|| Arc::new(glyph))
+                .then(|| (Arc::new(glyph), source))
         })
 }
 
@@ -715,11 +1588,7 @@ fn build_shaped(_family: &str, text: &str) -> Option<ShapedRun> {
 
     let primary_face = ttf_parser::Face::parse(&fonts[0], 0).ok()?;
     let upem = primary_face.units_per_em() as f32;
-    let cap = primary_face
-        .capital_height()
-        .filter(|height| *height > 0)
-        .map(|height| height as f32)
-        .unwrap_or(0.7 * upem);
+    let cap = capital_units(&primary_face);
     let px_to_9 = CAP_UNITS * upem / (SHAPE_FS * cap);
 
     let mut database = fontdb::Database::new();
@@ -727,21 +1596,37 @@ fn build_shaped(_family: &str, text: &str) -> Option<ShapedRun> {
         database.load_font_data((*bytes).clone());
     }
     database.set_sans_serif_family(crate::scene::text::web_font::primary_script().family());
-    let mut font_system = FontSystem::new_with_locale_and_db(
-        crate::i18n::active_language_tag(),
-        database,
-    );
-    let attrs = Attrs::new().family(Family::SansSerif);
+    let mut font_system =
+        FontSystem::new_with_locale_and_db(crate::i18n::active_language_tag(), database);
+    let attrs = Attrs::new()
+        .family(Family::SansSerif)
+        .font_features(unkerned());
     let mut buffer = Buffer::new(&mut font_system, Metrics::new(SHAPE_FS, SHAPE_FS));
     buffer.set_size(&mut font_system, None, None);
-    buffer.set_text(&mut font_system, text, &attrs, Shaping::Advanced, None);
+    // A leading left-to-right mark keeps the paragraph direction left to
+    // right, as the reference lays text out (right-to-left runs still read
+    // backwards); `cells` stay relative to `text`.
+    let marked = format!("{LRM}{text}");
+    buffer.set_text(&mut font_system, &marked, &attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(&mut font_system, false);
 
     let mut glyphs = Vec::new();
+    let mut cells = Vec::new();
     let mut advance = 0.0_f32;
     for run in buffer.layout_runs() {
         advance = advance.max(run.line_w * px_to_9);
         for glyph in run.glyphs.iter() {
+            // A cluster the shaper merged into the mark keeps its own part.
+            let m = LRM.len_utf8();
+            if glyph.end > m {
+                let start = glyph.start.saturating_sub(m);
+                cells.push((
+                    start,
+                    glyph.end - m,
+                    glyph.x * px_to_9,
+                    (glyph.x + glyph.w) * px_to_9,
+                ));
+            }
             let face_index = font_system
                 .db_mut()
                 .face(glyph.font_id)
@@ -780,7 +1665,11 @@ fn build_shaped(_family: &str, text: &str) -> Option<ShapedRun> {
     if advance <= 0.0 && glyphs.is_empty() {
         None
     } else {
-        Some(ShapedRun { glyphs, advance })
+        Some(ShapedRun {
+            glyphs,
+            advance,
+            cells,
+        })
     }
 }
 
@@ -788,28 +1677,45 @@ fn build_shaped(_family: &str, text: &str) -> Option<ShapedRun> {
 fn build_shaped(family: &str, text: &str) -> Option<ShapedRun> {
     use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping};
 
-    let mut primary_metrics = sysfont::with_face_data(family, |data, idx| {
-        let f = ttf_parser::Face::parse(data, idx).ok()?;
-        let upem = f.units_per_em() as f32;
-        let cap = f
-            .capital_height()
-            .filter(|&c| c > 0)
-            .map(|c| c as f32)
-            .unwrap_or(0.7 * upem);
-        Some((upem, cap))
-    })
-    .flatten();
+    let mut primary_metrics = cached_primary_metrics(family);
 
-    let mut fs = font_system().lock().unwrap();
-    let attrs = if family.is_empty() {
+    let mut fs = font_system().lock().unwrap_or_else(|e| e.into_inner());
+    // A styled family shapes with the bold / italic face it names.
+    let (name, bold, italic) = sysfont::split_style(family);
+    let attrs = if name.is_empty() {
         Attrs::new()
     } else {
-        Attrs::new().family(Family::Name(family))
+        Attrs::new().family(Family::Name(name))
     };
-    let mut buf = Buffer::new(&mut fs, Metrics::new(SHAPE_FS, SHAPE_FS));
-    // No wrapping: a run is a single line.
-    buf.set_size(&mut fs, None, None);
-    buf.set_text(&mut fs, text, &attrs, Shaping::Advanced, None);
+    let attrs = if bold {
+        attrs.weight(cosmic_text::Weight::BOLD)
+    } else {
+        attrs
+    };
+    let attrs = if italic {
+        attrs.style(cosmic_text::Style::Italic)
+    } else {
+        attrs
+    }
+    .font_features(unkerned());
+    static SHAPE_SCRATCH: OnceLock<Mutex<Option<(Buffer, String)>>> = OnceLock::new();
+    let mut scratch_guard = SHAPE_SCRATCH
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (buf, marked) = scratch_guard.get_or_insert_with(|| {
+        let mut buf = Buffer::new(&mut fs, Metrics::new(SHAPE_FS, SHAPE_FS));
+        // No wrapping: a run is a single line.
+        buf.set_size(&mut fs, None, None);
+        (buf, String::new())
+    });
+    // A leading left-to-right mark keeps the paragraph direction left to
+    // right, as the reference lays text out (right-to-left runs still read
+    // backwards); `cells` stay relative to `text`.
+    marked.clear();
+    marked.push(LRM);
+    marked.push_str(text);
+    buf.set_text(&mut fs, marked, &attrs, Shaping::Advanced, None);
     buf.shape_until_scroll(&mut fs, false);
 
     if primary_metrics.is_none() {
@@ -821,13 +1727,7 @@ fn build_shaped(family: &str, text: &str) -> Option<ShapedRun> {
                 let face_index = fs.db_mut().face(g.font_id).map(|f| f.index).unwrap_or(0);
                 if let Some(font) = fs.get_font(g.font_id, g.font_weight) {
                     if let Ok(face) = ttf_parser::Face::parse(font.data(), face_index) {
-                        let upem = face.units_per_em() as f32;
-                        let cap = face
-                            .capital_height()
-                            .filter(|&c| c > 0)
-                            .map(|c| c as f32)
-                            .unwrap_or(0.7 * upem);
-                        primary_metrics = Some((upem, cap));
+                        primary_metrics = Some((face.units_per_em() as f32, capital_units(&face)));
                         break;
                     }
                 }
@@ -842,19 +1742,46 @@ fn build_shaped(family: &str, text: &str) -> Option<ShapedRun> {
     // Pixel (at SHAPE_FS) → 9-unit cap-height factor.
     let px_to_9 = CAP_UNITS * upem_p / (SHAPE_FS * cap_p);
 
-    let mut glyphs: Vec<PlacedGlyph> = Vec::new();
+    let mut glyphs: Vec<Arc<PlacedGlyph>> = Vec::new();
+    let mut cells = Vec::new();
     let mut advance = 0.0_f32;
+    let mut last_font: Option<(
+        cosmic_text::fontdb::ID,
+        u16,
+        u32,
+        Arc<cosmic_text::Font>,
+        f32,
+    )> = None;
     for run in buf.layout_runs() {
         advance = advance.max(run.line_w * px_to_9);
         for g in run.glyphs.iter() {
-            let face_index = fs.db_mut().face(g.font_id).map(|f| f.index).unwrap_or(0);
-            let Some(font) = fs.get_font(g.font_id, g.font_weight) else {
-                continue;
+            // A cluster the shaper merged into the mark keeps its own part.
+            let m = LRM.len_utf8();
+            if g.end > m {
+                cells.push((
+                    g.start.saturating_sub(m),
+                    g.end - m,
+                    g.x * px_to_9,
+                    (g.x + g.w) * px_to_9,
+                ));
+            }
+            let (face_index, font, upem_g) = match &last_font {
+                Some((fid, fw, idx, f, upem)) if *fid == g.font_id && *fw == g.font_weight.0 => {
+                    (*idx, f, *upem)
+                }
+                _ => {
+                    let face_index = fs.db_mut().face(g.font_id).map(|f| f.index).unwrap_or(0);
+                    let Some(font) = fs.get_font(g.font_id, g.font_weight) else {
+                        continue;
+                    };
+                    let Ok(face) = ttf_parser::Face::parse(font.data(), face_index) else {
+                        continue;
+                    };
+                    let upem_g = face.units_per_em() as f32;
+                    last_font = Some((g.font_id, g.font_weight.0, face_index, font, upem_g));
+                    (face_index, &last_font.as_ref().unwrap().3, upem_g)
+                }
             };
-            let Ok(face) = ttf_parser::Face::parse(font.data(), face_index) else {
-                continue;
-            };
-            let upem_g = face.units_per_em() as f32;
             // Glyph font-units → 9-unit: to pixels (at SHAPE_FS) then to units.
             let scale_g = (SHAPE_FS / upem_g) * px_to_9;
             // Absolute pen position (px) → 9-unit. `physical()` shows x_offset /
@@ -862,6 +1789,29 @@ fn build_shaped(family: &str, text: &str) -> Option<ShapedRun> {
             let pen_x = (g.x + SHAPE_FS * g.x_offset) * px_to_9;
             let pen_y = -(SHAPE_FS * g.y_offset) * px_to_9; // outlines are y-up
 
+            // Flattening uses the pen position in every floating-point
+            // operation. Sharing only exact positioned matches preserves the
+            // original curves and triangulation, including their rounding.
+            let key = PositionedGlyphKey {
+                font: g.font_id,
+                weight: g.font_weight.0,
+                face_index,
+                glyph: g.glyph_id,
+                scale: scale_g.to_bits(),
+                x: pen_x.to_bits(),
+                y: pen_y.to_bits(),
+            };
+            if let Some(glyph) = positioned_glyph_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+            {
+                glyphs.push(glyph);
+                continue;
+            }
+            let Ok(face) = ttf_parser::Face::parse(font.data(), face_index) else {
+                continue;
+            };
             let mut fl = OutlineFlattener::new(scale_g);
             fl.offset = [pen_x, pen_y];
             outline_glyph_into(
@@ -873,11 +1823,23 @@ fn build_shaped(family: &str, text: &str) -> Option<ShapedRun> {
             );
             fl.flush();
             if !fl.contours.is_empty() {
-                let fill_tris = triangulate_contours(&fl.contours);
-                glyphs.push(PlacedGlyph {
+                let topo_key = GlyphTopologyKey {
+                    font: g.font_id,
+                    weight: g.font_weight.0,
+                    face_index,
+                    glyph: g.glyph_id,
+                    scale: scale_g.to_bits(),
+                };
+                let fill_tris = triangulate_contours_cached(topo_key, &fl.contours);
+                let glyph = Arc::new(PlacedGlyph {
                     strokes: fl.contours,
                     fill_tris,
                 });
+                positioned_glyph_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, glyph.clone());
+                glyphs.push(glyph);
             }
         }
     }
@@ -885,13 +1847,16 @@ fn build_shaped(family: &str, text: &str) -> Option<ShapedRun> {
     if advance <= 0.0 && glyphs.is_empty() {
         return None;
     }
-    Some(ShapedRun { glyphs, advance })
+    Some(ShapedRun {
+        glyphs,
+        advance,
+        cells,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn shape_run_falls_back_for_missing_script() {
@@ -907,9 +1872,19 @@ mod tests {
             .iter()
             .find(|f| glyph(f, 'A').is_some())
             .expect("family");
+        let latin = shape_run(fam, "A").expect("shaped");
         let run = shape_run(fam, "A中").expect("shaped");
         eprintln!("fallback run glyphs={}", run.glyphs.len());
         assert!(!run.glyphs.is_empty());
+        // The ideograph is resolved, not dropped: the run keeps a positive
+        // advance and grows by at least the Latin letter's own share.
+        assert!(run.advance > 0.0, "advance {}", run.advance);
+        assert!(
+            run.advance >= latin.advance,
+            "A中 advance {} must not shrink below A's {}",
+            run.advance,
+            latin.advance
+        );
     }
 
     #[test]
@@ -948,18 +1923,36 @@ mod tests {
     #[test]
     fn shape_run_positions_glyphs() {
         let fams = sysfont::families();
-        if fams.is_empty() { eprintln!("no fonts; skip"); return; }
-        let fam = fams.iter().find(|f| glyph(f, 'A').is_some()).expect("family");
+        if fams.is_empty() {
+            eprintln!("no fonts; skip");
+            return;
+        }
+        let fam = fams
+            .iter()
+            .find(|f| glyph(f, 'A').is_some())
+            .expect("family");
         let run = shape_run(fam, "AVA").expect("shaped");
         eprintln!("glyphs={} advance={:.3}", run.glyphs.len(), run.advance);
         assert_eq!(run.glyphs.len(), 3);
         assert!(run.advance > 0.0);
         // glyphs must be laid out left-to-right: each glyph's strokes sit at a
         // greater x than the previous glyph's start.
-        let xs: Vec<f32> = run.glyphs.iter()
-            .filter_map(|g| g.strokes.iter().flatten().map(|p| p[0]).fold(None, |m,x| Some(m.map_or(x, |mm:f32| mm.min(x)))))
+        let xs: Vec<f32> = run
+            .glyphs
+            .iter()
+            .filter_map(|g| {
+                g.strokes
+                    .iter()
+                    .flatten()
+                    .map(|p| p[0])
+                    .fold(None, |m, x| Some(m.map_or(x, |mm: f32| mm.min(x))))
+            })
             .collect();
-        assert!(xs.windows(2).all(|w| w[1] >= w[0] - 1.0), "glyphs not L->R: {:?}", xs);
+        assert!(
+            xs.windows(2).all(|w| w[1] >= w[0] - 1.0),
+            "glyphs not L->R: {:?}",
+            xs
+        );
     }
 
     #[test]

@@ -15,11 +15,25 @@ struct Uniforms {
     lineweight_scale: f32,
     view_rot:         mat4x4<f32>,
     eye_high:         vec3<f32>,
-    _pad_eh:          f32,
+    highlight_widen:          f32,
     eye_low:          vec3<f32>,
-    _pad_el:          f32,
+    edge_rgb:         f32,
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
+
+// Edge colour of the filled-with-edges modes: 0x01RRGGBB in the bits of
+// `edge_rgb` picks that colour, anything else black.
+fn edge_color() -> vec3<f32> {
+    let bits = bitcast<u32>(u.edge_rgb);
+    if (bits >> 24u) != 1u {
+        return vec3<f32>(0.0);
+    }
+    return vec3<f32>(
+        f32((bits >> 16u) & 255u),
+        f32((bits >> 8u) & 255u),
+        f32(bits & 255u),
+    ) / 255.0;
+}
 
 // Per-wire constants (std430). Must match `WireConst` in wire_gpu.rs.
 struct WireConst {
@@ -29,11 +43,11 @@ struct WireConst {
     half_width:     f32,
     pattern_length: f32,
     draw_depth:     f32,
-    align_end:      f32,
+    _reserved:      f32,
     align_total:    f32,
     world_half_width: f32,
     is_tapered:     f32,
-    _pad2:          f32,
+    hidden:         f32,
     marker_origin_high: vec4<f32>,
     marker_origin_low: vec4<f32>,
     marker_normal_scale: vec4<f32>,
@@ -48,16 +62,19 @@ struct InstanceIn {
     @location(4) distance_a: f32,
     @location(5) distance_b: f32,
     @location(6) wire_id:    u32,
-    // Per-endpoint width / per-wire maximum width. Vertex UNORM16 conversion
-    // expands this to 0..1; zero keeps the constant-width fallback.
-    @location(7) taper_ratio: vec2<f32>,
+    // Per-endpoint width / per-wire maximum width, as snorm16 for a band: 0..1
+    // once converted, zero keeps the constant-width fallback. A thin wire has
+    // its dash run's layout here instead (`dash_run_total`).
+    @location(7) taper_bits: vec2<i32>,
 }
 
 const MODEL_LINEWEIGHT_BOOST: f32 = 2.0;
 const MODEL_LINEWEIGHT_MAX_PX: f32 = 10.0;
+// Must match `MITER_LIMIT` in wire_gpu.rs.
+const MITER_LIMIT: f32 = 8.0;
 
 struct VertexOut {
-    @builtin(position)              clip_pos:       vec4<f32>,
+    @invariant @builtin(position)              clip_pos:       vec4<f32>,
     @location(0)                    color:          vec4<f32>,
     @location(1)                    distance:       f32,
     @location(2)                    pattern_length: f32,
@@ -72,12 +89,20 @@ struct VertexOut {
     @location(8)                    cap:            vec2<f32>,
     // (segment pixel length, end half-width at A, end half-width at B).
     @location(9) @interpolate(flat) cap_ends:       vec3<f32>,
+    // Dot half-width and signed across distance, both in world units.
+    @location(10)                   dot:            vec2<f32>,
 }
 
 // Half-width of one segment end: a tapered band's own end width wins, then a
 // constant world-unit band, then the screen-pixel lineweight (LWDISPLAY off
 // collapses to a hairline).
+// The selection pass widens highlighted lines by `highlight_widen` pixels;
+// every other pass uploads zero.
 fn resolve_hw(taper_ratio: f32, world_hw: f32, px_hw: f32) -> f32 {
+    return resolve_hw_base(taper_ratio, world_hw, px_hw) + u.highlight_widen * 0.5;
+}
+
+fn resolve_hw_base(taper_ratio: f32, world_hw: f32, px_hw: f32) -> f32 {
     if taper_ratio > 0.0 {
         return max((taper_ratio * world_hw) / u.world_per_pixel, 0.5);
     }
@@ -118,6 +143,17 @@ fn marker_relative(position_high: vec3<f32>, position_low: vec3<f32>, c: WireCon
     return origin_relative + axial + planar * world_size;
 }
 
+// How far along a segment its end (clip w `w`, other end `other`) moves to
+// lie in front of the eye. An end behind it — a ray or xline in perspective —
+// would flip through w <= 0 and stretch the band over the screen (#2801).
+fn front_t(w: f32, other: f32) -> f32 {
+    let eps = max(max(w, other) * 1e-4, 1e-6);
+    if w >= eps || other <= w {
+        return 0.0;
+    }
+    return (eps - w) / (other - w);
+}
+
 @vertex fn vs_main(@builtin(vertex_index) vid: u32, in: InstanceIn) -> VertexOut {
     let c = wire_consts[in.wire_id];
 
@@ -130,11 +166,13 @@ fn marker_relative(position_high: vec3<f32>, position_low: vec3<f32>, c: WireCon
     let rel_b = marker_relative(in.pos_b, in.pos_b_low, c);
     let is_tapered = c.is_tapered > 0.5;
     let is_world = c.world_half_width > 0.0;
+    let taper_ratio = vec2<f32>(in.taper_bits) / 32767.0;
 
     var final_clip: vec4<f32>;
     var out_dist: f32;
     var out_cap: vec2<f32>;
     var out_cap_ends: vec3<f32>;
+    var out_dot: vec2<f32>;
 
     if is_world {
         // Wide polylines have physical world-unit width (world_half_width or taper > 0).
@@ -142,10 +180,10 @@ fn marker_relative(position_high: vec3<f32>, position_low: vec3<f32>, c: WireCon
         // the segment and the plane normal), so the rectangle remains hosted rigidly
         // on the 3D plane when the camera rotates, orbits, or tilts, matching CAD
         // behavior and circle.wgsl planar arcs.
-        let world_hw_a = select(c.world_half_width, in.taper_ratio.x * c.world_half_width, is_tapered);
-        let world_hw_b = select(c.world_half_width, in.taper_ratio.y * c.world_half_width, is_tapered);
+        let world_hw_a = select(c.world_half_width, taper_ratio.x * c.world_half_width, is_tapered);
+        let world_hw_b = select(c.world_half_width, taper_ratio.y * c.world_half_width, is_tapered);
         let cur_world_hw = mix(world_hw_a, world_hw_b, which_end);
-        let eff_hw = max(cur_world_hw, 0.5 * u.world_per_pixel);
+        let eff_hw = cur_world_hw + 0.5 * u.world_per_pixel;
 
         let world_delta = rel_b - rel_a;
         let world_len = length(world_delta);
@@ -168,19 +206,28 @@ fn marker_relative(position_high: vec3<f32>, position_low: vec3<f32>, c: WireCon
         }
         perp_world = normalize(perp_world);
 
+        // A constant-width band slides each corner along the segment onto
+        // its joint's bisector (miter), so neighbours meet without a notch.
+        let miter = select(taper_ratio, vec2<f32>(0.0), is_tapered) * MITER_LIMIT;
+        let along = mix(miter.x, miter.y, which_end) * eff_hw * side;
         let pos_rel = mix(rel_a, rel_b, which_end);
-        let world_pos = pos_rel + perp_world * (eff_hw * side);
+        let world_pos = pos_rel + perp_world * (eff_hw * side) + world_dir * along;
         var clip_pos = u.view_rot * vec4<f32>(world_pos, 1.0);
         clip_pos = apply_draw_order(clip_pos, c.draw_depth);
 
         final_clip = clip_pos;
-        out_dist = mix(in.distance_a, in.distance_b, which_end);
+        out_dist = mix(in.distance_a, in.distance_b, which_end) + along * (in.distance_b - in.distance_a) / max(world_len, 1e-6);
         out_cap = vec2<f32>(which_end * world_len, eff_hw * side);
         out_cap_ends = vec3<f32>(world_len, world_hw_a, world_hw_b);
+        out_dot = vec2<f32>(max(cur_world_hw, 0.75 * u.world_per_pixel), eff_hw * side);
     } else {
         // Thin wires expand in screen pixels facing the camera with rounded end caps / joints.
-        let clip_a = u.view_rot * vec4<f32>(rel_a, 1.0);
-        let clip_b = u.view_rot * vec4<f32>(rel_b, 1.0);
+        let raw_a = u.view_rot * vec4<f32>(rel_a, 1.0);
+        let raw_b = u.view_rot * vec4<f32>(rel_b, 1.0);
+        let t_a = front_t(raw_a.w, raw_b.w);
+        let t_b = front_t(raw_b.w, raw_a.w);
+        let clip_a = mix(raw_a, raw_b, t_a);
+        let clip_b = mix(raw_b, raw_a, t_b);
 
         let ndc_a = clip_a.xy / clip_a.w;
         let ndc_b = clip_b.xy / clip_b.w;
@@ -208,9 +255,10 @@ fn marker_relative(position_high: vec3<f32>, position_low: vec3<f32>, c: WireCon
         clip_pos_out = apply_draw_order(clip_pos_out, c.draw_depth);
 
         final_clip = clip_pos_out;
-        out_dist = mix(in.distance_a, in.distance_b, which_end) + ext * hw * u.world_per_pixel;
+        out_dist = mix(in.distance_a, in.distance_b, mix(t_a, 1.0 - t_b, which_end)) + ext * hw * u.world_per_pixel;
         out_cap = vec2<f32>(which_end * seg_len + ext * hw, hw * side);
         out_cap_ends = vec3<f32>(seg_len, hw, hw);
+        out_dot = vec2<f32>(max(hw, 0.75) * u.world_per_pixel, hw * side * u.world_per_pixel);
     }
 
     let lt_scale = u.linetype_scale;
@@ -232,16 +280,28 @@ fn marker_relative(position_high: vec3<f32>, position_low: vec3<f32>, c: WireCon
     out.distance       = out_dist;
     out.cap            = out_cap;
     out.cap_ends       = out_cap_ends;
+    out.dot            = out_dot;
     out.pattern_length = c.pattern_length * lt_scale;
     out.pat0           = c.pat0 * lt_scale;
     out.pat1           = c.pat1 * lt_scale;
     out.min_elem       = min_elem;
-    out.align_end      = c.align_end * lt_scale;
-    out.align_total    = c.align_total;
+    let run_total = select(dash_run_total(in.taper_bits.x, in.taper_bits.y), c.align_total, is_world);
+    out.align_end      = aligned_end_dash(
+        run_total,
+        out.pattern_length,
+        max(out.pat0.x, 0.0),
+    );
+    out.align_total    = run_total;
+    // A hidden entity's arena slab stays resident; collapse it outside the
+    // clip volume and take the tombstone discard.
+    if c.hidden != 0.0 {
+        out.clip_pos = vec4<f32>(0.0, 0.0, -2.0, 1.0);
+        out.pattern_length = -1.0;
+    }
     return out;
 }
 
-fn in_dash(dist: f32, pat_len: f32, p0: vec4<f32>, p1: vec4<f32>, align_end: f32, align_total: f32) -> bool {
+fn in_dash(dist: f32, pat_len: f32, p0: vec4<f32>, p1: vec4<f32>, align_end: f32, align_total: f32, dot: vec2<f32>) -> bool {
     let elems = array<f32, 8>(p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w);
     var count = 0u;
     for (var i = 0u; i < 8u; i++) {
@@ -257,22 +317,29 @@ fn in_dash(dist: f32, pat_len: f32, p0: vec4<f32>, p1: vec4<f32>, align_end: f32
         if dist <= align_end || dist >= align_total - align_end {
             return true;
         }
-        var first_dash = 0.0;
-        for (var i = 0u; i < count; i++) {
-            if elems[i] > 0.0 { first_dash = elems[i]; break; }
-        }
+        // The aligned pattern leads with its dash or dot (see wire.wgsl).
+        let first_dash = max(elems[0], 0.0);
         d = ((dist - align_end + first_dash) % pat_len + pat_len) % pat_len;
+    } else if align_total < 0.0 {
+        // A closed path: whole periods, stretched to fit. One shorter than a
+        // period is drawn solid.
+        if closed_dash_solid(-align_total, pat_len) {
+            return true;
+        }
+        d = closed_dash_phase(dist, -align_total, pat_len);
     } else {
-        d = ((dist % pat_len) + pat_len) % pat_len;
+        // The cap before the start reads as the start (see wire.wgsl).
+        let from_start = max(dist, 0.0);
+        d = ((from_start % pat_len) + pat_len) % pat_len;
     }
 
     var pos = 0.0f;
-    let dot_half = u.world_per_pixel * 0.75;
     for (var i = 0u; i < count; i++) {
         let elem = elems[i];
         if elem == 0.0 {
             let dd = abs(d - pos);
-            if min(dd, pat_len - dd) <= dot_half { return true; }
+            let along = min(dd, pat_len - dd);
+            if along * along + dot.y * dot.y <= dot.x * dot.x { return true; }
         } else if elem > 0.0 {
             if d >= pos && d < pos + elem { return true; }
             pos += elem;
@@ -306,7 +373,7 @@ fn cap_clipped(cap: vec2<f32>, cap_ends: vec3<f32>) -> bool {
     }
     if in.pattern_length > 0.0 {
         if in.min_elem >= u.world_per_pixel {
-            if !in_dash(in.distance, in.pattern_length, in.pat0, in.pat1, in.align_end, in.align_total) {
+            if !in_dash(in.distance, in.pattern_length, in.pat0, in.pat1, in.align_end, in.align_total, in.dot) {
                 discard;
             }
         }
@@ -317,7 +384,7 @@ fn cap_clipped(cap: vec2<f32>, cap_ends: vec3<f32>) -> bool {
 
 // Black variant: used for 3D mesh outline edges in filled render modes so the
 // mesh reads as a shaded surface framed by black edges. Keeps the dash/LOD
-// logic identical to `fs_main`; only the RGB is forced to black.
+// logic identical to `fs_main`; only the RGB is forced to the edge colour.
 @fragment fn fs_black(in: VertexOut) -> @location(0) vec4<f32> {
     if in.pattern_length < 0.0 {
         discard;
@@ -327,11 +394,11 @@ fn cap_clipped(cap: vec2<f32>, cap_ends: vec3<f32>) -> bool {
     }
     if in.pattern_length > 0.0 {
         if in.min_elem >= u.world_per_pixel {
-            if !in_dash(in.distance, in.pattern_length, in.pat0, in.pat1, in.align_end, in.align_total) {
+            if !in_dash(in.distance, in.pattern_length, in.pat0, in.pat1, in.align_end, in.align_total, in.dot) {
                 discard;
             }
         }
     }
     let alpha = select(1.0, in.color.a, u.transparency_enable > 0.5);
-    return vec4<f32>(0.0, 0.0, 0.0, alpha);
+    return vec4<f32>(edge_color(), alpha);
 }

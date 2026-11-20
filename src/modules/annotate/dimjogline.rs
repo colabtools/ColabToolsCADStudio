@@ -1,7 +1,7 @@
 // DIMJOGLINE — add or remove a jog on a linear/aligned dimension.
 
-use codec::entities::Dimension;
-use codec::{EntityType, Handle};
+use document::entities::Dimension;
+use document::{EntityType, Handle};
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind};
@@ -32,6 +32,12 @@ pub struct DimJogLineCommand {
     dimension: Option<Dimension>,
 }
 
+impl Default for DimJogLineCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DimJogLineCommand {
     pub fn new() -> Self {
         Self {
@@ -58,8 +64,16 @@ impl DimJogLineCommand {
                 DVec3::new(value.rotation.cos(), value.rotation.sin(), 0.0),
             ),
             Dimension::Aligned(value) => {
-                let first = DVec3::new(value.first_point.x, value.first_point.y, value.first_point.z);
-                let second = DVec3::new(value.second_point.x, value.second_point.y, value.second_point.z);
+                let first = DVec3::new(
+                    value.first_point.x,
+                    value.first_point.y,
+                    value.first_point.z,
+                );
+                let second = DVec3::new(
+                    value.second_point.x,
+                    value.second_point.y,
+                    value.second_point.z,
+                );
                 (
                     value.first_point,
                     value.second_point,
@@ -77,7 +91,7 @@ impl DimJogLineCommand {
         } else {
             [f64::NAN; 3]
         };
-        kernel::space::default_dimension_jog_position(
+        ocs_geom::space::default_dimension_jog_position(
             [first.x, first.y, first.z],
             [second.x, second.y, second.z],
             [definition.x, definition.y, definition.z],
@@ -96,9 +110,7 @@ impl CadCommand for DimJogLineCommand {
 
     fn prompt(&self) -> String {
         match self.step {
-            Step::PickDim if self.remove => {
-                t!("DIMJOGLINE  Select dimension to remove jog:").into_owned()
-            }
+            Step::PickDim if self.remove => t!("DIMJOGLINE  Select jog to remove:").into_owned(),
             Step::PickDim => {
                 t!("DIMJOGLINE  Select dimension to add jog or [Remove]:").into_owned()
             }
@@ -137,13 +149,17 @@ impl CadCommand for DimJogLineCommand {
     }
 
     fn on_entity_pick(&mut self, handle: Handle, _point: DVec3) -> CmdResult {
-        let Some(EntityType::Dimension(dimension @ (Dimension::Linear(_) | Dimension::Aligned(_)))) =
-            self.picked_entity.take()
-        else {
+        let Some(EntityType::Dimension(dimension)) = self.picked_entity.take() else {
             return CmdResult::ReportError(
                 t!("DIMJOGLINE: select a linear or aligned dimension.").into_owned(),
             );
         };
+        let dimension = *dimension;
+        if !matches!(dimension, Dimension::Linear(_) | Dimension::Aligned(_)) {
+            return CmdResult::ReportError(
+                t!("DIMJOGLINE: select a linear or aligned dimension.").into_owned(),
+            );
+        }
         if handle.is_null() {
             return CmdResult::NeedPoint;
         }
@@ -192,19 +208,35 @@ impl CadCommand for DimJogLineCommand {
                 let axis = DVec3::new(value.rotation.cos(), value.rotation.sin(), 0.0);
                 (
                     [(point - axis).to_array(), (point + axis).to_array()],
-                    [value.base.normal.x, value.base.normal.y, value.base.normal.z],
+                    [
+                        value.base.normal.x,
+                        value.base.normal.y,
+                        value.base.normal.z,
+                    ],
                 )
             }
             Dimension::Aligned(value) => (
                 [
-                    [value.first_point.x, value.first_point.y, value.first_point.z],
-                    [value.second_point.x, value.second_point.y, value.second_point.z],
+                    [
+                        value.first_point.x,
+                        value.first_point.y,
+                        value.first_point.z,
+                    ],
+                    [
+                        value.second_point.x,
+                        value.second_point.y,
+                        value.second_point.z,
+                    ],
                 ],
-                [value.base.normal.x, value.base.normal.y, value.base.normal.z],
+                [
+                    value.base.normal.x,
+                    value.base.normal.y,
+                    value.base.normal.z,
+                ],
             ),
             _ => return None,
         };
-        let points = kernel::space::dimension_jog_points(
+        let points = ocs_geom::space::dimension_jog_points(
             segment,
             point.to_array(),
             normal,
@@ -223,7 +255,9 @@ impl CadCommand for DimJogLineCommand {
     }
 }
 
-inventory::submit!(crate::command::CommandRegistration { names: &["DIMJOGLINE"] });
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["DIMJOGLINE"]
+});
 
 #[cfg(test)]
 mod tests {

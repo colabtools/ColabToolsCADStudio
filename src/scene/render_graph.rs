@@ -6,9 +6,9 @@
 //! draw order, and clip boundaries. Leaf entities remain responsible for
 //! producing their normal wire, hatch, image, wipeout, or mesh model.
 
-use codec::entities::Insert;
-use codec::types::{Color, Matrix3, Matrix4, Transform, Vector3};
-use codec::{CadDocument, EntityType, Handle};
+use document::entities::Insert;
+use document::types::{Color, Matrix3, Matrix4, Transform, Vector3};
+use document::{Document, EntityType, Handle};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::scene::view::render::{
@@ -80,13 +80,16 @@ pub struct InsertStyleSpec {
 }
 
 impl InsertStyleSpec {
-    pub fn new(document: &CadDocument, insert: &Insert, viewport: Option<Handle>) -> Self {
+    pub fn new(document: &Document, insert: &Insert, viewport: Option<Handle>) -> Self {
         let common = &insert.common;
         let has_book_color = has_resolved_book_color_common(document, common);
         let linetype = &common.linetype;
+        let mut insert = render_style_for_common_viewport(document, common, viewport);
+        (insert.1, insert.2) =
+            crate::scene::view::render::insert_pattern_for_children(common, insert.1, insert.2);
         Self {
             own: BlockStyle {
-                insert: render_style_for_common_viewport(document, common, viewport),
+                insert,
                 layer0: layer_render_style_viewport(document, &common.layer, viewport),
                 layer0_aci: layer_aci(document, &common.layer),
             },
@@ -96,14 +99,10 @@ impl InsertStyleSpec {
             transparency_bylayer: common.transparency.is_by_layer(),
             linetype_byblock: linetype.eq_ignore_ascii_case("byblock"),
             linetype_bylayer: linetype.is_empty() || linetype.eq_ignore_ascii_case("bylayer"),
-            lineweight_byblock: matches!(
-                common.line_weight,
-                codec::types::LineWeight::ByBlock
-            ),
+            lineweight_byblock: matches!(common.line_weight, document::types::LineWeight::ByBlock),
             lineweight_bylayer: matches!(
                 common.line_weight,
-                codec::types::LineWeight::ByLayer
-                    | codec::types::LineWeight::Default
+                document::types::LineWeight::ByLayer | document::types::LineWeight::Default
             ),
             layer0: is_effective_layer_zero(&common.layer),
         }
@@ -158,11 +157,7 @@ impl InsertStyleSpec {
 }
 
 impl BlockStyle {
-    pub fn for_entity(
-        document: &CadDocument,
-        entity: &EntityType,
-        viewport: Option<Handle>,
-    ) -> Self {
+    pub fn for_entity(document: &Document, entity: &EntityType, viewport: Option<Handle>) -> Self {
         Self {
             insert: render_style_for_viewport(document, entity, viewport),
             layer0: layer_render_style_viewport(document, &entity.common().layer, viewport),
@@ -171,7 +166,7 @@ impl BlockStyle {
     }
 
     pub fn for_nested(
-        document: &CadDocument,
+        document: &Document,
         insert: &Insert,
         parent: Self,
         viewport: Option<Handle>,
@@ -181,7 +176,7 @@ impl BlockStyle {
 
     pub fn resolve(
         self,
-        document: &CadDocument,
+        document: &Document,
         entity: &EntityType,
         viewport: Option<Handle>,
     ) -> ResolvedStyle {
@@ -211,7 +206,7 @@ impl BlockStyle {
     }
 }
 
-fn layer_aci(document: &CadDocument, layer: &str) -> u8 {
+fn layer_aci(document: &Document, layer: &str) -> u8 {
     document
         .layers
         .get(layer)
@@ -258,7 +253,29 @@ impl InstanceContext {
         !self.root_handle.is_null()
     }
 
-    pub fn style_for(&self, document: &CadDocument, entity: &EntityType) -> ResolvedStyle {
+    /// Display/export layer for one occurrence without changing the source
+    /// entity. Layer 0 defers to the nearest nonzero INSERT ancestor; every
+    /// other layer, including a dependent xref layer, remains its own.
+    pub fn effective_layer(&self, raw_layer: &str) -> String {
+        if !is_effective_layer_zero(raw_layer) {
+            return raw_layer.to_string();
+        }
+        self.insert_path
+            .iter()
+            .rev()
+            .find(|insert| !is_effective_layer_zero(&insert.common.layer))
+            .map_or(raw_layer, |insert| insert.common.layer.as_str())
+            .to_string()
+    }
+
+    pub fn style_for(&self, document: &Document, entity: &EntityType) -> ResolvedStyle {
+        if self
+            .insert_path
+            .iter()
+            .any(|insert| crate::scene::block_construction::is_construction(&insert.common))
+        {
+            return crate::scene::block_construction::display_style();
+        }
         self.block_style
             .map(|style| style.resolve(document, entity, self.viewport))
             .unwrap_or_else(|| render_style_for_viewport(document, entity, self.viewport))
@@ -267,10 +284,7 @@ impl InstanceContext {
     pub fn draw_depth(&self, handle: Handle, depths: &FxHashMap<u64, [f32; 2]>) -> f32 {
         if self.is_instanced() {
             self.depth_base
-                + depths
-                    .get(&handle.value())
-                    .map_or(0.0, |depth| depth[0])
-                    * self.depth_scale
+                + depths.get(&handle.value()).map_or(0.0, |depth| depth[0]) * self.depth_scale
         } else {
             depths
                 .get(&handle.value())
@@ -280,18 +294,26 @@ impl InstanceContext {
 }
 
 pub struct RenderSceneGraph<'a> {
-    document: &'a CadDocument,
+    document: &'a Document,
     frozen_layers: Option<&'a FxHashSet<Handle>>,
+    /// Session LAYWALK visible-layer set of the space this graph renders,
+    /// carried like `frozen_layers`. `None` = the space is not walked (or
+    /// the graph serves a foreign space / an export pass).
+    layer_walk: Option<&'a FxHashSet<Handle>>,
     annotation_scale_handle: Option<Handle>,
     annotation_scale: f32,
     all_visible: bool,
     depths: &'a FxHashMap<u64, [f32; 2]>,
     viewport: Option<Handle>,
+    visibility_reveal: Option<&'a FxHashSet<Handle>>,
+    /// Published on the first INSERT: every placement asks for its block's
+    /// base point.
+    dictionary_owners: std::sync::OnceLock<super::block_authoring::DictionaryOwners<'a>>,
 }
 
 impl<'a> RenderSceneGraph<'a> {
     pub fn new(
-        document: &'a CadDocument,
+        document: &'a Document,
         frozen_layers: Option<&'a FxHashSet<Handle>>,
         annotation_scale_handle: Option<Handle>,
         all_visible: bool,
@@ -300,12 +322,25 @@ impl<'a> RenderSceneGraph<'a> {
         Self {
             document,
             frozen_layers,
+            layer_walk: None,
             annotation_scale_handle,
             annotation_scale: 1.0,
             all_visible,
             depths,
             viewport: None,
+            visibility_reveal: None,
+            dictionary_owners: std::sync::OnceLock::new(),
         }
+    }
+
+    pub fn with_visibility_reveal(mut self, handles: &'a FxHashSet<Handle>) -> Self {
+        self.visibility_reveal = Some(handles);
+        self
+    }
+
+    pub fn with_layer_walk(mut self, visible: Option<&'a FxHashSet<Handle>>) -> Self {
+        self.layer_walk = visible;
+        self
     }
 
     pub fn with_viewport(mut self, viewport: Option<Handle>) -> Self {
@@ -321,8 +356,22 @@ impl<'a> RenderSceneGraph<'a> {
     /// Walk direct root entities and every referenced block subtree. `visible`
     /// can add session-only rules such as isolate/preview hiding; returning
     /// false for an Insert removes its whole subtree.
-    pub fn walk_root<V, F>(&self, root: SceneRoot, mut visible: V, mut leaf: F)
+    pub fn walk_root<V, F>(&self, root: SceneRoot, visible: V, leaf: F)
     where
+        V: FnMut(&EntityType, &InstanceContext) -> bool,
+        F: FnMut(&EntityType, &InstanceContext),
+    {
+        self.walk_root_filtered(root, None, visible, leaf);
+    }
+
+    /// Limit the walk to named root entities without pruning their children.
+    pub(crate) fn walk_root_filtered<V, F>(
+        &self,
+        root: SceneRoot,
+        targets: Option<&rustc_hash::FxHashSet<Handle>>,
+        mut visible: V,
+        mut leaf: F,
+    ) where
         V: FnMut(&EntityType, &InstanceContext) -> bool,
         F: FnMut(&EntityType, &InstanceContext),
     {
@@ -340,6 +389,9 @@ impl<'a> RenderSceneGraph<'a> {
             return;
         };
         for &handle in &record.entity_handles {
+            if targets.is_some_and(|targets| !targets.contains(&handle)) {
+                continue;
+            }
             let Some(source) = self.document.get_entity(handle) else {
                 continue;
             };
@@ -354,7 +406,7 @@ impl<'a> RenderSceneGraph<'a> {
                 .get(&handle.value())
                 .map_or(0.0, |depth| depth[0]);
             let context = InstanceContext::direct(direct_depth, viewport);
-            if !self.document_visible(entity) || !visible(entity, &context) {
+            if !self.document_visible(entity, false) || !visible(entity, &context) {
                 continue;
             }
             if let EntityType::Insert(insert) = entity {
@@ -380,8 +432,7 @@ impl<'a> RenderSceneGraph<'a> {
         root_handle: Handle,
         mut visible: V,
         mut leaf: F,
-    )
-    where
+    ) where
         V: FnMut(&EntityType, &InstanceContext) -> bool,
         F: FnMut(&EntityType, &InstanceContext),
     {
@@ -413,17 +464,12 @@ impl<'a> RenderSceneGraph<'a> {
             .get(&root_handle.value())
             .map_or(0.0, |depth| depth[0]);
         let context = InstanceContext::direct(depth_base, self.viewport);
-        if self.document_visible(&entity) && visible(&entity, &context) {
-            self.walk_insert_instances(
-                &root_insert,
-                scale_policy,
-                &context,
-                visible,
-                leaf,
-            );
+        // The caller has already shown the owning object; the placement itself
+        // is often synthetic (an arrowhead on layer 0), so layer 0 defers.
+        if self.document_visible(&entity, true) && visible(&entity, &context) {
+            self.walk_insert_instances(&root_insert, scale_policy, &context, visible, leaf);
         }
     }
-
 
     fn walk_insert_instances<V, F>(
         &self,
@@ -436,11 +482,15 @@ impl<'a> RenderSceneGraph<'a> {
         V: FnMut(&EntityType, &InstanceContext) -> bool,
         F: FnMut(&EntityType, &InstanceContext),
     {
+        self.dictionary_owners
+            .get_or_init(|| super::block_authoring::DictionaryOwners::publish(self.document));
         let insert_entity = EntityType::Insert(insert.clone());
         let block_style = parent
             .block_style
             .map(|style| BlockStyle::for_nested(self.document, insert, style, self.viewport))
-            .unwrap_or_else(|| BlockStyle::for_entity(self.document, &insert_entity, self.viewport));
+            .unwrap_or_else(|| {
+                BlockStyle::for_entity(self.document, &insert_entity, self.viewport)
+            });
         let root_handle = if parent.root_handle.is_null() {
             insert.common.handle
         } else {
@@ -480,14 +530,11 @@ impl<'a> RenderSceneGraph<'a> {
             context.depth_scale = depth_scale;
             context.nesting_depth += 1;
             context.scale_policy = scale_policy;
-            if let Some(filter) = crate::scene::pick::xclip::insert_spatial_filter(
-                self.document,
-                insert,
-            ) {
-                let polygon = crate::scene::pick::xclip::world_clip_polygon_for_transform(
-                    filter,
-                    &transform,
-                );
+            if let Some(filter) =
+                crate::scene::pick::xclip::insert_spatial_filter(self.document, insert)
+            {
+                let polygon =
+                    crate::scene::pick::xclip::world_clip_polygon_for_transform(filter, &transform);
                 if polygon.len() >= 3 {
                     context.clips.push(polygon);
                 }
@@ -497,13 +544,7 @@ impl<'a> RenderSceneGraph<'a> {
                 .iter()
                 .map(|insert| insert.block_name.clone())
                 .collect();
-            self.walk_block(
-                &insert.block_name,
-                &context,
-                visible,
-                leaf,
-                &mut stack,
-            );
+            self.walk_block(&insert.block_name, &context, visible, leaf, &mut stack);
         }
     }
 
@@ -534,7 +575,7 @@ impl<'a> RenderSceneGraph<'a> {
                 self.annotation_scale_handle,
             );
             let entity = contextual.as_ref();
-            if !self.document_visible(entity) || !visible(entity, context) {
+            if !self.document_visible(entity, true) || !visible(entity, context) {
                 continue;
             }
             match entity {
@@ -599,21 +640,47 @@ impl<'a> RenderSceneGraph<'a> {
         }
     }
 
-    fn document_visible(&self, entity: &EntityType) -> bool {
+    /// `member`: the entity sits inside a block, where layer 0 defers to the
+    /// layer of the reference that places it.
+    fn document_visible(&self, entity: &EntityType, member: bool) -> bool {
         let common = entity.common();
-        if common.invisible {
-            return false;
-        }
-        let layer = self.document.layers.get(&common.layer);
-        if layer
-            .map(|layer| layer.flags.off || layer.flags.frozen)
-            .unwrap_or(false)
+        if crate::scene::block_construction::is_construction(common)
+            && (member
+                || !self
+                    .visibility_reveal
+                    .is_some_and(|handles| handles.contains(&common.handle)))
         {
             return false;
         }
+        if common.invisible
+            && !self
+                .visibility_reveal
+                .is_some_and(|handles| handles.contains(&common.handle))
+        {
+            return false;
+        }
+        let layer = self.document.layers.get(&common.layer);
+        if (member && block_member_layer_hidden(self.document, &common.layer, self.layer_walk))
+            || (!member
+                && layer.is_some_and(|layer| {
+                    layer.flags.off
+                        || layer.flags.frozen
+                        || self
+                            .layer_walk
+                            .is_some_and(|walk| !walk.contains(&layer.handle))
+                }))
+        {
+            return false;
+        }
+        // A viewport's frozen layer 0 hides what its space draws on layer 0.
+        // A block member on layer 0 shows on the layer of the reference that
+        // places it, which the walk has already checked against the viewport.
+        let defers_to_reference =
+            member && crate::scene::view::render::is_effective_layer_zero(&common.layer);
         if self.frozen_layers.is_some_and(|frozen| {
             frozen.contains(&common.handle)
-                || layer.is_some_and(|layer| frozen.contains(&layer.handle))
+                || (!defers_to_reference
+                    && layer.is_some_and(|layer| frozen.contains(&layer.handle)))
         }) {
             return false;
         }
@@ -626,12 +693,35 @@ impl<'a> RenderSceneGraph<'a> {
     }
 }
 
-pub fn block_base_point(document: &CadDocument, block_name: &str) -> Vector3 {
-    document
-        .block_records
-        .iter()
-        .find(|record| record.name.eq_ignore_ascii_case(block_name))
+/// Whether a block member on `layer` is hidden by its layer. An off or frozen
+/// layer hides it, except layer 0: a member on layer 0 shows on the layer of
+/// the reference that places it, which the caller has checked (#1916), so
+/// layer 0 being off or frozen leaves it to that layer. `walk` is the session
+/// LAYWALK visible set of the space being rendered; outside layers hide like
+/// frozen ones, and layer 0 defers there too — the reference's layer was
+/// already checked against the walk by the caller.
+pub(crate) fn block_member_layer_hidden(
+    document: &Document,
+    layer: &str,
+    walk: Option<&FxHashSet<Handle>>,
+) -> bool {
+    if crate::scene::view::render::is_effective_layer_zero(layer) {
+        return false;
+    }
+    document.layers.get(layer).is_some_and(|record| {
+        record.flags.frozen
+            || record.flags.off
+            || walk.is_some_and(|walk| !walk.contains(&record.handle))
+    })
+}
+
+pub fn block_base_point(document: &Document, block_name: &str) -> Vector3 {
+    block_record_by_name(document, block_name)
         .map(|record| {
+            if let Some((_, parameter)) = super::block_basepoint::parameter(document, record.handle)
+            {
+                return parameter.point;
+            }
             document
                 .get_entity(record.block_entity_handle)
                 .and_then(|entity| match entity {
@@ -643,14 +733,154 @@ pub fn block_base_point(document: &CadDocument, block_name: &str) -> Vector3 {
         .unwrap_or(Vector3::ZERO)
 }
 
-pub fn insert_transform(document: &CadDocument, insert: &Insert) -> Transform {
-    let base = block_base_point(document, &insert.block_name);
+/// An annotative dimension with a single scale representation has a single
+/// picture, its own block: edits drop it and moves carry it like any other
+/// dimension's. With several, each scale's block is a separate picture those
+/// edits leave behind, so it is drawn from its definition instead.
+fn single_scale_picture(document: &Document, handle: Handle, block: &str) -> bool {
+    crate::scene::annotative::object_scale_memberships(document, handle).len() == 1
+        && matches!(
+            document.get_entity(handle),
+            Some(EntityType::Dimension(stored))
+                if stored.base().block_name.trim().eq_ignore_ascii_case(block)
+        )
+}
+
+/// An unedited dimension whose definition points measure something other than
+/// the measurement it stores (group 42) cannot be rebuilt: a dimension copied
+/// into a block can keep some points in world coordinates, so one stored as 65
+/// rebuilds as 6570. The source application draws the scale's picture, and so
+/// do we. Saving refreshes the measurement of every dimension it re-bakes, so
+/// a picture an edit left behind is never chosen this way.
+fn rebuild_disagrees_with_picture(document: &Document, handle: Handle) -> bool {
+    let Some(EntityType::Dimension(stored)) = document.get_entity(handle) else {
+        return false;
+    };
+    let measured = stored.stored_measurement();
+    let kept = stored.base().actual_measurement;
+    !stored.base().block_name.trim().is_empty()
+        && (measured - kept).abs() > 1e-6 * measured.abs().max(kept.abs()).max(1.0)
+}
+
+/// An annotative dimension's picture drawn at another size than its scale
+/// gives: text far from DIMTXT times the scale. Earlier versions of this
+/// program saved such pictures at 1:1, and they came back oversized on every
+/// open; the dimension is rebuilt instead.
+fn picture_off_scale(
+    document: &Document,
+    dimension: &document::entities::Dimension,
+    record: &document::tables::BlockRecord,
+) -> bool {
+    let name = dimension.base().style_name.trim();
+    let Some(style) = document.dim_styles.iter().find(|style| {
+        style.name.eq_ignore_ascii_case(name)
+            || (name.is_empty() && style.name.eq_ignore_ascii_case("Standard"))
+    }) else {
+        return false;
+    };
+    let style_annotative = style.annotative;
+    let style = crate::entities::dimension::resolved_dimension_style(style, dimension, document);
+    // A fixed DIMSCALE, or a non-annotative one (DIMSCALE 0 there follows
+    // the viewport), sizes the picture, not the annotation scale.
+    if !(style.annotative || style_annotative) || style.dimscale > 1e-6 {
+        return false;
+    }
+    let expected = style.dimtxt
+        * crate::modules::draw::modify::explode::annotative_picture_scale(dimension, document);
+    let drawn = record.entity_handles.iter().find_map(|handle| match document.get_entity(*handle) {
+        Some(EntityType::Text(text)) => Some(text.height),
+        Some(EntityType::MText(text)) => Some(text.height),
+        _ => None,
+    });
+    match drawn {
+        Some(drawn) if expected > 0.0 && drawn > 0.0 => !(0.8..=1.25).contains(&(drawn / expected)),
+        _ => false,
+    }
+}
+
+/// The block reference that places a dimension's picture block: at the
+/// dimension's insertion point, with its insertion rotation and scale. The
+/// point is stored in the dimension's OCS; the picture's sub-entities are in
+/// world coordinates, so only the point goes through the OCS. A zero scale
+/// component (an unread field) counts as 1 rather than collapsing the picture.
+pub(crate) fn dimension_picture_insert(
+    base: &document::entities::dimension::DimensionBase,
+    block_name: String,
+) -> Insert {
+    let scale = |s: f64| if s.abs() < 1e-12 { 1.0 } else { s };
+    let point = Matrix3::arbitrary_axis(base.normal) * base.insertion_point;
+    Insert::new(block_name, point)
+        .with_scale(
+            scale(base.insertion_scale.x),
+            scale(base.insertion_scale.y),
+            scale(base.insertion_scale.z),
+        )
+        .with_rotation(base.insertion_rotation)
+}
+
+/// World transform of a dimension's picture placement, or None when it is
+/// the identity (the usual case: OCS bakes its pictures in place).
+pub(crate) fn dimension_picture_placement(
+    base: &document::entities::dimension::DimensionBase,
+) -> Option<Transform> {
+    let insert = dimension_picture_insert(base, String::new());
+    let p = insert.insert_point;
+    let identity = p.x.abs() < 1e-9
+        && p.y.abs() < 1e-9
+        && p.z.abs() < 1e-9
+        && insert.rotation.abs() < 1e-12
+        && (insert.x_scale() - 1.0).abs() < 1e-12
+        && (insert.y_scale() - 1.0).abs() < 1e-12
+        && (insert.z_scale() - 1.0).abs() < 1e-12;
+    (!identity).then(|| insert.get_transform())
+}
+
+/// A dimension's picture placement as a world-space edit, or None when it is
+/// the identity. Edits move the picture's sub-entities in world space, so a
+/// placed picture has its placement folded into the subs and the dimension's
+/// own placement cleared (`clear_dim_picture_placement`); a placement left on
+/// the dimension would be applied again on top of the moved subs.
+pub(crate) fn dim_picture_placement(
+    entity: &EntityType,
+) -> Option<crate::entities::transform::EntityTransform> {
+    let EntityType::Dimension(d) = entity else {
+        return None;
+    };
+    if d.base().block_name.trim().is_empty() {
+        return None;
+    }
+    dimension_picture_placement(d.base()).map(crate::entities::transform::EntityTransform::Affine)
+}
+
+/// Reset a dimension's picture placement to the identity once its subs carry
+/// it. Also undoes the transform moving the placement point along with the
+/// dimension, which would offset a picture baked in place.
+pub(crate) fn clear_dim_picture_placement(entity: &mut EntityType) {
+    if let EntityType::Dimension(d) = entity {
+        let base = d.base_mut();
+        if !base.block_name.trim().is_empty() {
+            base.insertion_point = Vector3::ZERO;
+            base.insertion_rotation = 0.0;
+            base.insertion_scale = Vector3::new(1.0, 1.0, 1.0);
+        }
+    }
+}
+
+pub fn insert_transform(document: &Document, insert: &Insert) -> Transform {
+    insert_transform_with_base(insert, block_base_point(document, &insert.block_name))
+}
+
+/// [`insert_transform`] for a caller that already resolved the block's base
+/// point (the `-INSERT` command builds the INSERT before the drawing is in
+/// scope), so the base-point convention lives in exactly one place:
+/// world = insert_point + Rot(rotation) * Scale * (P - base).
+pub fn insert_transform_with_base(insert: &Insert, base: Vector3) -> Transform {
     Transform::from_translation(Vector3::new(-base.x, -base.y, -base.z))
         .then(&insert.get_transform())
 }
 
 pub fn insert_transform_at_scale(
-    document: &CadDocument,
+    document: &Document,
     insert: &Insert,
     annotation_scale: f32,
 ) -> Transform {
@@ -663,7 +893,7 @@ pub fn insert_transform_at_scale(
 }
 
 pub fn insert_transform_with_policy(
-    document: &CadDocument,
+    document: &Document,
     insert: &Insert,
     annotation_scale: f32,
     scale_policy: BlockScalePolicy,
@@ -713,9 +943,9 @@ pub struct BlockUse {
 }
 
 pub(crate) fn block_record_by_name<'a>(
-    document: &'a CadDocument,
+    document: &'a Document,
     name: &str,
-) -> Option<&'a codec::tables::BlockRecord> {
+) -> Option<&'a document::tables::BlockRecord> {
     document.block_records.get(name).or_else(|| {
         document
             .block_records
@@ -725,7 +955,7 @@ pub(crate) fn block_record_by_name<'a>(
 }
 
 fn block_use(
-    document: &CadDocument,
+    document: &Document,
     mut insert: Insert,
     role: BlockRole,
     scale_policy: BlockScalePolicy,
@@ -733,11 +963,10 @@ fn block_use(
     replaces_host_wire: bool,
     suppress_root_points: bool,
 ) -> BlockUse {
-    let block =
-        block_record_by_name(document, &insert.block_name).map_or(Handle::NULL, |record| {
-            insert.block_name.clone_from(&record.name);
-            record.handle
-        });
+    let block = block_record_by_name(document, &insert.block_name).map_or(Handle::NULL, |record| {
+        insert.block_name.clone_from(&record.name);
+        record.handle
+    });
     BlockUse {
         block,
         insert,
@@ -750,7 +979,7 @@ fn block_use(
 }
 
 pub fn block_use_from_handle(
-    document: &CadDocument,
+    document: &Document,
     block: Handle,
     role: BlockRole,
     insertion: Vector3,
@@ -772,7 +1001,7 @@ pub fn block_use_from_handle(
 
 fn push_dependency_use(
     uses: &mut Vec<BlockUse>,
-    document: &CadDocument,
+    document: &Document,
     block: Handle,
     role: BlockRole,
 ) {
@@ -783,9 +1012,7 @@ fn push_dependency_use(
     {
         return;
     }
-    if let Some(mut block_use) =
-        block_use_from_handle(document, block, role, Vector3::ZERO)
-    {
+    if let Some(mut block_use) = block_use_from_handle(document, block, role, Vector3::ZERO) {
         block_use.active = false;
         uses.push(block_use);
     }
@@ -795,7 +1022,7 @@ fn push_dependency_use(
 /// edges, such as block-valued table cells. Representation flags let renderers
 /// choose the active picture while dependency consumers keep the full graph.
 fn entity_owned_block_uses(
-    document: &CadDocument,
+    document: &Document,
     entity: &EntityType,
     annotation_scale: f32,
 ) -> Vec<BlockUse> {
@@ -814,9 +1041,13 @@ fn entity_owned_block_uses(
             if let Some(record) = block_record_by_name(document, name)
                 .filter(|record| !record.entity_handles.is_empty())
             {
-                let mut insert = Insert::new(record.name.clone(), Vector3::ZERO);
-                insert.common = dimension.base().common.clone();
-                let picture = !crate::scene::annotative::is_annotative(document, entity);
+                let base = dimension.base();
+                let mut insert = dimension_picture_insert(base, record.name.clone());
+                insert.common = base.common.clone();
+                let picture = (!crate::scene::annotative::is_annotative(document, entity)
+                    || single_scale_picture(document, base.common.handle, &record.name)
+                    || rebuild_disagrees_with_picture(document, base.common.handle))
+                    && !picture_off_scale(document, dimension, record);
                 vec![block_use(
                     document,
                     insert,
@@ -894,7 +1125,7 @@ fn entity_owned_block_uses(
 }
 
 pub fn entity_render_block_uses(
-    document: &CadDocument,
+    document: &Document,
     entity: &EntityType,
     annotation_scale: f32,
 ) -> Vec<BlockUse> {
@@ -902,7 +1133,7 @@ pub fn entity_render_block_uses(
 }
 
 pub fn entity_block_uses(
-    document: &CadDocument,
+    document: &Document,
     entity: &EntityType,
     annotation_scale: f32,
 ) -> Vec<BlockUse> {
@@ -926,17 +1157,10 @@ pub fn entity_block_uses(
                     || (style_name.is_empty() && style.name.eq_ignore_ascii_case("Standard"))
             }) {
                 let style = crate::entities::dimension::resolved_dimension_style(
-                    style,
-                    dimension,
-                    document,
+                    style, dimension, document,
                 );
                 for handle in [style.dimblk, style.dimblk1, style.dimblk2, style.dimldrblk] {
-                    push_dependency_use(
-                        &mut uses,
-                        document,
-                        handle,
-                        BlockRole::ArrowHead,
-                    );
+                    push_dependency_use(&mut uses, document, handle, BlockRole::ArrowHead);
                 }
                 for name in [style.dimblk_name, style.dimblk1_name, style.dimblk2_name] {
                     if let Some(record) = block_record_by_name(document, &name) {
@@ -962,22 +1186,12 @@ pub fn entity_block_uses(
             )
             .or_else(|| style.map(|style| style.dimldrblk));
             if let Some(handle) = handle {
-                push_dependency_use(
-                    &mut uses,
-                    document,
-                    handle,
-                    BlockRole::ArrowHead,
-                );
+                push_dependency_use(&mut uses, document, handle, BlockRole::ArrowHead);
             }
         }
         EntityType::MultiLeader(multileader) => {
             if let Some(handle) = multileader.arrowhead_handle {
-                push_dependency_use(
-                    &mut uses,
-                    document,
-                    handle,
-                    BlockRole::ArrowHead,
-                );
+                push_dependency_use(&mut uses, document, handle, BlockRole::ArrowHead);
             }
             for line in multileader
                 .context
@@ -986,65 +1200,11 @@ pub fn entity_block_uses(
                 .flat_map(|root| &root.lines)
             {
                 if let Some(handle) = line.arrowhead_handle {
-                    push_dependency_use(
-                        &mut uses,
-                        document,
-                        handle,
-                        BlockRole::ArrowHead,
-                    );
+                    push_dependency_use(&mut uses, document, handle, BlockRole::ArrowHead);
                 }
             }
         }
         _ => {}
-    }
-    uses
-}
-
-/// Blocks referenced by document-level styles rather than a concrete entity.
-pub fn document_block_uses(document: &CadDocument) -> Vec<BlockUse> {
-    let mut uses = Vec::new();
-    for style in document.dim_styles.iter() {
-        for handle in [style.dimblk, style.dimblk1, style.dimblk2, style.dimldrblk] {
-            push_dependency_use(&mut uses, document, handle, BlockRole::ArrowHead);
-        }
-        for name in [&style.dimblk_name, &style.dimblk1_name, &style.dimblk2_name] {
-            if let Some(record) = block_record_by_name(document, name) {
-                push_dependency_use(
-                    &mut uses,
-                    document,
-                    record.handle,
-                    BlockRole::ArrowHead,
-                );
-            }
-        }
-    }
-    for object in document.objects.values() {
-        let codec::objects::ObjectType::MultiLeaderStyle(style) = object else {
-            continue;
-        };
-        if let Some(handle) = style.arrowhead_handle {
-            push_dependency_use(&mut uses, document, handle, BlockRole::ArrowHead);
-        }
-        if let Some(handle) = style.block_content_handle {
-            push_dependency_use(
-                &mut uses,
-                document,
-                handle,
-                BlockRole::MultiLeaderContent,
-            );
-        }
-    }
-    for line_type in document.line_types.iter() {
-        for symbol in
-            crate::scene::convert::dgn_linestyle::symbol_blocks(document, &line_type.name)
-        {
-            push_dependency_use(
-                &mut uses,
-                document,
-                symbol.block,
-                BlockRole::LineStyleSymbol,
-            );
-        }
     }
     uses
 }
@@ -1081,7 +1241,7 @@ pub fn array_offsets(insert: &Insert) -> Vec<[f64; 3]> {
 }
 
 pub fn insert_instance_transform(
-    document: &CadDocument,
+    document: &Document,
     insert: &Insert,
     offset: [f64; 3],
     annotation_scale: f32,
@@ -1091,43 +1251,108 @@ pub fn insert_instance_transform(
     if offset == [0.0; 3] {
         transform
     } else {
-        let orientation = Transform::from_matrix(Matrix4::rotation_z(insert.rotation))
-            .then(&Transform::from_matrix(Matrix4::from_matrix3(Matrix3::arbitrary_axis(insert.normal))));
-        let world_offset = orientation.apply_rotation(Vector3::new(offset[0], offset[1], offset[2]));
+        let orientation = Transform::from_matrix(Matrix4::rotation_z(insert.rotation)).then(
+            &Transform::from_matrix(Matrix4::from_matrix3(Matrix3::arbitrary_axis(
+                insert.normal,
+            ))),
+        );
+        let world_offset =
+            orientation.apply_rotation(Vector3::new(offset[0], offset[1], offset[2]));
         transform.then(&Transform::from_translation(world_offset))
     }
 }
 
 pub fn insert_instance_translation_delta(
-    document: &CadDocument,
+    document: &Document,
     insert: &Insert,
     offset: [f64; 3],
     annotation_scale: f32,
     scale_policy: BlockScalePolicy,
 ) -> Vector3 {
-    let base = insert_instance_transform(
-        document,
-        insert,
-        [0.0; 3],
-        annotation_scale,
-        scale_policy,
-    )
-    .apply(Vector3::ZERO);
-    let instance = insert_instance_transform(
-        document,
-        insert,
-        offset,
-        annotation_scale,
-        scale_policy,
-    )
-    .apply(Vector3::ZERO);
+    let base =
+        insert_instance_transform(document, insert, [0.0; 3], annotation_scale, scale_policy)
+            .apply(Vector3::ZERO);
+    let instance =
+        insert_instance_transform(document, insert, offset, annotation_scale, scale_policy)
+            .apply(Vector3::ZERO);
     instance - base
 }
 
 pub fn block_contains_hatch(
-    document: &CadDocument,
+    document: &Document,
     block_name: &str,
     memo: &mut std::collections::HashMap<String, bool>,
+) -> bool {
+    block_contains_kind(document, block_name, memo, &|entity| {
+        matches!(entity, EntityType::Hatch(_))
+    })
+}
+
+/// Whether any block definition (a block record that is not a layout)
+/// directly holds an entity of the kind. Nesting only places what some
+/// definition holds, so when none does no reference in the drawing can
+/// place such an entity: walks that look only for those leaves inside
+/// blocks can be skipped.
+pub fn any_block_definition_holds(
+    document: &Document,
+    is_kind: impl Fn(&EntityType) -> bool,
+) -> bool {
+    document
+        .block_records
+        .iter()
+        // `is_layout()` alone is not enough: an orphaned block can carry a
+        // dangling layout handle and still be inserted somewhere.
+        .filter(|record| {
+            !matches!(
+                document.objects.get(&record.layout),
+                Some(document::objects::ObjectType::Layout(_))
+            )
+        })
+        .any(|record| {
+            record
+                .entity_handles
+                .iter()
+                .any(|&handle| document.get_entity(handle).is_some_and(&is_kind))
+        })
+}
+
+/// Whether the block, or a block it nests, holds a WIPEOUT mask.
+pub fn block_contains_wipeout(
+    document: &Document,
+    block_name: &str,
+    memo: &mut std::collections::HashMap<String, bool>,
+) -> bool {
+    block_contains_kind(document, block_name, memo, &|entity| {
+        matches!(entity, EntityType::Wipeout(_))
+    })
+}
+
+/// Whether the block, or a block it nests, holds a solid, surface or mesh
+/// entity, the kinds that draw through the mesh cache.
+pub fn block_contains_mesh(
+    document: &Document,
+    block_name: &str,
+    memo: &mut std::collections::HashMap<String, bool>,
+) -> bool {
+    block_contains_kind(document, block_name, memo, &|entity| {
+        matches!(
+            entity,
+            EntityType::Solid3D(_)
+                | EntityType::Region(_)
+                | EntityType::Body(_)
+                | EntityType::Surface(_)
+                | EntityType::Mesh(_)
+                | EntityType::PolygonMesh(_)
+                | EntityType::PolyfaceMesh(_)
+        )
+    })
+}
+
+fn block_contains_kind(
+    document: &Document,
+    block_name: &str,
+    memo: &mut std::collections::HashMap<String, bool>,
+    is_kind: &dyn Fn(&EntityType) -> bool,
 ) -> bool {
     let key = block_name.to_ascii_lowercase();
     if let Some(&contains) = memo.get(&key) {
@@ -1139,12 +1364,12 @@ pub fn block_contains_hatch(
             .entity_handles
             .iter()
             .any(|&handle| match document.get_entity(handle) {
-                Some(EntityType::Hatch(_)) => true,
+                Some(entity) if is_kind(entity) => true,
                 Some(entity) => entity_render_block_uses(document, entity, 1.0)
                     .into_iter()
                     .filter(|block_use| block_use.active)
                     .any(|block_use| {
-                        block_contains_hatch(document, &block_use.insert.block_name, memo)
+                        block_contains_kind(document, &block_use.insert.block_name, memo, is_kind)
                     }),
                 _ => false,
             })
@@ -1156,11 +1381,11 @@ pub fn block_contains_hatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::xdata::ExtendedDataRecord;
+    use document::xdata::ExtendedDataRecord;
 
     #[test]
     fn applied_block_scale_skips_annotative_rescaling() {
-        let document = CadDocument::new();
+        let document = Document::new();
         let mut insert = Insert::new("BLOCK", Vector3::new(10.0, 20.0, 0.0));
         insert
             .common
@@ -1168,23 +1393,202 @@ mod tests {
             .add_record(ExtendedDataRecord::new("AcAnnotativeData"));
         let point = Vector3::new(1.0, 0.0, 0.0);
 
-        let from_insert = insert_transform_with_policy(
-            &document,
-            &insert,
-            2.0,
-            BlockScalePolicy::FromInsert,
-        )
-        .apply(point);
-        let applied = insert_transform_with_policy(
-            &document,
-            &insert,
-            2.0,
-            BlockScalePolicy::Applied,
-        )
-        .apply(point);
+        let from_insert =
+            insert_transform_with_policy(&document, &insert, 2.0, BlockScalePolicy::FromInsert)
+                .apply(point);
+        let applied =
+            insert_transform_with_policy(&document, &insert, 2.0, BlockScalePolicy::Applied)
+                .apply(point);
 
         assert!((from_insert.x - 12.0).abs() < 1.0e-9);
         assert!((applied.x - 11.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn effective_layer_skips_zero_inserts_and_keeps_dependent_layers() {
+        let mut context = InstanceContext::direct(0.0, None);
+        let mut outer = Insert::new("OUTER", Vector3::ZERO);
+        outer.common.layer = "OUTER_LAYER".into();
+        let mut zero = Insert::new("ZERO", Vector3::ZERO);
+        zero.common.layer = "0".into();
+        let mut inner = Insert::new("INNER", Vector3::ZERO);
+        inner.common.layer = "INNER_LAYER".into();
+
+        context.insert_path = vec![outer, zero];
+        assert_eq!(context.effective_layer("0"), "OUTER_LAYER");
+        assert_eq!(context.effective_layer("XREF|0"), "OUTER_LAYER");
+        assert_eq!(context.effective_layer("XREF|WALLS"), "XREF|WALLS");
+        context.insert_path.push(inner);
+        assert_eq!(context.effective_layer("0"), "INNER_LAYER");
+        context.insert_path.clear();
+        assert_eq!(context.effective_layer("XREF|0"), "XREF|0");
+    }
+
+    /// Off or frozen, layer 0 leaves a block member on it to the layer of the
+    /// reference that places it.
+    #[test]
+    fn layer_zero_block_members_follow_the_reference_when_off_or_frozen() {
+        use document::entities::Line;
+        use document::tables::BlockRecord;
+        let mut document = Document::new();
+        let mut record = BlockRecord::new("ARROW");
+        record.handle = document.allocate_handle();
+        let block = record.handle;
+        document.block_records.add(record).unwrap();
+        let mut line = Line::from_points(Vector3::ZERO, Vector3::new(1.0, 0.0, 0.0));
+        line.common.owner_handle = block;
+        document.add_entity(EntityType::Line(line)).unwrap();
+        let leaves = |document: &Document| {
+            let depths = rustc_hash::FxHashMap::default();
+            let graph = RenderSceneGraph::new(document, None, None, true, &depths);
+            let arrow = block_use_from_handle(document, block, BlockRole::ArrowHead, Vector3::ZERO)
+                .unwrap();
+            let mut count = 0;
+            graph.walk_block_use(&arrow, block, |_, _| true, |_, _| count += 1);
+            count
+        };
+
+        document.layers.get_mut("0").unwrap().flags.off = true;
+        assert_eq!(leaves(&document), 1);
+        document.layers.get_mut("0").unwrap().flags.frozen = true;
+        assert_eq!(leaves(&document), 1);
+    }
+
+    /// Layer 0 frozen in the whole drawing hides what is drawn on layer 0 in a
+    /// space, not a reference placed on layer 0 inside another block, nor what
+    /// that reference holds.
+    #[test]
+    fn a_frozen_layer_zero_keeps_a_nested_reference_on_layer_zero() {
+        use document::entities::Line;
+        use document::tables::{BlockRecord, Layer};
+        let mut document = Document::new();
+        document.layers.add(Layer::new("REF")).unwrap();
+        let mut add_block = |name: &str| {
+            let mut record = BlockRecord::new(name);
+            record.handle = document.allocate_handle();
+            let handle = record.handle;
+            document.block_records.add(record).unwrap();
+            handle
+        };
+        let inner = add_block("INNER");
+        let outer = add_block("OUTER");
+        let mut member = Line::from_points(Vector3::ZERO, Vector3::new(1.0, 0.0, 0.0));
+        member.common.owner_handle = inner;
+        member.common.layer = "0".into();
+        document.add_entity(EntityType::Line(member)).unwrap();
+        let mut nested = Insert::new("INNER", Vector3::ZERO);
+        nested.common.owner_handle = outer;
+        nested.common.layer = "0".into();
+        document.add_entity(EntityType::Insert(nested)).unwrap();
+        let mut placed = Insert::new("OUTER", Vector3::ZERO);
+        placed.common.layer = "REF".into();
+        document.add_entity(EntityType::Insert(placed)).unwrap();
+        let mut drawn_on_zero = Line::from_points(Vector3::ZERO, Vector3::new(0.0, 1.0, 0.0));
+        drawn_on_zero.common.layer = "0".into();
+        document
+            .add_entity(EntityType::Line(drawn_on_zero))
+            .unwrap();
+        document.layers.get_mut("0").unwrap().flags.frozen = true;
+        let model = document.header.model_space_block_handle;
+
+        let depths = FxHashMap::default();
+        let graph = RenderSceneGraph::new(&document, None, None, true, &depths);
+        let mut lines = 0;
+        graph.walk_root(
+            SceneRoot::Block(BlockRoot {
+                record: model,
+                role: BlockRootRole::ModelSpace,
+            }),
+            |_, _| true,
+            |entity, _| lines += usize::from(matches!(entity, EntityType::Line(_))),
+        );
+        assert_eq!(
+            lines, 1,
+            "only the line drawn on layer 0 in model space hides"
+        );
+    }
+
+    /// A viewport that freezes layer 0 hides what is drawn on layer 0 in its
+    /// space, not the members of a block on layer 0: those show on the layer
+    /// of the reference that places them. A fill in a block placed on layer 0
+    /// inside another reference kept vanishing from such viewports.
+    #[test]
+    fn a_viewport_freezing_layer_zero_keeps_a_nested_reference_on_layer_zero() {
+        use document::entities::Line;
+        use document::tables::{BlockRecord, Layer};
+        let mut document = Document::new();
+        document.layers.add(Layer::new("REF")).unwrap();
+        document.layers.add(Layer::new("GREEN")).unwrap();
+        let mut add_block = |name: &str| {
+            let mut record = BlockRecord::new(name);
+            record.handle = document.allocate_handle();
+            let handle = record.handle;
+            document.block_records.add(record).unwrap();
+            handle
+        };
+        let inner = add_block("INNER");
+        let outer = add_block("OUTER");
+        let mut fill_edge = Line::from_points(Vector3::ZERO, Vector3::new(1.0, 0.0, 0.0));
+        fill_edge.common.owner_handle = inner;
+        fill_edge.common.layer = "GREEN".into();
+        document.add_entity(EntityType::Line(fill_edge)).unwrap();
+        let mut nested = Insert::new("INNER", Vector3::ZERO);
+        nested.common.owner_handle = outer;
+        nested.common.layer = "0".into();
+        document.add_entity(EntityType::Insert(nested)).unwrap();
+        let mut placed = Insert::new("OUTER", Vector3::ZERO);
+        placed.common.layer = "REF".into();
+        document.add_entity(EntityType::Insert(placed)).unwrap();
+        let model = document.header.model_space_block_handle;
+
+        let leaves = |frozen_layer: &str| {
+            let frozen: FxHashSet<Handle> =
+                std::iter::once(document.layers.get(frozen_layer).unwrap().handle).collect();
+            let depths = FxHashMap::default();
+            let graph = RenderSceneGraph::new(&document, Some(&frozen), None, true, &depths);
+            let mut count = 0;
+            graph.walk_root(
+                SceneRoot::Block(BlockRoot {
+                    record: model,
+                    role: BlockRootRole::ModelSpace,
+                }),
+                |_, _| true,
+                |_, _| count += 1,
+            );
+            count
+        };
+
+        assert_eq!(leaves("0"), 1, "the viewport froze layer 0 only");
+        assert_eq!(leaves("GREEN"), 0, "the member's own layer is frozen");
+        assert_eq!(leaves("REF"), 0, "the reference's layer is frozen");
+    }
+
+    /// Only block definitions count: an object of the kind in model space
+    /// does not make a reference able to place one.
+    #[test]
+    fn any_block_definition_holds_ignores_layouts() {
+        use document::entities::{Circle, Line};
+        use document::tables::BlockRecord;
+        let mut document = Document::new();
+        document
+            .add_entity(EntityType::Circle(Circle::from_coords(0.0, 0.0, 0.0, 1.0)))
+            .unwrap();
+        let mut record = BlockRecord::new("ARROW");
+        record.handle = document.allocate_handle();
+        let block = record.handle;
+        document.block_records.add(record).unwrap();
+        let mut line = Line::from_points(Vector3::ZERO, Vector3::new(1.0, 0.0, 0.0));
+        line.common.owner_handle = block;
+        document.add_entity(EntityType::Line(line)).unwrap();
+
+        assert!(any_block_definition_holds(&document, |entity| matches!(
+            entity,
+            EntityType::Line(_)
+        )));
+        assert!(!any_block_definition_holds(&document, |entity| matches!(
+            entity,
+            EntityType::Circle(_)
+        )));
     }
 
     #[test]
@@ -1195,7 +1599,11 @@ mod tests {
         insert.row_spacing = 1.0;
         insert.column_spacing = 1.0;
         let offsets = array_offsets(&insert);
-        assert_eq!(offsets, vec![[0.0; 3]], "pathological instance count must clamp to a single instance");
+        assert_eq!(
+            offsets,
+            vec![[0.0; 3]],
+            "pathological instance count must clamp to a single instance"
+        );
     }
 
     #[test]
@@ -1214,7 +1622,7 @@ mod tests {
 
     #[test]
     fn insert_instance_transform_does_not_scale_the_row_column_spacing() {
-        let document = CadDocument::new();
+        let document = Document::new();
         let mut insert = Insert::new("BLOCK", Vector3::new(100.0, 0.0, 0.0));
         insert.set_x_scale(2.0);
         insert.row_count = 1;
@@ -1231,18 +1639,25 @@ mod tests {
         // The block's own origin (local point 0,0,0) placed at this instance
         // must land 10 units from the insert point, not 20.
         let world = transform.apply(Vector3::ZERO);
-        assert!((world.x - 110.0).abs() < 1.0e-9, "expected spacing 10, got offset {}", world.x - 100.0);
+        assert!(
+            (world.x - 110.0).abs() < 1.0e-9,
+            "expected spacing 10, got offset {}",
+            world.x - 100.0
+        );
 
         // Block-local geometry must still pick up the block scale normally.
         let block_point = transform.apply(Vector3::new(1.0, 0.0, 0.0));
-        assert!((block_point.x - 112.0).abs() < 1.0e-9, "block-local geometry should still be scaled by x_scale 2");
+        assert!(
+            (block_point.x - 112.0).abs() < 1.0e-9,
+            "block-local geometry should still be scaled by x_scale 2"
+        );
     }
 
     #[test]
     fn insert_instance_transform_rotates_the_spacing_with_the_insert() {
         // Matches the pinned CAD model's own `Insert::array_points`: spacing
         // is rotated with the insert but never scaled.
-        let document = CadDocument::new();
+        let document = Document::new();
         let mut insert = Insert::new("BLOCK", Vector3::ZERO);
         insert.rotation = std::f64::consts::FRAC_PI_2;
         insert.row_count = 1;
@@ -1257,7 +1672,15 @@ mod tests {
             BlockScalePolicy::Applied,
         );
         let world = transform.apply(Vector3::ZERO);
-        assert!(world.x.abs() < 1.0e-9, "a 90deg rotation should turn column spacing into Y, got x={}", world.x);
-        assert!((world.y - 10.0).abs() < 1.0e-9, "expected the spacing rotated onto Y, got y={}", world.y);
+        assert!(
+            world.x.abs() < 1.0e-9,
+            "a 90deg rotation should turn column spacing into Y, got x={}",
+            world.x
+        );
+        assert!(
+            (world.y - 10.0).abs() < 1.0e-9,
+            "expected the spacing rotated onto Y, got y={}",
+            world.y
+        );
     }
 }

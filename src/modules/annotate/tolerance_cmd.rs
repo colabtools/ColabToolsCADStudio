@@ -2,9 +2,9 @@
 //
 // The structured editor prepares the frame; this command places it.
 
-use codec::entities::Tolerance;
-use codec::types::Vector3;
-use codec::EntityType;
+use document::entities::Tolerance;
+use document::types::Vector3;
+use document::EntityType;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult, WorkingPlane};
@@ -49,7 +49,7 @@ impl CadCommand for ToleranceCommand {
     }
 
     fn prompt(&self) -> String {
-        t!("TOLERANCE  Specify insertion point:").into_owned()
+        t!("TOLERANCE  Enter tolerance location:").into_owned()
     }
 
     fn wants_text_input(&self) -> bool {
@@ -76,15 +76,15 @@ impl CadCommand for ToleranceCommand {
             if !points.is_empty() {
                 points.push(DVec3::splat(f64::NAN));
             }
-            points.extend(stroke.iter().map(|[x, y]| {
-                pt + self.plane.x * *x as f64 + self.plane.y * *y as f64
-            }));
+            points.extend(
+                stroke
+                    .iter()
+                    .map(|[x, y]| pt + self.plane.x * *x as f64 + self.plane.y * *y as f64),
+            );
         }
         Some(WireModel {
             bg_adapt: None,
             point_marker: None,
-            taper_widths: Vec::new(),
-            pattern_stations: Vec::new(),
             world_width: 0.0,
             depth_override: None,
             display_visible: true,
@@ -92,32 +92,42 @@ impl CadCommand for ToleranceCommand {
             plot_visible: true,
             fill_is_3d: false,
             fill_is_2d_solid: false,
+            solid_normal: None,
             render_instance: None,
-            pick_tris: Vec::new(),
-            pick_tris_low: Vec::new(),
             dash_from_start: false,
-            dash_align_end: None,
-            text_verts: Vec::new(),
             name: "tolerance_preview".into(),
-            points: points.iter().map(|point| point.as_vec3().to_array()).collect(),
-            points_low: Vec::new(),
             color: WireModel::CYAN,
             selected: false,
             pattern_length: 0.0,
             pattern: [0.0; 8],
             line_weight_px: 1.0,
-            snap_pts: vec![],
-            tangent_geoms: vec![],
             aci: 0,
-            key_vertices: vec![],
             aabb: WireModel::UNBOUNDED_AABB,
             plinegen: true,
-            fill_tris: vec![],
-            fill_tris_low: Vec::new(),
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                taper_widths: Vec::new(),
+                pattern_stations: Vec::new(),
+                pick_tris: Vec::new(),
+                pick_tris_low: Vec::new(),
+                text_verts: Vec::new(),
+                points: points
+                    .iter()
+                    .map(|point| point.as_vec3().to_array())
+                    .collect(),
+                points_low: Vec::new(),
+                snap_pts: vec![],
+                tangent_geoms: vec![],
+                key_vertices: vec![],
+                fill_tris: vec![],
+                fill_tris_low: Vec::new(),
+                ..crate::scene::WireGeom::default()
+            }),
+            ..Default::default()
         })
     }
 }
 
-
 // ── Autocomplete registry ─────────────────────────────────
-inventory::submit!(crate::command::CommandRegistration { names: &["TOLERANCE"] });  // ToleranceCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["TOLERANCE"]
+}); // ToleranceCommand

@@ -2,23 +2,52 @@
 //
 // ARRAYRECT (AR):
 //   Rectangular array: row/column counts and spacing collected via text input.
+//   The defaults are a grid of 3 rows x 4 columns spaced 1.5 x the selection's
+//   height and width, so no copy overlaps the source.
 //   1. Row count → 2. Column count → 3. Row spacing → 4. Column spacing
 //   → Returns BatchCopy with a grid of Translate transforms.
 //
 // ARRAYPATH:
-//   Path array: copies placed at equal intervals along a curve/line.
-//   (pending geometry engine support — stub)
+//   Path array: copies placed along a curve/line, aligned to it. Measure
+//   (the default) takes the distance between items, then how many of those
+//   fit; Divide takes a count and spreads it over the whole path.
 //
 // ARRAYPOLAR:
 //   Polar array: copies rotated around a center point by a total angle.
 //   1. Center point → 2. Item count (text) → 3. Total angle in degrees (text)
 
-use codec::Handle;
-use glam::DVec3;
 use crate::t;
+use document::Handle;
+use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult, EntityTransform, WorkingPlane};
 use crate::modules::draw::defaults;
+
+/// The Associative option button, labelled with its current state.
+fn associative_option(on: bool) -> crate::command::CmdOption {
+    crate::command::CmdOption {
+        label: format!(
+            "{}: {}",
+            crate::t!("Associative"),
+            crate::t!(if on { "Yes" } else { "No" })
+        ),
+        keyword: "AS".to_string(),
+    }
+}
+
+/// Typed `AS` / `ASSOCIATIVE` flips the Associative option.
+fn is_associative_keyword(text: &str) -> bool {
+    matches!(
+        text.trim().to_ascii_uppercase().as_str(),
+        "AS" | "ASSOCIATIVE" | "_AS"
+    )
+}
+
+/// Associative arrays are built in world axes; a rotated working plane
+/// falls back to plain copies.
+fn world_plane(plane: WorkingPlane) -> bool {
+    plane.x.abs_diff_eq(DVec3::X, 1e-12) && plane.z.abs_diff_eq(DVec3::Z, 1e-12)
+}
 use crate::modules::IconKind;
 use crate::scene::model::wire_model::WireModel;
 
@@ -68,6 +97,65 @@ pub(crate) fn array_limit_error() -> CmdResult {
 
 // ── Rectangular Array ──────────────────────────────────────────────────────
 
+/// Spacing offered when the selection has no extent to measure (a point).
+const FALLBACK_SPACING: f64 = 100.0;
+
+/// Default spacing is this multiple of the selection's size, which leaves a
+/// gap of half a width (height) between neighbouring copies.
+const SPACING_FACTOR: f64 = 1.5;
+
+/// Default (row spacing, column spacing) for a selection `width` x `height`
+/// in the working plane. A flat selection (a horizontal or vertical line)
+/// borrows the spacing of its other side; a point gets [`FALLBACK_SPACING`].
+pub(crate) fn default_rect_spacing(width: f64, height: f64) -> (f64, f64) {
+    let usable = |v: f64| v.is_finite() && v > 1e-9;
+    let col = usable(width).then(|| width * SPACING_FACTOR);
+    let row = usable(height).then(|| height * SPACING_FACTOR);
+    match (row, col) {
+        (Some(r), Some(c)) => (r, c),
+        (Some(r), None) => (r, r),
+        (None, Some(c)) => (c, c),
+        (None, None) => (FALLBACK_SPACING, FALLBACK_SPACING),
+    }
+}
+
+/// Width and height of the wires in the working plane's axes.
+fn selection_size(wires: &[WireModel], plane: WorkingPlane) -> (f64, f64) {
+    let (mut min, mut max) = (
+        glam::DVec2::splat(f64::INFINITY),
+        glam::DVec2::splat(f64::NEG_INFINITY),
+    );
+    let mut take = |p: DVec3| {
+        if p.x.is_finite() && p.y.is_finite() && p.z.is_finite() {
+            let l = plane.to_local(p);
+            min = min.min(glam::DVec2::new(l.x, l.y));
+            max = max.max(glam::DVec2::new(l.x, l.y));
+        }
+    };
+    for w in wires {
+        if w.points.is_empty() {
+            let [x0, y0, x1, y1] = w.aabb;
+            for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+                take(DVec3::new(x as f64, y as f64, 0.0));
+            }
+            continue;
+        }
+        for (i, p) in w.points.iter().enumerate() {
+            let low = w.points_low.get(i).copied().unwrap_or([0.0; 3]);
+            take(DVec3::new(
+                p[0] as f64 + low[0] as f64,
+                p[1] as f64 + low[1] as f64,
+                p[2] as f64 + low[2] as f64,
+            ));
+        }
+    }
+    if min.x > max.x || min.y > max.y {
+        (0.0, 0.0)
+    } else {
+        (max.x - min.x, max.y - min.y)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum RectStep {
     Rows,
@@ -84,20 +172,29 @@ pub struct ArrayRectCommand {
     default_cols: u32,
     default_row_sp: f64,
     default_col_sp: f64,
+    associative: bool,
     plane: WorkingPlane,
+    base_point: Option<DVec3>,
+    awaiting_base: bool,
 }
 
 impl ArrayRectCommand {
     pub fn new(handles: Vec<Handle>, wire_models: Vec<WireModel>) -> Self {
+        let plane = WorkingPlane::default();
+        let (size_w, size_h) = selection_size(&wire_models, plane);
+        let (default_row_sp, default_col_sp) = default_rect_spacing(size_w, size_h);
         Self {
             handles,
             wire_models,
             step: RectStep::Rows,
             default_rows: (defaults::get_array_rows() as u32).clamp(1, MAX_ARRAY_ITEMS as u32),
             default_cols: (defaults::get_array_cols() as u32).clamp(1, MAX_ARRAY_ITEMS as u32),
-            default_row_sp: defaults::get_array_row_sp(),
-            default_col_sp: defaults::get_array_col_sp(),
-            plane: WorkingPlane::default(),
+            default_row_sp,
+            default_col_sp,
+            associative: defaults::get_array_assoc() != 0.0,
+            plane,
+            base_point: None,
+            awaiting_base: false,
         }
     }
 
@@ -115,11 +212,9 @@ impl ArrayRectCommand {
                 if r == 0 && c == 0 {
                     continue;
                 }
-                t.push(EntityTransform::Translate(plane.vector_to_world(DVec3::new(
-                    col_sp * c as f64,
-                    row_sp * r as f64,
-                    0.0,
-                ))));
+                t.push(EntityTransform::Translate(plane.vector_to_world(
+                    DVec3::new(col_sp * c as f64, row_sp * r as f64, 0.0),
+                )));
             }
         }
         t
@@ -131,8 +226,17 @@ impl CadCommand for ArrayRectCommand {
         "ARRAYRECT"
     }
 
+    fn options(&self) -> Vec<crate::command::CmdOption> {
+        vec![
+            associative_option(self.associative),
+            crate::command::CmdOption::new("Basepoint", "B"),
+        ]
+    }
+
     fn set_working_plane(&mut self, plane: WorkingPlane) {
         self.plane = plane;
+        let (w, h) = selection_size(&self.wire_models, plane);
+        (self.default_row_sp, self.default_col_sp) = default_rect_spacing(w, h);
     }
 
     fn prompt(&self) -> String {
@@ -167,6 +271,32 @@ impl CadCommand for ArrayRectCommand {
     }
 
     fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
+        if is_associative_keyword(text) {
+            self.associative = !self.associative;
+            defaults::set_array_assoc(f64::from(u8::from(self.associative)));
+            return None;
+        }
+        if self.awaiting_base {
+            self.awaiting_base = false;
+            let mut parts = text.split(',');
+            let parsed = (|| {
+                let x = parts.next()?.trim().parse().ok()?;
+                let y = parts.next()?.trim().parse().ok()?;
+                let z = parts.next().and_then(|z| z.trim().parse().ok()).unwrap_or(0.0);
+                Some(DVec3::new(x, y, z))
+            })();
+            return Some(match parsed {
+                Some(pt) => {
+                    self.base_point = Some(pt);
+                    CmdResult::NeedPoint
+                }
+                None => CmdResult::ReportError("Enter a base point as x,y[,z].".to_string()),
+            });
+        }
+        if matches!(text.trim().to_ascii_uppercase().as_str(), "B" | "BASEPOINT" | "BP") {
+            self.awaiting_base = true;
+            return Some(CmdResult::NeedPoint);
+        }
         let t = text.trim().replace(',', ".");
         let t = t.as_str();
         match self.step {
@@ -205,11 +335,7 @@ impl CadCommand for ArrayRectCommand {
                 let row_sp = if t.is_empty() {
                     self.default_row_sp
                 } else {
-                    let v = crate::entities::common::parse_typed_length(t)
-                        .unwrap_or(self.default_row_sp);
-                    defaults::set_array_row_sp(v);
-                    self.default_row_sp = v;
-                    v
+                    crate::entities::common::parse_typed_length(t).unwrap_or(self.default_row_sp)
                 };
                 self.step = RectStep::ColSp { rows, cols, row_sp };
                 None
@@ -218,11 +344,20 @@ impl CadCommand for ArrayRectCommand {
                 let col_sp = if t.is_empty() {
                     self.default_col_sp
                 } else {
-                    let v = crate::entities::common::parse_typed_length(t)
-                        .unwrap_or(self.default_col_sp);
-                    defaults::set_array_col_sp(v);
-                    v
+                    crate::entities::common::parse_typed_length(t).unwrap_or(self.default_col_sp)
                 };
+                if self.associative && world_plane(self.plane) {
+                    return Some(CmdResult::AssocArray {
+                        handles: self.handles.clone(),
+                        base_point: self.base_point,
+                        spec: crate::scene::assoc_array::AssocArraySpec::Rectangular {
+                            columns: cols,
+                            rows,
+                            column_spacing: col_sp,
+                            row_spacing: row_sp,
+                        },
+                    });
+                }
                 Some(CmdResult::BatchCopy(
                     self.handles.clone(),
                     Self::build_transforms(rows, cols, row_sp, col_sp, self.plane),
@@ -269,7 +404,11 @@ impl CadCommand for ArrayRectCommand {
             .collect()
     }
 
-    fn on_point(&mut self, _pt: DVec3) -> CmdResult {
+    fn on_point(&mut self, pt: DVec3) -> CmdResult {
+        if self.awaiting_base {
+            self.base_point = Some(pt);
+            self.awaiting_base = false;
+        }
         CmdResult::NeedPoint
     }
 
@@ -297,6 +436,7 @@ pub struct ArrayPolarCommand {
     step: PolarStep,
     default_count: u32,
     default_angle: f64,
+    associative: bool,
     plane: WorkingPlane,
 }
 
@@ -308,6 +448,7 @@ impl ArrayPolarCommand {
             step: PolarStep::Center,
             default_count: (defaults::get_array_p_count() as u32).clamp(2, MAX_ARRAY_ITEMS as u32),
             default_angle: defaults::get_array_p_angle(),
+            associative: defaults::get_array_assoc() != 0.0,
             plane: WorkingPlane::default(),
         }
     }
@@ -320,6 +461,10 @@ impl CadCommand for ArrayPolarCommand {
 
     fn name(&self) -> &'static str {
         "ARRAYPOLAR"
+    }
+
+    fn options(&self) -> Vec<crate::command::CmdOption> {
+        vec![associative_option(self.associative)]
     }
 
     fn prompt(&self) -> String {
@@ -353,6 +498,11 @@ impl CadCommand for ArrayPolarCommand {
     }
 
     fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
+        if is_associative_keyword(text) {
+            self.associative = !self.associative;
+            defaults::set_array_assoc(f64::from(u8::from(self.associative)));
+            return None;
+        }
         let t = text.trim().replace(',', ".");
         let t = t.as_str();
         match &self.step {
@@ -385,6 +535,17 @@ impl CadCommand for ArrayPolarCommand {
                     defaults::set_array_p_angle(v);
                     v
                 };
+                if self.associative && world_plane(self.plane) {
+                    return Some(CmdResult::AssocArray {
+                        handles: self.handles.clone(),
+                        base_point: None,
+                        spec: crate::scene::assoc_array::AssocArraySpec::Polar {
+                            center,
+                            items: count,
+                            fill_angle: total_deg.to_radians(),
+                        },
+                    });
+                }
                 let step_rad = total_deg.to_radians() / count as f64;
                 let transforms = (1..count)
                     .map(|n| EntityTransform::Rotate {
@@ -406,9 +567,7 @@ impl CadCommand for ArrayPolarCommand {
             PolarStep::Count { center } => {
                 (center.as_vec3(), self.default_count, self.default_angle)
             }
-            PolarStep::Angle { center, count } => {
-                (center.as_vec3(), *count, self.default_angle)
-            }
+            PolarStep::Angle { center, count } => (center.as_vec3(), *count, self.default_angle),
         };
         let step_rad = total_deg.to_radians() / count as f64;
         let axis = self.plane.z.as_vec3();
@@ -456,20 +615,31 @@ impl CadCommand for ArrayPolarCommand {
 //   2. Enter item count (total, including the original at the path start)
 //   → Returns BatchCopy with Translate transforms derived from path samples.
 
-use codec::EntityType;
 use crate::entities::curve::entity_curve;
+use document::EntityType;
 use std::f64::consts::PI as FPI;
 use std::f64::consts::TAU as FTAU;
 
 // ── Path geometry helpers ──────────────────────────────────────────────────
 
-
-
 // ── State machine ──────────────────────────────────────────────────────────
 
 enum PathStep {
     SelectPath,
-    Count { path_entity: EntityType },
+    /// Divide: the item count, spread over the whole path.
+    Count {
+        path_entity: EntityType,
+    },
+    /// Measure: the distance between items.
+    Spacing {
+        path_entity: EntityType,
+    },
+    /// Measure: how many items, at most as many as the path holds.
+    MeasuredCount {
+        path_entity: EntityType,
+        spacing: f64,
+        maximum: u32,
+    },
 }
 
 pub struct ArrayPathCommand {
@@ -483,6 +653,24 @@ pub struct ArrayPathCommand {
     /// travel direction (a stored arc is always CCW regardless of how it was
     /// drawn, so without this the array could run opposite to expectation).
     pick_pt: DVec3,
+    /// Measure (items a fixed distance apart) rather than Divide.
+    measure: bool,
+    default_spacing: f64,
+    associative: bool,
+    plane: WorkingPlane,
+}
+
+/// The Method option button, labelled with the current method.
+fn method_option(measure: bool) -> crate::command::CmdOption {
+    crate::command::CmdOption {
+        label: crate::t!(if measure {
+            "Method: Measure"
+        } else {
+            "Method: Divide"
+        })
+        .into_owned(),
+        keyword: "M".to_string(),
+    }
 }
 
 impl ArrayPathCommand {
@@ -496,8 +684,145 @@ impl ArrayPathCommand {
             wire_models,
             all_entities,
             step: PathStep::SelectPath,
-            default_count: (defaults::get_array_path_count() as u32).clamp(2, MAX_ARRAY_ITEMS as u32),
+            default_count: (defaults::get_array_path_count() as u32)
+                .clamp(2, MAX_ARRAY_ITEMS as u32),
             pick_pt: DVec3::ZERO,
+            measure: defaults::get_array_path_measure() != 0.0,
+            default_spacing: defaults::get_array_path_spacing(),
+            associative: defaults::get_array_assoc() != 0.0,
+            plane: WorkingPlane::default(),
+        }
+    }
+
+    /// Whether the pick chose the path's far end as the start.
+    fn picked_end(&self, entity: &EntityType) -> bool {
+        let Some(curve) = entity_curve(entity) else {
+            return false;
+        };
+        let start = DVec3::from_array(curve.point_at_distance(0.0));
+        let end = DVec3::from_array(curve.point_at_distance(curve.length()));
+        self.pick_pt.distance_squared(end) < self.pick_pt.distance_squared(start)
+    }
+
+    /// The array as an associative path array, when that is on and the
+    /// working plane is the world's.
+    fn associative_result(
+        &self,
+        path_entity: &EntityType,
+        items: u32,
+        spacing: f64,
+    ) -> Option<CmdResult> {
+        (self.associative && world_plane(self.plane)).then(|| CmdResult::AssocArray {
+            handles: self.handles.clone(),
+            base_point: None,
+            spec: crate::scene::assoc_array::AssocArraySpec::Path {
+                path: path_entity.common().handle,
+                items,
+                spacing,
+                divide: !self.measure,
+                reversed: self.picked_end(path_entity),
+            },
+        })
+    }
+
+    /// The step after the path is known, by the current method.
+    fn first_step(&self, path_entity: EntityType) -> PathStep {
+        if self.measure {
+            PathStep::Spacing { path_entity }
+        } else {
+            PathStep::Count { path_entity }
+        }
+    }
+
+    /// The spacing offered at the Measure prompt: the last one used, else
+    /// one and a half times the selection's width, else a fifth of the path.
+    fn offered_spacing(&self, path_entity: &EntityType) -> f64 {
+        if self.default_spacing > 0.0 {
+            return self.default_spacing;
+        }
+        let xs = self
+            .wire_models
+            .iter()
+            .flat_map(|w| w.points.iter())
+            .map(|p| p[0])
+            .filter(|x| x.is_finite());
+        let (lo, hi) = xs.fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), x| {
+            (lo.min(x), hi.max(x))
+        });
+        let width = f64::from(hi - lo);
+        if width.is_finite() && width > 1e-9 {
+            return width * 1.5;
+        }
+        entity_curve(path_entity).map_or(1.0, |curve| curve.length() / 5.0)
+    }
+
+    /// Items `spacing` apart that fit on the path, counting the first.
+    fn measured_maximum(path_entity: &EntityType, spacing: f64) -> u32 {
+        let Some(curve) = entity_curve(path_entity) else {
+            return 1;
+        };
+        let length = curve.length();
+        if !(spacing > 0.0) || !length.is_finite() {
+            return 1;
+        }
+        let along = (length / spacing + 1e-9).floor();
+        // A closed path ends where it starts: the last place is the first.
+        let items = if curve.is_closed() {
+            along
+        } else {
+            along + 1.0
+        };
+        items.clamp(1.0, MAX_ARRAY_ITEMS as f64) as u32
+    }
+
+    /// `count` points `spacing` apart from the path's start.
+    fn spaced_samples(&self, entity: &EntityType, spacing: f64, count: usize) -> Vec<DVec3> {
+        let Some(curve) = entity_curve(entity) else {
+            return vec![];
+        };
+        let length = curve.length();
+        // Walk from the end nearest the pick, as Divide does.
+        let start_point = curve.point_at_distance(0.0);
+        let end_point = curve.point_at_distance(length);
+        let from_end = self.pick_pt.distance_squared(DVec3::from_array(end_point))
+            < self
+                .pick_pt
+                .distance_squared(DVec3::from_array(start_point));
+        (0..count)
+            .map(|i| {
+                let along = (spacing * i as f64).min(length);
+                let p = curve.point_at_distance(if from_end { length - along } else { along });
+                DVec3::new(p[0], p[1], p[2])
+            })
+            .collect()
+    }
+
+    /// The copies at `pts`, or `Cancel` when there are none.
+    fn result(&self, pts: &[DVec3]) -> CmdResult {
+        let transforms = Self::build_transforms(pts);
+        if transforms.is_empty() {
+            return CmdResult::Cancel;
+        }
+        CmdResult::BatchCopy(self.handles.clone(), transforms)
+    }
+
+    /// The preview points of the current step.
+    fn preview_samples(&self) -> Vec<DVec3> {
+        match &self.step {
+            PathStep::SelectPath => vec![],
+            PathStep::Count { path_entity } => {
+                self.oriented_samples(path_entity, self.default_count as usize)
+            }
+            PathStep::Spacing { path_entity } => {
+                let spacing = self.offered_spacing(path_entity);
+                let count = Self::measured_maximum(path_entity, spacing);
+                self.spaced_samples(path_entity, spacing, count as usize)
+            }
+            PathStep::MeasuredCount {
+                path_entity,
+                spacing,
+                maximum,
+            } => self.spaced_samples(path_entity, *spacing, *maximum as usize),
         }
     }
 
@@ -648,7 +973,34 @@ impl CadCommand for ArrayPathCommand {
             PathStep::Count { .. } => {
                 crate::tf!("ARRAYPATH  Enter item count <{}>:", self.default_count).into_owned()
             }
+            PathStep::Spacing { path_entity } => crate::tf!(
+                "ARRAYPATH  Enter distance between items along path <{}>:",
+                crate::entities::common::format_length(self.offered_spacing(path_entity))
+            )
+            .into_owned(),
+            PathStep::MeasuredCount { maximum, .. } => crate::tf!(
+                "ARRAYPATH  Enter number of items <{}>  [maximum {}]:",
+                maximum,
+                maximum
+            )
+            .into_owned(),
         }
+    }
+
+    fn options(&self) -> Vec<crate::command::CmdOption> {
+        match self.step {
+            PathStep::Count { .. } | PathStep::Spacing { .. } => {
+                vec![
+                    method_option(self.measure),
+                    associative_option(self.associative),
+                ]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn set_working_plane(&mut self, plane: WorkingPlane) {
+        self.plane = plane;
     }
 
     fn needs_entity_pick(&self) -> bool {
@@ -656,14 +1008,14 @@ impl CadCommand for ArrayPathCommand {
     }
 
     fn wants_text_input(&self) -> bool {
-        matches!(self.step, PathStep::Count { .. })
+        !matches!(self.step, PathStep::SelectPath)
     }
 
     fn dyn_field(&self) -> crate::command::DynField {
-        if matches!(self.step, PathStep::Count { .. }) {
-            crate::command::DynField::Scalar
-        } else {
+        if matches!(self.step, PathStep::SelectPath) {
             crate::command::DynField::Point
+        } else {
+            crate::command::DynField::Scalar
         }
     }
 
@@ -678,9 +1030,7 @@ impl CadCommand for ArrayPathCommand {
             .cloned()
         {
             self.pick_pt = pt;
-            self.step = PathStep::Count {
-                path_entity: entity,
-            };
+            self.step = self.first_step(entity);
         }
         CmdResult::NeedPoint
     }
@@ -713,10 +1063,79 @@ impl CadCommand for ArrayPathCommand {
     }
 
     fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
+        if is_associative_keyword(text) && !matches!(self.step, PathStep::SelectPath) {
+            self.associative = !self.associative;
+            defaults::set_array_assoc(f64::from(u8::from(self.associative)));
+            return None;
+        }
+        // M switches the method; DIVIDE / MEASURE name it, for scripts that
+        // cannot know which one was used last.
+        let method = match text.trim().to_ascii_uppercase().as_str() {
+            "M" | "METHOD" | "_M" => Some(!self.measure),
+            "DIVIDE" | "_DIVIDE" => Some(false),
+            "MEASURE" | "_MEASURE" => Some(true),
+            _ => None,
+        };
+        if let Some(measure) = method
+            .filter(|_| matches!(self.step, PathStep::Count { .. } | PathStep::Spacing { .. }))
+        {
+            self.measure = measure;
+            defaults::set_array_path_measure(f64::from(u8::from(self.measure)));
+            let path_entity = match std::mem::replace(&mut self.step, PathStep::SelectPath) {
+                PathStep::Count { path_entity } | PathStep::Spacing { path_entity } => path_entity,
+                other => {
+                    self.step = other;
+                    return None;
+                }
+            };
+            self.step = self.first_step(path_entity);
+            return None;
+        }
+        let t = text.trim().replace(',', ".");
+        match &self.step {
+            PathStep::Spacing { path_entity } => {
+                let spacing = if t.is_empty() {
+                    self.offered_spacing(path_entity)
+                } else {
+                    match crate::entities::common::parse_typed_length(&t) {
+                        Some(v) if v.is_finite() && v > 0.0 => v,
+                        _ => return None,
+                    }
+                };
+                self.default_spacing = spacing;
+                defaults::set_array_path_spacing(spacing);
+                let maximum = Self::measured_maximum(path_entity, spacing);
+                self.step = PathStep::MeasuredCount {
+                    path_entity: path_entity.clone(),
+                    spacing,
+                    maximum,
+                };
+                return None;
+            }
+            PathStep::MeasuredCount {
+                path_entity,
+                spacing,
+                maximum,
+            } => {
+                let count = if t.is_empty() {
+                    *maximum
+                } else {
+                    match t.parse::<u32>() {
+                        Ok(v) if v >= 1 => v.min(*maximum),
+                        _ => return None,
+                    }
+                };
+                if let Some(result) = self.associative_result(path_entity, count, *spacing) {
+                    return Some(result);
+                }
+                let pts = self.spaced_samples(path_entity, *spacing, count as usize);
+                return Some(self.result(&pts));
+            }
+            _ => {}
+        }
         let PathStep::Count { path_entity } = &self.step else {
             return None;
         };
-        let t = text.trim().replace(',', ".");
         let count = if t.is_empty() {
             self.default_count
         } else {
@@ -728,19 +1147,15 @@ impl CadCommand for ArrayPathCommand {
             self.default_count = v;
             v
         };
-        let pts = self.oriented_samples(path_entity, count as usize);
-        let transforms = Self::build_transforms(&pts);
-        if transforms.is_empty() {
-            return Some(CmdResult::Cancel);
+        if let Some(result) = self.associative_result(path_entity, count, 0.0) {
+            return Some(result);
         }
-        Some(CmdResult::BatchCopy(self.handles.clone(), transforms))
+        let pts = self.oriented_samples(path_entity, count as usize);
+        Some(self.result(&pts))
     }
 
     fn on_preview_wires(&mut self, _pt: DVec3) -> Vec<WireModel> {
-        let PathStep::Count { path_entity } = &self.step else {
-            return vec![];
-        };
-        let pts = self.oriented_samples(path_entity, self.default_count as usize);
+        let pts = self.preview_samples();
         let transforms = Self::build_transforms(&pts);
         transforms
             .iter()
@@ -750,7 +1165,9 @@ impl CadCommand for ArrayPathCommand {
                     .iter()
                     .map(|w| w.translated(delta.as_vec3()))
                     .collect::<Vec<_>>(),
-                EntityTransform::Rotate { center, angle_rad, .. } => self
+                EntityTransform::Rotate {
+                    center, angle_rad, ..
+                } => self
                     .wire_models
                     .iter()
                     .map(|w| w.rotated(center.as_vec3(), *angle_rad as f32))
@@ -1033,7 +1450,9 @@ impl CadCommand for Array3DCommand {
 }
 
 // ── Autocomplete registry ─────────────────────────────────
-inventory::submit!(crate::command::CommandRegistration { names: &["ARRAY3D", "3DARRAY"] });
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ARRAY3D", "3DARRAY"]
+});
 
 #[cfg(test)]
 mod item_limit_tests {
@@ -1044,23 +1463,127 @@ mod item_limit_tests {
         assert!(array_items_within_limit(&[MAX_ARRAY_ITEMS]));
         assert!(!array_items_within_limit(&[MAX_ARRAY_ITEMS + 1]));
         assert!(!array_items_within_limit(&[1_000, 1_000]));
-        assert!(!array_items_within_limit(&[u32::MAX as u64, u32::MAX as u64, u32::MAX as u64]));
+        assert!(!array_items_within_limit(&[
+            u32::MAX as u64,
+            u32::MAX as u64,
+            u32::MAX as u64
+        ]));
     }
 
     #[test]
     fn oversized_counts_are_rejected_at_the_prompt() {
         let mut rect = ArrayRectCommand::new(vec![Handle::new(1)], Vec::new());
         assert!(rect.on_text_input("100000").is_none());
-        assert!(matches!(rect.on_text_input("100000"), Some(CmdResult::ReportError(_))));
+        assert!(matches!(
+            rect.on_text_input("100000"),
+            Some(CmdResult::ReportError(_))
+        ));
         assert!(matches!(rect.step, RectStep::Cols { rows: 100_000 }));
 
         let mut polar = ArrayPolarCommand::new(vec![Handle::new(1)], Vec::new());
-        polar.step = PolarStep::Count { center: DVec3::ZERO };
-        assert!(matches!(polar.on_text_input("4294967295"), Some(CmdResult::ReportError(_))));
+        polar.step = PolarStep::Count {
+            center: DVec3::ZERO,
+        };
+        assert!(matches!(
+            polar.on_text_input("4294967295"),
+            Some(CmdResult::ReportError(_))
+        ));
 
         let mut cube = Array3DCommand::new(vec![Handle::new(1)]);
-        assert!(matches!(cube.on_text_input("300"), Some(CmdResult::NeedPoint)));
-        assert!(matches!(cube.on_text_input("300"), Some(CmdResult::NeedPoint)));
-        assert!(matches!(cube.on_text_input("2"), Some(CmdResult::ReportError(_))));
+        assert!(matches!(
+            cube.on_text_input("300"),
+            Some(CmdResult::NeedPoint)
+        ));
+        assert!(matches!(
+            cube.on_text_input("300"),
+            Some(CmdResult::NeedPoint)
+        ));
+        assert!(matches!(
+            cube.on_text_input("2"),
+            Some(CmdResult::ReportError(_))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod default_grid_tests {
+    use super::*;
+    use crate::scene::assoc_array::AssocArraySpec;
+
+    fn wire(points: &[[f32; 3]]) -> WireModel {
+        WireModel::solid("1".to_string(), points.to_vec(), WireModel::WHITE, false)
+    }
+
+    /// Start the command and accept every default with Enter.
+    fn accept_defaults(wires: Vec<WireModel>) -> (u32, u32, f64, f64) {
+        defaults::set_array_assoc(1.0);
+        let mut cmd = ArrayRectCommand::new(vec![Handle::new(1)], wires);
+        for _ in 0..3 {
+            assert!(cmd.on_text_input("").is_none());
+        }
+        match cmd.on_enter() {
+            CmdResult::AssocArray {
+                spec:
+                    AssocArraySpec::Rectangular {
+                        columns,
+                        rows,
+                        column_spacing,
+                        row_spacing,
+                    },
+                ..
+            } => (columns, rows, column_spacing, row_spacing),
+            _ => panic!("accepting every default builds the array"),
+        }
+    }
+
+    #[test]
+    fn default_grid_is_four_columns_by_three_rows_spaced_from_the_selection() {
+        // 30 wide, 10 high, away from the origin.
+        let rect = wire(&[
+            [5.0, 7.0, 0.0],
+            [35.0, 7.0, 0.0],
+            [35.0, 17.0, 0.0],
+            [5.0, 17.0, 0.0],
+            [5.0, 7.0, 0.0],
+        ]);
+        let (columns, rows, column_spacing, row_spacing) = accept_defaults(vec![rect]);
+        assert_eq!((columns, rows), (4, 3));
+        assert!((column_spacing - 45.0).abs() < 1e-4, "column {column_spacing}");
+        assert!((row_spacing - 15.0).abs() < 1e-4, "row {row_spacing}");
+        // Neighbouring copies do not overlap the source.
+        assert!(column_spacing >= 30.0 && row_spacing >= 10.0);
+    }
+
+    #[test]
+    fn default_grid_of_a_flat_selection_uses_its_length_both_ways() {
+        let line = wire(&[[0.0, 4.0, 0.0], [30.0, 4.0, 0.0]]);
+        let (_, _, column_spacing, row_spacing) = accept_defaults(vec![line]);
+        assert!((column_spacing - 45.0).abs() < 1e-4, "column {column_spacing}");
+        assert!((row_spacing - 45.0).abs() < 1e-4, "row {row_spacing}");
+    }
+
+    #[test]
+    fn default_grid_of_a_point_keeps_a_non_zero_spacing() {
+        let point = wire(&[[3.0, 3.0, 0.0]]);
+        let (_, _, column_spacing, row_spacing) = accept_defaults(vec![point]);
+        assert!(column_spacing > 0.0 && row_spacing > 0.0);
+        let (_, _, column_spacing, row_spacing) = accept_defaults(Vec::new());
+        assert!(column_spacing > 0.0 && row_spacing > 0.0);
+    }
+
+    #[test]
+    fn default_grid_follows_a_rotated_working_plane() {
+        // 30 along world X is the plane's height when the plane is turned 90 degrees.
+        let line = wire(&[[0.0, 0.0, 0.0], [30.0, 0.0, 0.0], [30.0, 10.0, 0.0]]);
+        let mut cmd = ArrayRectCommand::new(vec![Handle::new(1)], vec![line]);
+        let plane = WorkingPlane {
+            x: DVec3::Y,
+            y: DVec3::NEG_X,
+            z: DVec3::Z,
+            ..WorkingPlane::default()
+        };
+        cmd.set_working_plane(plane);
+        assert!((cmd.default_col_sp - 15.0).abs() < 1e-4, "{}", cmd.default_col_sp);
+        assert!((cmd.default_row_sp - 45.0).abs() < 1e-4, "{}", cmd.default_row_sp);
     }
 }

@@ -7,9 +7,7 @@ use iced::{Background, Border, Element, Fill, Theme};
 use std::borrow::Cow;
 
 /// Active tab in the Drafting Settings dialog.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DraftingSettingsTab {
     #[default]
@@ -20,6 +18,18 @@ pub enum DraftingSettingsTab {
     DynamicInput,
     QuickProperties,
     SelectionCycling,
+}
+
+/// Dynamic Input options: the pointer and dimension input switches
+/// (DYNMODE bits 1 and 2), the pointer format for second points
+/// (DYNPIFORMAT, DYNPICOORDS) and when pointer tooltips show (DYNPIVIS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DynInputPrefs {
+    pub pointer: bool,
+    pub dimension: bool,
+    pub cartesian: bool,
+    pub absolute: bool,
+    pub on_type: bool,
 }
 
 /// Working buffer of drafting settings edited in the dialog.
@@ -37,6 +47,7 @@ pub struct DraftingSettingsState {
     pub grid_major_input: String,
     pub grid_adaptive: bool,
     pub grid_beyond_limits: bool,
+    pub grid_axes: bool,
     pub isometric: bool,
     pub iso_plane: IsoPlane,
     pub snap_angle_deg: f32,
@@ -46,6 +57,7 @@ pub struct DraftingSettingsState {
     pub polar_increment_deg: f32,
     // Object Snap
     pub osnap_on: bool,
+    pub osnap_aperture_input: String,
     pub otrack_on: bool,
     pub snap_modes: rustc_hash::FxHashSet<SnapType>,
     // 3D Object Snap
@@ -53,8 +65,11 @@ pub struct DraftingSettingsState {
     pub snap3d_modes: rustc_hash::FxHashSet<SnapType>,
     // Dynamic Input
     pub dyn_input_on: bool,
+    pub dyn_prefs: DynInputPrefs,
     // Quick Properties
     pub quick_props_on: bool,
+    /// Palette location: floating rather than by the cursor (QPLOCATION).
+    pub quick_props_float: bool,
     // Selection Cycling
     pub selection_cycling_on: bool,
 }
@@ -73,6 +88,7 @@ impl DraftingSettingsState {
             || self.grid_major_input != saved.grid_major_input
             || self.grid_adaptive != saved.grid_adaptive
             || self.grid_beyond_limits != saved.grid_beyond_limits
+            || self.grid_axes != saved.grid_axes
             || self.isometric != saved.isometric
             || self.iso_plane != saved.iso_plane
             || (self.snap_angle_deg - saved.snap_angle_deg).abs() > 0.001
@@ -80,12 +96,15 @@ impl DraftingSettingsState {
             || self.ortho_on != saved.ortho_on
             || (self.polar_increment_deg - saved.polar_increment_deg).abs() > 0.001
             || self.osnap_on != saved.osnap_on
+            || self.osnap_aperture_input != saved.osnap_aperture_input
             || self.otrack_on != saved.otrack_on
             || self.snap_modes != saved.snap_modes
             || self.osnap3d_on != saved.osnap3d_on
             || self.snap3d_modes != saved.snap3d_modes
             || self.dyn_input_on != saved.dyn_input_on
+            || self.dyn_prefs != saved.dyn_prefs
             || self.quick_props_on != saved.quick_props_on
+            || self.quick_props_float != saved.quick_props_float
             || self.selection_cycling_on != saved.selection_cycling_on
     }
 }
@@ -116,12 +135,17 @@ pub fn parse_grid_major(s: &str) -> Option<u32> {
 }
 
 /// Helper for grouped sub-panels with a light border and header title.
-fn group<'a>(title: impl Into<String>, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+fn group<'a>(
+    title: impl Into<String>,
+    body: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
     container(
         column![
-            text(title.into()).size(11).style(|theme: &Theme| text::Style {
-                color: Some(theme.palette().background.strongest.text.scale_alpha(0.75)),
-            }),
+            text(title.into())
+                .size(11)
+                .style(|theme: &Theme| text::Style {
+                    color: Some(crate::ui::style::readable::muted_text(theme)),
+                }),
             body.into(),
         ]
         .spacing(6),
@@ -167,10 +191,9 @@ pub fn view_window<'a>(
                 let palette = theme.palette();
                 let pair = match (is_active, status) {
                     (true, _) => palette.primary.strong,
-                    (
-                        false,
-                        button::Status::Hovered | button::Status::Pressed,
-                    ) => palette.background.strong,
+                    (false, button::Status::Hovered | button::Status::Pressed) => {
+                        palette.background.strong
+                    }
                     _ => palette.background.weak,
                 };
                 button::Style {
@@ -194,12 +217,27 @@ pub fn view_window<'a>(
 
     let tab_row = row![
         tab_button(DraftingSettingsTab::SnapAndGrid, crate::t!("Snap and Grid")),
-        tab_button(DraftingSettingsTab::PolarTracking, crate::t!("Polar Tracking")),
+        tab_button(
+            DraftingSettingsTab::PolarTracking,
+            crate::t!("Polar Tracking")
+        ),
         tab_button(DraftingSettingsTab::ObjectSnap, crate::t!("Object Snap")),
-        tab_button(DraftingSettingsTab::ObjectSnap3D, crate::t!("3D Object Snap")),
-        tab_button(DraftingSettingsTab::DynamicInput, crate::t!("Dynamic Input")),
-        tab_button(DraftingSettingsTab::QuickProperties, crate::t!("Quick Properties")),
-        tab_button(DraftingSettingsTab::SelectionCycling, crate::t!("Selection Cycling")),
+        tab_button(
+            DraftingSettingsTab::ObjectSnap3D,
+            crate::t!("3D Object Snap")
+        ),
+        tab_button(
+            DraftingSettingsTab::DynamicInput,
+            crate::t!("Dynamic Input")
+        ),
+        tab_button(
+            DraftingSettingsTab::QuickProperties,
+            crate::t!("Quick Properties")
+        ),
+        tab_button(
+            DraftingSettingsTab::SelectionCycling,
+            crate::t!("Selection Cycling")
+        ),
     ]
     .spacing(2)
     .width(Fill)
@@ -209,9 +247,7 @@ pub fn view_window<'a>(
         .width(Fill)
         .height(1)
         .style(|theme: &Theme| container::Style {
-            background: Some(Background::Color(
-                theme.palette().background.neutral.color,
-            )),
+            background: Some(Background::Color(theme.palette().background.neutral.color)),
             ..Default::default()
         });
 
@@ -284,10 +320,15 @@ pub fn view_window<'a>(
                     Message::DraftingSettingsToggleIsometric,
                 ),
                 iso_planes,
-                text(crate::t!("F5 cycles Left, Top, and Right.")).size(10.5),
+                text(crate::t!("F5 cycles Left, Top, and Right."))
+                    .size(crate::ui::style::text::UI_SMALL),
                 Space::new().height(4),
                 row![
-                    text(crate::t!("Rotation: %{angle}°", angle = state.snap_angle_deg)).size(11),
+                    text(crate::t!(
+                        "Rotation: %{angle}°",
+                        angle = state.snap_angle_deg
+                    ))
+                    .size(11),
                     button(text(crate::t!("Reset rotation")).size(10))
                         .on_press(Message::DraftingSettingsResetRotation)
                         .style(button::secondary)
@@ -366,6 +407,14 @@ pub fn view_window<'a>(
                 ]
                 .spacing(6)
                 .align_y(iced::Center),
+                row![
+                    checkbox(state.grid_axes)
+                        .on_toggle(|_| Message::DraftingSettingsToggleGridAxes)
+                        .size(14),
+                    text(crate::t!("Display grid axis lines")).size(11),
+                ]
+                .spacing(6)
+                .align_y(iced::Center),
             ]
             .spacing(6),
         );
@@ -403,9 +452,9 @@ pub fn view_window<'a>(
                 text(crate::t!(
                     "Polar Tracking guides cursor movement along specified angles. Ortho mode constrains movement to orthogonal axes."
                 ))
-                .size(10.5)
+                .size(crate::ui::style::text::UI_SMALL)
                 .style(|theme: &Theme| text::Style {
-                    color: Some(theme.palette().background.strongest.text.scale_alpha(0.7)),
+                    color: Some(crate::ui::style::readable::muted_text(theme)),
                 }),
             ]
             .spacing(6),
@@ -436,50 +485,48 @@ pub fn view_window<'a>(
         );
 
         let action_buttons = row![
-            button(text(crate::t!("Select All")).size(10.5))
+            button(text(crate::t!("Select All")).size(crate::ui::style::text::UI_SMALL))
                 .on_press(Message::DraftingSettingsSnapSelectAll)
                 .style(button::secondary)
                 .padding([4, 10]),
-            button(text(crate::t!("Clear All")).size(10.5))
+            button(text(crate::t!("Clear All")).size(crate::ui::style::text::UI_SMALL))
                 .on_press(Message::DraftingSettingsSnapClearAll)
                 .style(button::secondary)
                 .padding([4, 10]),
         ]
         .spacing(8);
 
+        // Each mode shows the marker drawn when it snaps.
+        let snap_mode_row = |snap_type: SnapType, label: &'static str| {
+            row![
+                checkbox(state.snap_modes.contains(&snap_type))
+                    .on_toggle(move |_| Message::DraftingSettingsToggleSnapMode(snap_type))
+                    .size(14),
+                container(crate::ui::icons::themed_success::<Message>(
+                    crate::ui::icons::osnap(snap_type),
+                    13.0,
+                ))
+                .width(16)
+                .align_x(iced::Center),
+                text(crate::t!(label)).size(11),
+            ]
+            .spacing(7)
+            .align_y(iced::Center)
+        };
+
         // Two columns of snap modes:
         let total = ALL_SNAP_MODES.len();
-        let mid = (total + 1) / 2;
+        let mid = total.div_ceil(2);
         let (first_half, second_half) = ALL_SNAP_MODES.split_at(mid);
 
         let mut col1 = column![].spacing(6).width(Fill);
         for &(snap_type, _, label) in first_half {
-            let is_checked = state.snap_modes.contains(&snap_type);
-            col1 = col1.push(
-                row![
-                    checkbox(is_checked)
-                        .on_toggle(move |_| Message::DraftingSettingsToggleSnapMode(snap_type))
-                        .size(14),
-                    text(crate::t!(label)).size(11),
-                ]
-                .spacing(7)
-                .align_y(iced::Center),
-            );
+            col1 = col1.push(snap_mode_row(snap_type, label));
         }
 
         let mut col2 = column![].spacing(6).width(Fill);
         for &(snap_type, _, label) in second_half {
-            let is_checked = state.snap_modes.contains(&snap_type);
-            col2 = col2.push(
-                row![
-                    checkbox(is_checked)
-                        .on_toggle(move |_| Message::DraftingSettingsToggleSnapMode(snap_type))
-                        .size(14),
-                    text(crate::t!(label)).size(11),
-                ]
-                .spacing(7)
-                .align_y(iced::Center),
-            );
+            col2 = col2.push(snap_mode_row(snap_type, label));
         }
 
         let snap_modes_group = group(
@@ -488,8 +535,22 @@ pub fn view_window<'a>(
         );
 
         column![
-            row![osnap_on_toggle, Space::new().width(24), otrack_on_toggle]
-                .align_y(iced::Center),
+            row![osnap_on_toggle, Space::new().width(24), otrack_on_toggle].align_y(iced::Center),
+            row![
+                text("OSNAP capture radius (pixels)").size(11),
+                text_input("25", &state.osnap_aperture_input)
+                    .on_input(Message::DraftingSettingsOsnapApertureChanged)
+                    .width(70),
+                // The accepted range, so a refused value is not a surprise (#2167).
+                text(format!(
+                    "{}–{}",
+                    crate::snap::MIN_OSNAP_RADIUS_PX,
+                    crate::snap::MAX_OSNAP_RADIUS_PX
+                ))
+                .size(11),
+            ]
+            .spacing(10)
+            .align_y(iced::Center),
             action_buttons,
             Space::new().height(4),
             snap_modes_group,
@@ -534,40 +595,110 @@ pub fn view_window<'a>(
     let dynamic_input_view = {
         let dyn_input_toggle = toggle(
             state.dyn_input_on,
-            crate::t!("Enable Pointer Input (F12)"),
+            crate::t!("Dynamic Input (F12)"),
             Message::DraftingSettingsToggleDynInput,
         );
 
+        let prefs = state.dyn_prefs;
+        let choice = |on: bool, label: &'static str, next: DynInputPrefs| {
+            row![
+                checkbox(on)
+                    .size(14)
+                    .on_toggle(move |_| Message::DraftingSettingsDynPrefs(next)),
+                text(crate::t!(label)).size(11),
+            ]
+            .spacing(7)
+            .align_y(iced::Center)
+        };
         let pointer_group = group(
             crate::t!("Pointer Input"),
             column![
-                row![
-                    checkbox(true).size(14),
-                    text(crate::t!("Display coordinate input near crosshairs")).size(11),
-                ]
-                .spacing(7)
-                .align_y(iced::Center),
-                row![
-                    checkbox(true).size(14),
-                    text(crate::t!("Enable dimension input fields")).size(11),
-                ]
-                .spacing(7)
-                .align_y(iced::Center),
+                choice(
+                    prefs.pointer,
+                    "Enable Pointer Input",
+                    DynInputPrefs {
+                        pointer: !prefs.pointer,
+                        ..prefs
+                    },
+                ),
+                text(crate::t!("Format for second or next points")).size(11),
+                choice(
+                    !prefs.cartesian,
+                    "Polar format",
+                    DynInputPrefs {
+                        cartesian: false,
+                        ..prefs
+                    },
+                ),
+                choice(
+                    prefs.cartesian,
+                    "Cartesian format",
+                    DynInputPrefs {
+                        cartesian: true,
+                        ..prefs
+                    },
+                ),
+                choice(
+                    !prefs.absolute,
+                    "Relative coordinates",
+                    DynInputPrefs {
+                        absolute: false,
+                        ..prefs
+                    },
+                ),
+                choice(
+                    prefs.absolute,
+                    "Absolute coordinates",
+                    DynInputPrefs {
+                        absolute: true,
+                        ..prefs
+                    },
+                ),
+                text(crate::t!("Show coordinate tooltips")).size(11),
+                choice(
+                    prefs.on_type,
+                    "As soon as I type coordinate data",
+                    DynInputPrefs {
+                        on_type: true,
+                        ..prefs
+                    },
+                ),
+                choice(
+                    !prefs.on_type,
+                    "When a command asks for a point",
+                    DynInputPrefs {
+                        on_type: false,
+                        ..prefs
+                    },
+                ),
             ]
+            .spacing(6),
+        );
+
+        let dimension_group = group(
+            crate::t!("Dimension Input"),
+            column![choice(
+                prefs.dimension,
+                "Enable Dimension Input where possible",
+                DynInputPrefs {
+                    dimension: !prefs.dimension,
+                    ..prefs
+                },
+            )]
             .spacing(6),
         );
 
         let prompt_group = group(
             crate::t!("Dynamic Prompts"),
-            column![
-                row![
-                    checkbox(true).size(14),
-                    text(crate::t!("Show command prompting and command input near crosshairs"))
-                        .size(11),
-                ]
-                .spacing(7)
-                .align_y(iced::Center),
+            column![row![
+                checkbox(true).size(14),
+                text(crate::t!(
+                    "Show command prompting and command input near crosshairs"
+                ))
+                .size(11),
             ]
+            .spacing(7)
+            .align_y(iced::Center),]
             .spacing(6),
         );
 
@@ -575,6 +706,7 @@ pub fn view_window<'a>(
             dyn_input_toggle,
             Space::new().height(4),
             pointer_group,
+            dimension_group,
             prompt_group,
         ]
         .spacing(10)
@@ -593,13 +725,17 @@ pub fn view_window<'a>(
             crate::t!("Palette Location"),
             column![
                 row![
-                    checkbox(true).size(14),
+                    checkbox(!state.quick_props_float)
+                        .size(14)
+                        .on_toggle(|_| Message::DraftingSettingsQuickPropsFloat(false)),
                     text(crate::t!("Cursor-dependent position")).size(11),
                 ]
                 .spacing(7)
                 .align_y(iced::Center),
                 row![
-                    checkbox(false).size(14),
+                    checkbox(state.quick_props_float)
+                        .size(14)
+                        .on_toggle(|_| Message::DraftingSettingsQuickPropsFloat(true)),
                     text(crate::t!("Static quadrant location")).size(11),
                 ]
                 .spacing(7)
@@ -608,13 +744,9 @@ pub fn view_window<'a>(
             .spacing(6),
         );
 
-        column![
-            quick_props_toggle,
-            Space::new().height(4),
-            palette_group,
-        ]
-        .spacing(10)
-        .width(Fill)
+        column![quick_props_toggle, Space::new().height(4), palette_group,]
+            .spacing(10)
+            .width(Fill)
     };
 
     // ── Tab 7: Selection Cycling ─────────────────────────────────────────
@@ -644,13 +776,9 @@ pub fn view_window<'a>(
             .spacing(6),
         );
 
-        column![
-            sel_cycling_toggle,
-            Space::new().height(4),
-            cycling_group,
-        ]
-        .spacing(10)
-        .width(Fill)
+        column![sel_cycling_toggle, Space::new().height(4), cycling_group,]
+            .spacing(10)
+            .width(Fill)
     };
 
     // ── Active Tab Content ───────────────────────────────────────────────
@@ -719,4 +847,3 @@ pub fn view_window<'a>(
         Message::DraftingSettingsCloseKeep,
     )
 }
-
