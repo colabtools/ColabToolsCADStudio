@@ -350,6 +350,44 @@ fn canonical_family_name_uncached(family: &str) -> Option<String> {
         }
     }
 
+    // 4b. Native builds (servers plotting with no office fonts installed):
+    //     the common office families stand in via free look-alikes with the
+    //     same widths, as the web build does with Noto (#141). Runs before the
+    //     fuzzy prefix match so "Arial" can never drift onto an arbitrary
+    //     family, and so text keeps its widths (no wrapping or overlap).
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let key = family_lower
+            .trim_end_matches(".ttf")
+            .trim_end_matches(".otf")
+            .to_string();
+        let twins: &[&str] = match key.as_str() {
+            "arial" | "arial_0" | "helvetica" => {
+                &["Liberation Sans", "Arimo", "TeX Gyre Heros", "Nimbus Sans"]
+            }
+            "arialbd" => &["Liberation Sans"],
+            "arial narrow" | "arialn" | "arial-narrow" => &[
+                "Liberation Sans Narrow",
+                "Nimbus Sans Narrow",
+                "TeX Gyre Heros Cn",
+            ],
+            "times new roman" | "times" => &["Liberation Serif", "Tinos", "Nimbus Roman"],
+            "courier new" | "cour" => &["Liberation Mono", "Cousine", "Nimbus Mono PS"],
+            "century gothic" | "gothic" | "gothicb" | "gothicbi" => {
+                &["URW Gothic", "TeX Gyre Adventor"]
+            }
+            "calibri" => &["Carlito"],
+            "cambria" => &["Caladea"],
+            "tahoma" | "verdana" | "segoe ui" => &["DejaVu Sans"],
+            _ => &[],
+        };
+        for twin in twins {
+            if let Some(matched) = families.iter().find(|&f| f.eq_ignore_ascii_case(twin)) {
+                return Some(matched.clone());
+            }
+        }
+    }
+
     // 5. Try matching prefix/subset case-insensitively. Require at least 3
     //    chars so a 1–2 letter request can't grab an arbitrary family by the
     //    first iteration order. Iterating sorted keeps the pick deterministic.
