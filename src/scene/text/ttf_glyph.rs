@@ -420,11 +420,33 @@ pub(crate) fn glyph_id(face: &ttf_parser::Face, ch: char) -> Option<ttf_parser::
     })
 }
 
+/// Arial's capital A: 1466 of 2048 font units.
+const ARIAL_CAPITAL_EM: f32 = 1466.0 / 2048.0;
+
+/// The face's family name (name table, family or typographic family).
+fn face_family(face: &ttf_parser::Face) -> Option<String> {
+    face.names()
+        .into_iter()
+        .filter(|name| {
+            name.name_id == ttf_parser::name_id::TYPOGRAPHIC_FAMILY
+                || name.name_id == ttf_parser::name_id::FAMILY
+        })
+        .find_map(|name| name.to_string())
+}
+
 /// The font units a TrueType text height spans, as the reference measures
 /// it: the top of the capital A's box (Times New Roman's apex rises above
 /// its OS/2 cap height, MS Gothic's box above its outline), else the OS/2
 /// cap height, else 0.7 em. A symbol font's A sits at U+F041.
 pub(crate) fn capital_units(face: &ttf_parser::Face) -> f32 {
+    // A free twin standing in for Arial (Liberation Sans, Arimo) has Arial's
+    // advance widths but lower capitals (its A reaches 1409 of 2048 units,
+    // Arial's 1466). Sized by its own capitals, the Arial text it replaces came
+    // out 4% too big: lines ran past their MTEXT width, wrapped, and grew into
+    // the label above (T1, k04 "L8 / VOID"). Size it by Arial's capitals.
+    if face_family(face).is_some_and(|family| sysfont::stands_in_for_arial(&family)) {
+        return ARIAL_CAPITAL_EM * face.units_per_em().max(1) as f32;
+    }
     face.glyph_index('A')
         .or_else(|| {
             face.tables()
@@ -1389,6 +1411,27 @@ pub fn clear_fallback_cache() {
 #[cfg(test)]
 mod fallback_tests {
     use super::*;
+
+    /// T1 (k04): the "VOID / 2.80 X 2.30" label is 1417.8 units wide at height
+    /// 200; AutoCAD measures the line 1407.6, so it stays on one line. An Arial
+    /// twin sized by its own (lower) capitals is 4% bigger and wrapped it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_arial_twin_is_sized_by_arials_capitals() {
+        let Some(family) = sysfont::canonical_family_name("Arial") else {
+            return;
+        };
+        if !sysfont::stands_in_for_arial(&family) {
+            return; // real Arial installed, or no twin: nothing to check
+        }
+        let (capital, upem) = sysfont::with_face_data(&family, |data, index| {
+            let face = ttf_parser::Face::parse(data, index).ok()?;
+            Some((capital_units(&face), face.units_per_em() as f32))
+        })
+        .flatten()
+        .expect("twin face");
+        assert!((capital / upem - 1466.0 / 2048.0).abs() < 1e-4);
+    }
 
     /// A fallback that comes back with an id but no outline draws nothing while
     /// believing it drew something: the stroke fonts hand every letter they
