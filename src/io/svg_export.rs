@@ -487,14 +487,15 @@ fn emit_wire(
     let mut cap = "round";
     let mut join = "round";
     if let Some(table) = plot_style {
-        if wire.aci > 0 {
-            if let Some([cr, cg, cb]) = table.resolve_color(wire.aci) {
+        let row = crate::io::plot_style::ctb_row(wire.aci, wire.color, wire.snap_only);
+        if row > 0 {
+            if let Some([cr, cg, cb]) = table.resolve_color(row) {
                 [r, g, b] = [cr, cg, cb];
                 color_overridden = true;
             }
-            lw_override_mm = table.resolve_lineweight(wire.aci).map(|mm| mm as f64);
-            screening = table.resolve_screening(wire.aci);
-            if let Some(entry) = table.aci_entries.get(wire.aci as usize) {
+            lw_override_mm = table.resolve_lineweight(row).map(|mm| mm as f64);
+            screening = table.resolve_screening(row);
+            if let Some(entry) = table.aci_entries.get(row as usize) {
                 cap = match entry.end_style {
                     0 => "butt",
                     1 | 3 => "square",
@@ -619,12 +620,13 @@ fn emit_wire_fills(
         let mut screening = 1.0;
         let mut color_overridden = false;
         if let Some(table) = plot_style {
-            if wire.aci > 0 {
-                if let Some(color) = table.resolve_color(wire.aci) {
+            let row = crate::io::plot_style::ctb_row(wire.aci, wire.color, wire.snap_only);
+            if row > 0 {
+                if let Some(color) = table.resolve_color(row) {
                     [r, g, b] = color;
                     color_overridden = true;
                 }
-                screening = table.resolve_screening(wire.aci);
+                screening = table.resolve_screening(row);
             }
         }
         if !color_overridden {
@@ -698,13 +700,14 @@ fn emit_hatch(
     let mut color_overridden = false;
     if !is_wipeout {
         if let Some(table) = plot_style {
-            if hatch.aci > 0 {
-                if let Some([cr, cg, cb]) = table.resolve_color(hatch.aci) {
+            let row = crate::io::plot_style::ctb_row(hatch.aci, hatch.color, false);
+            if row > 0 {
+                if let Some([cr, cg, cb]) = table.resolve_color(row) {
                     [r, g, b] = [cr, cg, cb];
                     color_overridden = true;
                 }
-                screening = table.resolve_screening(hatch.aci);
-                lw_override_mm = table.resolve_lineweight(hatch.aci).map(|mm| mm as f64);
+                screening = table.resolve_screening(row);
+                lw_override_mm = table.resolve_lineweight(row).map(|mm| mm as f64);
             }
         }
     }
@@ -963,11 +966,12 @@ fn emit_text_outlines(out: &mut String, wire: &WireModel, context: OutlineContex
     let mut lw_override_mm = None;
     let mut screening = 1.0;
     if let Some(table) = context.plot_style {
-        if wire.aci > 0 {
-            ctb_color = table.resolve_color(wire.aci);
-            screening = table.resolve_screening(wire.aci);
+        let row = crate::io::plot_style::ctb_row(wire.aci, wire.color, wire.snap_only);
+        if row > 0 {
+            ctb_color = table.resolve_color(row);
+            screening = table.resolve_screening(row);
             if context.options.object_lineweights {
-                lw_override_mm = table.resolve_lineweight(wire.aci).map(|mm| mm as f64);
+                lw_override_mm = table.resolve_lineweight(row).map(|mm| mm as f64);
             }
         }
     }
@@ -1114,9 +1118,10 @@ fn emit_searchable_text(
     let mut ctb_color: Option<[f32; 3]> = None;
     let mut screening = 1.0;
     if let Some(table) = plot_style {
-        if wire.aci > 0 {
-            ctb_color = table.resolve_color(wire.aci);
-            screening = table.resolve_screening(wire.aci);
+        let row = crate::io::plot_style::ctb_row(wire.aci, wire.color, wire.snap_only);
+        if row > 0 {
+            ctb_color = table.resolve_color(row);
+            screening = table.resolve_screening(row);
         }
     }
     for run in &wire.searchable_text {

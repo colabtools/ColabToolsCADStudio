@@ -263,6 +263,22 @@ fn normal_entry(table: &PlotStyleTable) -> Option<&PlotStyleEntry> {
         .or_else(|| table.named_entries.values().next())
 }
 
+/// The colour-table (CTB) row an object plots with.
+///
+/// An object in an index colour uses its own row. An object in a custom
+/// colour (true colour or colour book) reaches the plot with index 0; AutoCAD
+/// plots it with the row of the nearest index colour, so a black-and-white
+/// table (monochrome.ctb) prints it black like everything else. Reference
+/// geometry (an underlay's content, `WireModel::snap_only`) has no row of
+/// its own and keeps 0.
+pub(crate) fn ctb_row(aci: u8, color: [f32; 4], reference: bool) -> u8 {
+    if aci > 0 || reference {
+        return aci;
+    }
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    document::types::aci_table::nearest_aci(byte(color[0]), byte(color[1]), byte(color[2]))
+}
+
 // Names in a named table: the packed RGB the codec reads and writes.
 fn packed_rgb([r, g, b]: [u8; 3]) -> i32 {
     u32::from_be_bytes([0xC2, r, g, b]) as i32
@@ -687,6 +703,18 @@ fn screening(name: &str, percent: u8) -> PlotStyleTable {
 #[cfg(test)]
 mod round_trip_tests {
     use super::{PlotStyleTable, PlotStyleTableExt};
+
+    /// A true-colour object (index 0) plots with the nearest index colour's
+    /// row: magenta-ish labels print black under monochrome.ctb (T1, k12).
+    #[test]
+    fn true_colour_objects_use_the_nearest_index_row() {
+        assert_eq!(super::ctb_row(3, [1.0, 0.0, 1.0, 1.0], false), 3);
+        assert_eq!(super::ctb_row(0, [1.0, 0.0, 1.0, 1.0], false), 6);
+        assert_eq!(super::ctb_row(0, [1.0, 0.0, 1.0, 1.0], true), 0);
+        let mono = PlotStyleTable::builtin("monochrome.ctb").expect("monochrome");
+        let row = super::ctb_row(0, [0.93, 0.0, 0.91, 1.0], false);
+        assert_eq!(mono.resolve_style_color(row), Some([0.0; 3]));
+    }
 
     /// A table registered this session (the web stand-in for the plot-styles
     /// folder) is what `load_named` returns for its name — matched
