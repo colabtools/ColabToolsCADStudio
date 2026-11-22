@@ -2061,10 +2061,14 @@ fn glyph_world_xy(v: &crate::scene::pipeline::text_gpu::TextVertex) -> [f64; 2] 
 /// only near-white (colour 7) turns black. Every other colour, yellow and
 /// cyan included, plots as drawn. (#1926)
 pub(crate) fn adapt_to_paper([r, g, b]: [f32; 3]) -> [f32; 3] {
-    // An authored white (not colour 7) plots as drawn, like on screen.
-    let is_light = r > 0.80
-        && g > 0.80
-        && b > 0.80
+    // Only colour 7 swaps: it reaches the plot as pure white (the screen
+    // swaps nothing else, see `adapt_to_bg`). A light grey such as colour
+    // 254 (214, 214, 214) plots as drawn, as AutoCAD prints it: a light-grey
+    // background fill must not come out solid black. An authored white (not
+    // colour 7) plots as drawn, like on screen.
+    let is_light = r >= 0.99
+        && g >= 0.99
+        && b >= 0.99
         && !crate::scene::convert::tess_util::is_authored_white([r, g, b]);
     if is_light {
         [0.0, 0.0, 0.0]
@@ -3092,7 +3096,10 @@ mod tests {
     #[test]
     fn only_colour_7_adapts_to_the_white_sheet() {
         assert_eq!(adapt_to_paper([1.0, 1.0, 1.0]), [0.0, 0.0, 0.0]);
-        for rgb in [[1.0, 1.0, 0.0], [0.0, 1.0, 1.0], [1.0, 1.0, 0.5]] {
+        // Colours 2, 4, 51 and the light greys 254 and 253 (T1, Krunal DR-101A:
+        // light-grey slab and wall fills came out solid black).
+        let grey = |v: f32| [v / 255.0; 3];
+        for rgb in [[1.0, 1.0, 0.0], [0.0, 1.0, 1.0], [1.0, 1.0, 0.5], grey(214.0), grey(173.0)] {
             assert_eq!(adapt_to_paper(rgb), rgb, "{rgb:?} must plot as drawn");
         }
     }
