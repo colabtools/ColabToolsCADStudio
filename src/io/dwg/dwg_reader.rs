@@ -139,6 +139,41 @@ fn ac21_page_layout(
     Ok((total_size, factor, factor * 255))
 }
 
+/// Put one decoded AC21 data page into its section buffer.
+///
+/// Each page of an AC21 section records where its data starts in the
+/// section (`offset`). The pages need not be packed: AutoCAD leaves
+/// unwritten (all-zero) stretches between pages of a large
+/// `AcDb:AcDbObjects` section, and the handle map's offsets count those
+/// stretches. Appending pages back to back then moves every later record,
+/// and reading stops at the first record past the gap ("Could not read
+/// record type at handle …"). LibreDWG also copies each page to its offset.
+///
+/// The declared offset is used when it is at or after the data placed so
+/// far and inside `section_size`; the bytes in between stay zero (a padded
+/// last page may run past the section size: the caller truncates).
+/// Otherwise (a writer that leaves the offset zero, an overlap, or a page
+/// starting past the section end) the page is appended, as before. Returns
+/// `true` when the declared offset was used.
+fn place_ac21_page(
+    result: &mut Vec<u8>,
+    declared_offset: u64,
+    data: &[u8],
+    section_size: usize,
+) -> bool {
+    match usize::try_from(declared_offset) {
+        Ok(at) if at >= result.len() && at < section_size => {
+            result.resize(at, 0);
+            result.extend_from_slice(data);
+            true
+        }
+        _ => {
+            result.extend_from_slice(data);
+            false
+        }
+    }
+}
+
 fn decode_ac21_page(
     encoded: &[u8],
     total_size: usize,
@@ -3385,8 +3420,12 @@ impl<R: Read + Seek> DwgReader<R> {
         // The pages append at most `page_total` bytes, so reserve that once,
         // fallibly: later `extend_from_slice`/`resize` calls cannot reallocate
         // (and so cannot hit the aborting allocator path) within this capacity.
-        let mut result =
-            try_vec_with_capacity(page_total, format_args!("AC21 section '{}'", section_name))?;
+        // Pages are placed at their declared offsets (see `place_ac21_page`),
+        // which may leave zero gaps up to the declared section size.
+        let mut result = try_vec_with_capacity(
+            page_total.max(total_size),
+            format_args!("AC21 section '{}'", section_name),
+        )?;
 
         // encoding=1 (stored): contiguous data followed by non-interleaved RS
         // parity. Reading only the payload deliberately skips that parity.
@@ -3409,6 +3448,7 @@ impl<R: Read + Seek> DwgReader<R> {
         }
         struct PreparedPage {
             number: i64,
+            offset: u64,
             fill_size: usize,
             payload: PagePayload,
         }
@@ -3499,6 +3539,7 @@ impl<R: Read + Seek> DwgReader<R> {
                 };
                 prepared.push(PreparedPage {
                     number: page.page_number,
+                    offset: page.offset,
                     fill_size,
                     payload,
                 });
@@ -3530,12 +3571,14 @@ impl<R: Read + Seek> DwgReader<R> {
                     .map_err(|error| error.to_string()),
                     PagePayload::Failed(error) => Err(error),
                 };
-                (page.number, page.fill_size, data)
+                (page.number, page.offset, page.fill_size, data)
             });
 
-            for (page_number, fill_size, page_result) in decoded {
+            for (page_number, page_offset, fill_size, page_result) in decoded {
                 match page_result {
-                    Ok(page_data) => result.extend_from_slice(&page_data),
+                    Ok(page_data) => {
+                        place_ac21_page(&mut result, page_offset, &page_data, total_size);
+                    }
                     Err(error) => {
                         skipped_pages += 1;
                         self.notifications.notify(
@@ -3545,7 +3588,8 @@ impl<R: Read + Seek> DwgReader<R> {
                                 page_number, section_name, error
                             ),
                         );
-                        result.resize(result.len() + fill_size, 0);
+                        // Zeros where the page belongs, so later pages keep their place.
+                        place_ac21_page(&mut result, page_offset, &vec![0; fill_size], total_size);
                     }
                 }
             }
@@ -4027,10 +4071,52 @@ fn system_page_checksum(header: [i32; 4], data: &[u8]) -> u32 {
 #[cfg(test)]
 mod dwg_reader_tests {
     use super::{
-        extract_acds_record_blobs, find_acds_magic, find_subsequence, section_name_from_field,
-        ACIS_END_MARKER,
+        extract_acds_record_blobs, find_acds_magic, find_subsequence, place_ac21_page,
+        section_name_from_field, ACIS_END_MARKER,
     };
     use std::collections::HashSet;
+
+    #[test]
+    fn ac21_packed_pages_are_appended_in_order() {
+        let mut out = Vec::new();
+        assert!(place_ac21_page(&mut out, 0, b"abc", 7));
+        assert!(place_ac21_page(&mut out, 3, b"defg", 7));
+        assert_eq!(out, b"abcdefg");
+    }
+
+    #[test]
+    fn ac21_page_after_a_gap_lands_at_its_offset() {
+        // A large AcDbObjects section of a real R2007 file: page 2 starts
+        // 4 bytes after page 1 ends; the handle map counts those bytes.
+        let mut out = Vec::new();
+        assert!(place_ac21_page(&mut out, 0, b"ab", 10));
+        assert!(place_ac21_page(&mut out, 6, b"cd", 10));
+        assert!(place_ac21_page(&mut out, 8, b"ef", 10));
+        assert_eq!(out, b"ab\0\0\0\0cdef");
+    }
+
+    #[test]
+    fn ac21_padded_last_page_after_a_gap_keeps_its_offset() {
+        let mut out = Vec::new();
+        assert!(place_ac21_page(&mut out, 0, b"ab", 7));
+        assert!(place_ac21_page(&mut out, 4, b"cdef", 7));
+        out.truncate(7);
+        assert_eq!(out, b"ab\0\0cde");
+    }
+
+    #[test]
+    fn ac21_page_with_an_unusable_offset_is_appended() {
+        let mut out = Vec::new();
+        assert!(place_ac21_page(&mut out, 0, b"abcd", 8));
+        // Overlaps data already placed (a writer that leaves offsets zero).
+        assert!(!place_ac21_page(&mut out, 0, b"ef", 8));
+        assert_eq!(out, b"abcdef");
+        // Starts past the declared section size.
+        assert!(!place_ac21_page(&mut out, 9, b"gh", 8));
+        assert_eq!(out, b"abcdefgh");
+        assert!(!place_ac21_page(&mut out, u64::MAX, b"i", 8));
+        assert_eq!(out, b"abcdefghi");
+    }
 
     #[test]
     fn find_subsequence_starts_at_from() {
