@@ -429,8 +429,23 @@ mod tests {
             let resolved = Face::resolve(test_name);
             match resolved {
                 Face::Ttf { family, .. } => {
+                    // Without the office fonts (a server), native builds
+                    // resolve them to their free twins (sysfont step 4b).
                     assert!(
-                        family == "Arial" || family == "Arial Narrow" || family == "Cambria",
+                        [
+                            "Arial",
+                            "Arial Narrow",
+                            "Cambria",
+                            "Liberation Sans",
+                            "Arimo",
+                            "TeX Gyre Heros",
+                            "Nimbus Sans",
+                            "Liberation Sans Narrow",
+                            "Nimbus Sans Narrow",
+                            "TeX Gyre Heros Cn",
+                            "Caladea",
+                        ]
+                        .contains(&family.as_str()),
                         "Resolved to unexpected family name: {}",
                         family
                     );
