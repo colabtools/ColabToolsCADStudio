@@ -429,6 +429,17 @@ pub(crate) fn append_insert_attribute_wires(
     if attributes.is_empty() {
         return;
     }
+    // The colour index each attribute plots with: a ByBlock attribute takes
+    // the insert's, a ByLayer one on layer 0 the insert layer's, exactly as
+    // block contents do (`BlockStyle::resolve`). Without it such attributes
+    // reached the plot with index 0, so a colour table never applied: under
+    // monochrome.ctb the column labels of T1 k12 stayed magenta (colour 210
+    // from the insert's layer) where AutoCAD prints them black.
+    let block_style = crate::scene::render_graph::BlockStyle::for_entity(
+        document,
+        &EntityType::Insert(ins.clone()),
+        None,
+    );
     for offset in crate::scene::render_graph::array_offsets(ins) {
         let delta = crate::scene::render_graph::insert_instance_translation_delta(
             document,
@@ -453,6 +464,10 @@ pub(crate) fn append_insert_attribute_wires(
                     ins_lw_px,
                     ins_layer,
                 );
+            let sub_aci = match block_style.resolve(document, &attr_entity, None).4 {
+                0 => sub_aci,
+                aci => aci,
+            };
             let sub_color = render::adapt_to_bg(sub_color, bg_color);
             let sub_color = if is_xref && !sel {
                 block_cache::xref_fade(sub_color, bg_color)
@@ -1082,6 +1097,70 @@ mod tests {
             1,
             "ATTMODE=0 should hide every attribute grip",
         );
+    }
+
+    /// T1 k12: a ByBlock attribute on an insert whose layer is colour 210
+    /// plots with index 210, so a colour table (monochrome.ctb) applies to it
+    /// as it does to the block's own contents. Its wires carried index 0
+    /// before, and the labels stayed magenta on a black-and-white plot.
+    #[test]
+    fn a_byblock_attribute_plots_with_the_inserts_colour_index() {
+        let mut layer = Layer::new("Co-ordinates");
+        layer.color = document::types::Color::Index(210);
+        let mut document = document_with_layers(vec![layer]);
+        document.header.attribute_visibility = 1;
+        let mut label = one_character_attribute("POINTNAME", 1_000.0);
+        label.common.color = document::types::Color::ByBlock;
+        let mut layer_zero_label = one_character_attribute("ZERO", 2_000.0);
+        layer_zero_label.common.color = document::types::Color::ByLayer;
+        let mut own = one_character_attribute("OWN", 3_000.0);
+        own.common.color = document::types::Color::Index(3);
+        own.common.layer = "Co-ordinates".into();
+        let mut insert = block_with(vec![label, layer_zero_label, own]);
+        insert.common.layer = "Co-ordinates".into();
+
+        let mut wires = Vec::new();
+        let magenta = [1.0, 0.0, 1.0, 1.0];
+        append_insert_attribute_wires(
+            &mut wires,
+            &document,
+            &insert,
+            Handle::new(0x41),
+            false,
+            magenta,
+            0.0,
+            [0.0; 8],
+            1.0,
+            render::InheritStyle {
+                color: magenta,
+                pat_len: 0.0,
+                pat: [0.0; 8],
+                lw_px: 1.0,
+            },
+            true,
+            [1.0, 1.0, 1.0, 1.0],
+            false,
+            1.0,
+            1.0,
+            None,
+        );
+
+        let aci_near = |x: f64| {
+            wires
+                .iter()
+                .find(|wire| {
+                    wire.text_verts.iter().any(|v| {
+                        let vx = f64::from(v.pos[0]) + f64::from(v.pos_low[0]);
+                        vx >= x - 1.0 && vx < x + 100.0
+                    }) || wire.points.iter().any(|p| {
+                        f64::from(p[0]) >= x - 1.0 && f64::from(p[0]) < x + 100.0
+                    })
+                })
+                .map(|wire| wire.aci)
+        };
+        assert_eq!(aci_near(1_000.0), Some(210), "ByBlock takes the insert's index");
+        assert_eq!(aci_near(2_000.0), Some(210), "ByLayer on layer 0 takes the insert layer's");
+        assert_eq!(aci_near(3_000.0), Some(3), "its own index stays");
     }
 
     #[test]
