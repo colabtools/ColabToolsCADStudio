@@ -1583,9 +1583,19 @@ pub fn wrap_paragraph(
                     .iter()
                     .any(|a| !matches!(a.kind, AtomKind::Space));
                 // A word fits when its ink does: the letter spacing after its
-                // last glyph may run past the edge.
-                let ink_w = w - trailing_letter_gap(&atom, entity_h, base_wf, base_font);
-                if has_content && cur_w + ink_w > max_w && !after_align_tab {
+                // last glyph may run past the edge, and so may the side
+                // bearings at the line's two ends, which the line's width does
+                // not count (`side_bearing`; measured: AutoCAD keeps
+                // "2.80 X 2.30" in Arial at height 200 on one line of a
+                // 1417.8-wide box, its stored line width 1407.6, T1 k04).
+                let ink_w = w
+                    - trailing_letter_gap(&atom, entity_h, base_wf, base_font)
+                    - side_bearing(&atom, entity_h, base_wf, base_font, true);
+                let lead = cur[..word_start]
+                    .iter()
+                    .find(|a| matches!(a.kind, AtomKind::Word(_)))
+                    .map_or(0.0, |a| side_bearing(a, entity_h, base_wf, base_font, false));
+                if has_content && cur_w - lead + ink_w > max_w && !after_align_tab {
                     let word = cur.split_off(word_start);
                     while matches!(cur.last().map(|a| &a.kind), Some(AtomKind::Space)) {
                         cur.pop();
