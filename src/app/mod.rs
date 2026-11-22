@@ -146,6 +146,8 @@ mod tolerance_dialog;
 pub(crate) mod tool_windows;
 #[cfg(test)]
 mod undo_sweep_tests;
+#[cfg(test)]
+mod view_only_tests;
 mod update;
 pub(crate) use update::style_import::{style_exists as style_import_exists, StyleImportDraft};
 #[cfg(test)]
@@ -2099,6 +2101,11 @@ pub(super) struct OpenCADStudio {
     /// Read-only session (`--read-only`): editing is allowed but every save
     /// path is refused. Set once at boot from the CLI config.
     read_only: bool,
+    /// View-only session (an embedding page opened the drawing read-only, or
+    /// `?viewonly=1`): on top of `read_only`, every change to the drawing is
+    /// taken back as soon as it is recorded. Viewing stays free: pan, zoom,
+    /// layouts, layer on/off/freeze/lock, isolation, measuring, selecting.
+    pub(crate) view_only: bool,
     /// Tag of the latest available release (without the leading "v"),
     /// e.g. `"0.3.0"`. `None` when up-to-date or check hasn't returned.
     update_notice_version: Option<String>,
@@ -7068,6 +7075,7 @@ impl OpenCADStudio {
             font_source_input: String::new(),
             donation_prompt_version: String::new(),
             read_only: false,
+            view_only: false,
             update_notice_version: None,
             update_notice_body: None,
             clipboard: Vec::new(),
