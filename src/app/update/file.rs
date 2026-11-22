@@ -9510,7 +9510,9 @@ impl OpenCADStudio {
                 }
                 self.active_tab = 0;
                 host_bridge::clear_pending_saves();
-                self.read_only = read_only;
+                let view_only = read_only || host_bridge::is_view_only_forced();
+                self.read_only = view_only || read_only;
+                self.view_only = view_only;
                 self.active_modal = None;
                 self.update(Message::WebFileDropped(name, bytes, None))
             }

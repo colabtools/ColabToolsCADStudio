@@ -131,6 +131,10 @@ impl OpenCADStudio {
     }
 
     pub(super) fn push_undo_entry(&mut self, i: usize, mut snapshot: HistorySnapshot) {
+        if self.view_only && !self.view_only_allows(i, &snapshot) {
+            self.take_back_view_only_change(i, snapshot);
+            return;
+        }
         if let HistorySnapshot::Delta(delta) = &mut snapshot {
             if delta.view.is_none() {
                 delta.view = Some(Box::new(self.tabs[i].scene.camera.borrow().clone()));
@@ -140,6 +144,72 @@ impl OpenCADStudio {
         self.tabs[i].edit_revision = self.tabs[i].edit_revision.wrapping_add(1);
         self.clear_redo_history(i);
         self.trim_history(i);
+    }
+
+    /// View-only sessions keep what only changes how the drawing is seen:
+    /// object isolation, layouts and the view, layer on/off/freeze/lock,
+    /// loading or unloading references. Anything else (entities, blocks,
+    /// styles, objects, layer properties, constraints) is a change.
+    pub(super) fn view_only_allows(&self, i: usize, snapshot: &HistorySnapshot) -> bool {
+        let HistorySnapshot::Delta(d) = snapshot else {
+            return true;
+        };
+        if !d.entities.is_empty()
+            || !d.parametric_constraints.is_empty()
+            || !d.reference_designations.is_empty()
+            || d.graph.is_some()
+            || d.named_parameters.is_some()
+        {
+            return false;
+        }
+        d.structure
+            .as_ref()
+            .map_or(true, |structure| self.view_only_structure_allowed(i, structure))
+    }
+
+    fn view_only_structure_allowed(&self, i: usize, structure: &StructureSnapshot) -> bool {
+        match structure {
+            StructureSnapshot::Combined(parts) => parts
+                .iter()
+                .all(|part| self.view_only_structure_allowed(i, part)),
+            StructureSnapshot::Layers(entries) => entries.iter().all(|entry| {
+                match (&entry.before, &entry.after) {
+                    (Some(before), Some(after)) => layer_visibility_only(before, after),
+                    _ => false,
+                }
+            }),
+            StructureSnapshot::Full(before) => {
+                let mut after = self.tabs[i].scene.document.snapshot_structure();
+                let mut before = before.clone();
+                for layer in before.layers.iter_mut() {
+                    if let Some(now) = after.layers.get(&layer.name) {
+                        copy_layer_visibility(now, layer);
+                    }
+                }
+                // Switching layouts only moves the header's current layout.
+                after.header = before.header.clone();
+                before == after
+            }
+            _ => false,
+        }
+    }
+
+    /// Put a refused change back at once and say why. The entry goes on the
+    /// undo stack only to be applied backwards by the ordinary undo path, then
+    /// leaves no redo behind.
+    fn take_back_view_only_change(&mut self, i: usize, snapshot: HistorySnapshot) {
+        let active = self.active_tab;
+        self.active_tab = i;
+        self.tabs[i].history.push_undo(snapshot);
+        self.undo_steps_reported(1, false);
+        self.clear_redo_history(i);
+        self.active_tab = active;
+        self.command_line
+            .push_error(crate::t!("View only: this drawing can't be changed here.").as_ref());
+        #[cfg(target_arch = "wasm32")]
+        if crate::io::host_bridge::is_embed_mode() {
+            crate::io::host_bridge::emit_error("read_only", "View only: this drawing can't be changed here.");
+        }
     }
 
     pub(super) fn push_object_visibility_history(
@@ -1831,6 +1901,19 @@ impl OpenCADStudio {
 /// Collapse a step's entity changes to one kind per handle: an add followed
 /// by a remove never existed, a remove dominates a prior modify, and a
 /// re-add of a removed handle reads as a modify.
+/// The two layer records differ only in on/off, frozen and locked.
+fn layer_visibility_only(before: &document::tables::Layer, after: &document::tables::Layer) -> bool {
+    let mut seen = after.clone();
+    copy_layer_visibility(before, &mut seen);
+    seen == *before
+}
+
+fn copy_layer_visibility(from: &document::tables::Layer, to: &mut document::tables::Layer) {
+    to.flags.off = from.flags.off;
+    to.flags.frozen = from.flags.frozen;
+    to.flags.locked = from.flags.locked;
+}
+
 fn net_entity_changes(
     changes: &[(Handle, crate::scene::ChangeKind)],
 ) -> Vec<(Handle, crate::scene::ChangeKind)> {

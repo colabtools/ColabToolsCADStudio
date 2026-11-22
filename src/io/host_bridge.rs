@@ -112,6 +112,7 @@ mod web {
 
     static EMBED_MODE: OnceLock<bool> = OnceLock::new();
     static AUTOMATION_ALLOWED: OnceLock<bool> = OnceLock::new();
+    static VIEW_ONLY_FORCED: OnceLock<bool> = OnceLock::new();
     static INSTALLED: OnceLock<()> = OnceLock::new();
     static COMMAND_QUEUE: Mutex<VecDeque<HostCommand>> = Mutex::new(VecDeque::new());
     static PENDING_SAVES: Mutex<VecDeque<PendingSave>> = Mutex::new(VecDeque::new());
@@ -127,6 +128,12 @@ mod web {
 
     pub fn is_embed_mode() -> bool {
         *EMBED_MODE.get_or_init(|| has_query_flag("embed", "1"))
+    }
+
+    /// `?viewonly=1`: the host wants a view-only session whatever an open
+    /// message says. Every change to the drawing is refused, not only saves.
+    pub fn is_view_only_forced() -> bool {
+        *VIEW_ONLY_FORCED.get_or_init(|| is_embed_mode() && has_query_flag("viewonly", "1"))
     }
 
     pub fn is_automation_allowed() -> bool {
