@@ -150,7 +150,7 @@ impl OpenCADStudio {
     /// object isolation, layouts and the view, layer on/off/freeze/lock,
     /// loading or unloading references. Anything else (entities, blocks,
     /// styles, objects, layer properties, constraints) is a change.
-    pub(super) fn view_only_allows(&self, i: usize, snapshot: &HistorySnapshot) -> bool {
+    pub(super) fn view_only_allows(&mut self, i: usize, snapshot: &HistorySnapshot) -> bool {
         let HistorySnapshot::Delta(d) = snapshot else {
             return true;
         };
@@ -167,7 +167,7 @@ impl OpenCADStudio {
             .map_or(true, |structure| self.view_only_structure_allowed(i, structure))
     }
 
-    fn view_only_structure_allowed(&self, i: usize, structure: &StructureSnapshot) -> bool {
+    fn view_only_structure_allowed(&mut self, i: usize, structure: &StructureSnapshot) -> bool {
         match structure {
             StructureSnapshot::Combined(parts) => parts
                 .iter()
