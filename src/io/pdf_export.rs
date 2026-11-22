@@ -991,19 +991,18 @@ fn append_pdf_page(
             let mut cap = None;
             let mut join = None;
             if let Some(ctb) = plot_style {
-                let row = crate::io::plot_style::ctb_row(wire.aci, wire.color, wire.snap_only);
-                if row > 0 || ctb.is_stb {
-                    if let Some([cr, cg, cb]) = ctb.resolve_style_color(row) {
+                if wire.aci > 0 || ctb.is_stb {
+                    if let Some([cr, cg, cb]) = ctb.resolve_style_color(wire.aci) {
                         r = cr;
                         g = cg;
                         b = cb;
                         color_overridden = true;
                     }
                     lw_override = ctb
-                        .resolve_style_lineweight(row)
+                        .resolve_style_lineweight(wire.aci)
                         .map(|mm| (mm * MM_TO_PT).max(0.1));
-                    screening = ctb.resolve_style_screening(row);
-                    if let Some(entry) = ctb.aci_entries.get(row as usize) {
+                    screening = ctb.resolve_style_screening(wire.aci);
+                    if let Some(entry) = ctb.aci_entries.get(wire.aci as usize) {
                         cap = match entry.end_style {
                             0 => Some(LineCapStyle::Butt),
                             1 | 3 => Some(LineCapStyle::ProjectingSquare),
@@ -1736,13 +1735,12 @@ fn emit_wire_fills(
             let mut screening = 1.0;
             let mut color_overridden = false;
             if let Some(table) = plot_style {
-                let row = crate::io::plot_style::ctb_row(wire.aci, wire.color, wire.snap_only);
-                if row > 0 {
-                    if let Some(color) = table.resolve_style_color(row) {
+                if wire.aci > 0 {
+                    if let Some(color) = table.resolve_style_color(wire.aci) {
                         [r, g, b] = color;
                         color_overridden = true;
                     }
-                    screening = table.resolve_style_screening(row);
+                    screening = table.resolve_style_screening(wire.aci);
                 }
             }
             if !color_overridden {
@@ -1841,9 +1839,8 @@ fn emit_hatch(
     }
     let mut styled_hatch = None;
     if let Some(table) = plot_style {
-        let row = crate::io::plot_style::ctb_row(hatch.aci, hatch.color, false);
-        if row > 0 && matches!(hatch.pattern, HatchPattern::Solid) {
-            if let Some(pattern) = table.aci_entries.get(row as usize).and_then(|entry| {
+        if hatch.aci > 0 && matches!(hatch.pattern, HatchPattern::Solid) {
+            if let Some(pattern) = table.aci_entries.get(hatch.aci as usize).and_then(|entry| {
                 crate::scene::model::hatch_model::plot_style_fill_pattern(entry.fill_style)
             }) {
                 let mut model = hatch.clone();
@@ -1868,17 +1865,16 @@ fn emit_hatch(
     let mut color_overridden = false;
     if !is_wipeout {
         if let Some(table) = plot_style {
-            let row = crate::io::plot_style::ctb_row(hatch.aci, hatch.color, false);
-            if row > 0 {
-                if let Some([cr, cg, cb]) = table.resolve_style_color(row) {
+            if hatch.aci > 0 {
+                if let Some([cr, cg, cb]) = table.resolve_style_color(hatch.aci) {
                     r = cr;
                     g = cg;
                     b = cb;
                     color_overridden = true;
                 }
-                screening = table.resolve_style_screening(row);
+                screening = table.resolve_style_screening(hatch.aci);
                 lw_override = table
-                    .resolve_style_lineweight(row)
+                    .resolve_style_lineweight(hatch.aci)
                     .map(|mm| (mm * MM_TO_PT).max(0.1));
             }
         }
@@ -2142,10 +2138,9 @@ fn emit_searchable_text(
         let mut ctb_color: Option<[f32; 3]> = None;
         let mut screening = 1.0;
         if let Some(ctb) = plot_style {
-            let row = crate::io::plot_style::ctb_row(wire.aci, wire.color, wire.snap_only);
-            if row > 0 {
-                ctb_color = ctb.resolve_style_color(row);
-                screening = ctb.resolve_style_screening(row);
+            if wire.aci > 0 {
+                ctb_color = ctb.resolve_style_color(wire.aci);
+                screening = ctb.resolve_style_screening(wire.aci);
             }
         }
         for run in &wire.searchable_text {
@@ -2528,13 +2523,12 @@ fn emit_text(
         let mut lw_override: Option<f32> = None;
         let mut screening = 1.0;
         if let Some(ctb) = plot_style {
-            let row = crate::io::plot_style::ctb_row(wire.aci, wire.color, wire.snap_only);
-            if row > 0 {
-                ctb_color = ctb.resolve_style_color(row);
+            if wire.aci > 0 {
+                ctb_color = ctb.resolve_style_color(wire.aci);
                 lw_override = options
                     .object_lineweights
                     .then(|| {
-                        ctb.resolve_style_lineweight(row).map(|mm| {
+                        ctb.resolve_style_lineweight(wire.aci).map(|mm| {
                             let divisor = if options.scale_lineweights {
                                 1.0
                             } else {
@@ -2544,7 +2538,7 @@ fn emit_text(
                         })
                     })
                     .flatten();
-                screening = ctb.resolve_style_screening(row);
+                screening = ctb.resolve_style_screening(wire.aci);
             }
         }
         for quad in verts.as_chunks::<6>().0 {
