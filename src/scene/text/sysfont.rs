@@ -258,6 +258,30 @@ pub fn canonical_family_name(family: &str) -> Option<String> {
     resolved
 }
 
+/// Families that stood in for Arial in this process (lower case): a free twin
+/// keeps Arial's widths but not the height of its capitals, so its text is
+/// sized by Arial's (see `ttf_glyph::capital_units`).
+fn arial_stand_ins() -> &'static Mutex<std::collections::HashSet<String>> {
+    static SET: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn note_arial_stand_in(family: &str) {
+    arial_stand_ins()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(family.to_ascii_lowercase());
+}
+
+/// Whether `family` was picked to stand in for Arial (native builds only).
+pub(crate) fn stands_in_for_arial(family: &str) -> bool {
+    arial_stand_ins()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&family.to_ascii_lowercase())
+}
+
 fn canonical_family_name_uncached(family: &str) -> Option<String> {
     // Snapshot so the families lock is never held across the db lock below
     // (`register_web_font` takes them in the opposite order, scoped).
@@ -383,6 +407,9 @@ fn canonical_family_name_uncached(family: &str) -> Option<String> {
         };
         for twin in twins {
             if let Some(matched) = families.iter().find(|&f| f.eq_ignore_ascii_case(twin)) {
+                if matches!(key.as_str(), "arial" | "arial_0" | "arialbd") {
+                    note_arial_stand_in(matched);
+                }
                 return Some(matched.clone());
             }
         }
