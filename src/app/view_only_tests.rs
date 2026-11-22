@@ -95,7 +95,15 @@ fn zoom_and_layouts_stay_in_a_view_only_session() {
     assert_ne!(app.tabs[tab].scene.current_layout, "Model", "a paper layout is current");
     let _ = run(&mut app, "TILEMODE 1");
     assert_eq!(app.tabs[tab].scene.current_layout, "Model");
-    assert_eq!(entity_count(&app), 2);
+    // Opening an empty paper layout adds its own default viewports (never
+    // saved here); what was drawn is untouched.
+    let drawn = app.tabs[tab]
+        .scene
+        .document
+        .entities()
+        .filter(|e| matches!(e, EntityType::Line(_) | EntityType::Circle(_)))
+        .count();
+    assert_eq!(drawn, 2);
 }
 
 #[test]
