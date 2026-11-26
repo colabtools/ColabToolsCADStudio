@@ -166,13 +166,17 @@ iced_widget = { git = "https://github.com/HakanSeven12/iced.git", rev = "e4b2fc1
 iced_winit = { git = "https://github.com/HakanSeven12/iced.git", rev = "e4b2fc1aa4d8b4fa882aec36c404b99ddd439343" }
 
 # ColabTools: the DWG reader at the revision opencaddocument pins (a7d3785)
-# plus one fix, kept on branch acadrust/ac21-page-offsets of this repository:
-# R2007 (AC1021) section pages are placed at their stored offsets, so a large
-# objects section with gaps between pages is read whole (it stopped with
-# "Could not read record type at handle 0x2"). When upstream bumps acadrust,
-# rebase that branch onto the new revision (or drop this once fixed upstream).
+# plus our fixes, kept on branch perf/dynamic-definition-lookup of this
+# repository (on top of acadrust/ac21-page-offsets):
+# - R2007 (AC1021) section pages are placed at their stored offsets, so a large
+#   objects section with gaps between pages is read whole (it stopped with
+#   "Could not read record type at handle 0x2");
+# - an INSERT's dynamic definition is found down from its extension dictionary,
+#   not by walking every block representation (about 3.5 s of DR-101A's open).
+# When upstream bumps acadrust, rebase that branch onto the new revision (or
+# drop these once fixed upstream).
 [patch."https://github.com/hakanaktt/acadrust.git"]
-acadrust = { git = "https://github.com/colabtools/ColabToolsCADStudio.git", rev = "4953890755e8689aa59c373c020449615dcbe8e7" }
+acadrust = { git = "https://github.com/colabtools/ColabToolsCADStudio.git", rev = "fc92afa8cbb3b90225f52f3a1380077891bd508a" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 mimalloc = { version = "0.1", default-features = false }
