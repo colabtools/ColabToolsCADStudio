@@ -2872,6 +2872,12 @@ impl OpenCADStudio {
         // selected — see #21.
         self.sync_ribbon_from_selection();
         self.tabs[i].scene.restore_saved_camera();
+        // A view-only embed opens with the whole drawing in view, in the same
+        // frame as the open (a ZOOM E from the host afterwards cost a redraw).
+        #[cfg(target_arch = "wasm32")]
+        if crate::io::host_bridge::is_view_only_forced() {
+            self.tabs[i].scene.fit_all();
+        }
         // Grid/snap are per-drawing view settings — adopt the opened
         // file's active viewport state rather than a global preference.
         self.adopt_view_display(i);
@@ -9514,6 +9520,17 @@ impl OpenCADStudio {
                 self.read_only = view_only || read_only;
                 self.view_only = view_only;
                 self.active_modal = None;
+                // A view-only embed (the portal's CAD view) shows the drawing,
+                // not the editor: the surrounding panels go before the drawing
+                // opens, so its first frame is already the clean one (a
+                // CLEANSCREENON from the host afterwards cost a whole redraw).
+                if host_bridge::is_view_only_forced() && !self.clean_screen {
+                    self.clean_screen = true;
+                    self.clean_screen_properties = false;
+                    self.clean_screen_parameters_manager = false;
+                    self.clean_screen_authoring_palettes = false;
+                    self.clean_screen_tool_palettes = false;
+                }
                 self.update(Message::WebFileDropped(name, bytes, None))
             }
             HostCommand::RequestSave { format } => {
