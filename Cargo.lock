@@ -115,7 +115,7 @@ checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 [[package]]
 name = "acadrust"
 version = "0.6.8"
-source = "git+https://github.com/colabtools/ColabToolsCADStudio.git?rev=4953890755e8689aa59c373c020449615dcbe8e7#4953890755e8689aa59c373c020449615dcbe8e7"
+source = "git+https://github.com/colabtools/ColabToolsCADStudio.git?rev=fc92afa8cbb3b90225f52f3a1380077891bd508a#fc92afa8cbb3b90225f52f3a1380077891bd508a"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
