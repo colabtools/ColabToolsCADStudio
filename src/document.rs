@@ -5460,18 +5460,56 @@ impl CadDocument {
             return None;
         };
         if let Some(xdict) = insert.common.xdictionary_handle {
-            if let Some(definition) = self
-                .block_representations
-                .iter()
-                .find(|(rep, _)| self.owner_chain_reaches(**rep, xdict))
-                .map(|(_, definition)| *definition)
-            {
+            if let Some(definition) = self.representation_under(xdict) {
                 return Some(definition);
             }
         }
         self.block_records
             .get(&insert.block_name)
             .map(|record| record.handle)
+    }
+
+    /// The definition of a block representation owned below `root` (an
+    /// INSERT's extension dictionary), if there is one.
+    ///
+    /// Searches down from `root` through its dictionaries (as deep as
+    /// [`owner_chain_reaches`](Self::owner_chain_reaches) climbs) instead of
+    /// walking every representation of the drawing up to `root`: that was
+    /// inserts × representations × 16 lookups on every viewport build, several
+    /// seconds on drawings with many dynamic blocks. A found representation is
+    /// still checked with `owner_chain_reaches`, so the answer is the same.
+    pub fn representation_under(&self, root: Handle) -> Option<Handle> {
+        if self.block_representations.is_empty() || root.is_null() {
+            return None;
+        }
+        let mut frontier = vec![root];
+        let mut seen: std::collections::HashSet<Handle> = std::collections::HashSet::new();
+        seen.insert(root);
+        for _ in 0..16 {
+            let mut next = Vec::new();
+            for handle in frontier {
+                if let Some(definition) = self.block_representations.get(&handle) {
+                    if self.owner_chain_reaches(handle, root) {
+                        return Some(*definition);
+                    }
+                }
+                let entries = match self.objects.get(&handle) {
+                    Some(ObjectType::Dictionary(d)) => Some(&d.entries),
+                    Some(ObjectType::DictionaryWithDefault(d)) => Some(&d.entries),
+                    _ => None,
+                };
+                for (_, child) in entries.into_iter().flatten() {
+                    if !child.is_null() && seen.insert(*child) {
+                        next.push(*child);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        None
     }
 
     pub fn copy_evaluated_block_metadata(&mut self, source: Handle, target: Handle) -> Result<()> {

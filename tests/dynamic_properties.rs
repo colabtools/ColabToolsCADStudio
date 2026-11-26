@@ -415,3 +415,46 @@ fn lookup_and_axis_descriptors_survive_dwg_and_dxf_roundtrips() {
         }
     }
 }
+
+/// `dynamic_definition_for_insert` searches down from the INSERT's extension
+/// dictionary instead of walking every representation up to it (speed on
+/// drawings with many dynamic blocks): every INSERT of every fixture still
+/// resolves to the definition the full walk finds.
+#[test]
+fn definition_lookup_down_from_the_insert_matches_the_full_walk() {
+    let files = [
+        "BLOCKALIGNMENTPARAMETER",
+        "BLOCKBASEPOINTPARAMETER",
+        "BLOCKFLIPPARAMETER",
+        "BLOCKLINEARPARAMETER",
+        "BLOCKLOOKUPPARAMETER",
+        "BLOCKPOINTPARAMETER",
+        "BLOCKPOLARPARAMETER",
+        "BLOCKROTATIONPARAMETER",
+        "BLOCKVISIBILITYPARAMETER",
+        "BLOCKXYPARAMETER",
+        "LOOKUP_R2004",
+        "LOOKUP_REOPEN",
+        "ROTATION_270",
+    ];
+    let mut with_representation = 0;
+    for file in files {
+        let doc = read_fixture(file);
+        for entity in doc.entities() {
+            let EntityType::Insert(insert) = entity else { continue };
+            let handle = insert.common.handle;
+            let full_walk = insert.common.xdictionary_handle.and_then(|xdict| {
+                doc.block_representations
+                    .iter()
+                    .find(|(rep, _)| doc.owner_chain_reaches(**rep, xdict))
+                    .map(|(_, definition)| *definition)
+            });
+            if full_walk.is_some() {
+                with_representation += 1;
+            }
+            let expected = full_walk.or_else(|| doc.block_records.get(&insert.block_name).map(|r| r.handle));
+            assert_eq!(doc.dynamic_definition_for_insert(handle), expected, "{file} insert {handle:?}");
+        }
+    }
+    assert!(with_representation > 0, "the fixtures hold evaluated dynamic inserts");
+}
